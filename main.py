@@ -10,6 +10,8 @@ import subprocess
 import shutil
 import math
 import sys
+import json
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from reportlab.pdfgen import canvas
@@ -19,8 +21,178 @@ from reportlab.pdfbase.ttfonts import TTFont
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_CSV = os.path.join(BASE_DIR, "hotel_settings.csv")
-HISTORY_CSV = os.path.join(BASE_DIR, "elstat_history.csv")
+
+# ----------------------------------------------------------------- storage
+# elstat_config.json (next to the program) only remembers WHERE the data folder is.
+# Everything else (hotel details, history, archive, preferences) lives in the data folder.
+CONFIG_FILE = os.path.join(BASE_DIR, "elstat_config.json")
+DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "ELSTAT_Data")
+DEFAULT_TEMPLATE = os.path.join(BASE_DIR, "template_elstat_report.pdf")
+ARCHIVE_NAME = "ELSTAT_Archive"
+DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json")
+
+DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = ""
+
+
+def set_data_dir(path):
+    """Points every data path of the program at `path`."""
+    global DATA_DIR, SETTINGS_CSV, HISTORY_CSV, MONTHS_CSV, PREFS_JSON, ARCHIVE_DIR
+    DATA_DIR = os.path.abspath(path)
+    SETTINGS_CSV = os.path.join(DATA_DIR, "hotel_settings.csv")
+    HISTORY_CSV = os.path.join(DATA_DIR, "elstat_history.csv")
+    MONTHS_CSV = os.path.join(DATA_DIR, "elstat_months.csv")
+    PREFS_JSON = os.path.join(DATA_DIR, "elstat_preferences.json")
+    ARCHIVE_DIR = os.path.join(DATA_DIR, ARCHIVE_NAME)
+
+
+set_data_dir(DEFAULT_DATA_DIR)
+
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _is_inside(child, parent):
+    c, p = os.path.normcase(os.path.abspath(child)), os.path.normcase(os.path.abspath(parent))
+    return c == p or c.startswith(p + os.sep)
+
+
+def data_exists(folder):
+    """True if `folder` already holds data of this program."""
+    return (any(os.path.exists(os.path.join(folder, f)) for f in DATA_FILES) or
+            os.path.isdir(os.path.join(folder, ARCHIVE_NAME)))
+
+
+def copy_data_files(src_dir, dst_dir):
+    """Copies the program's data (not deleting anything) from one folder to another."""
+    for name in DATA_FILES:
+        p = os.path.join(src_dir, name)
+        if os.path.isfile(p):
+            shutil.copy2(p, os.path.join(dst_dir, name))
+    a = os.path.join(src_dir, ARCHIVE_NAME)
+    if os.path.isdir(a):
+        shutil.copytree(a, os.path.join(dst_dir, ARCHIVE_NAME), dirs_exist_ok=True)
+
+
+def load_app_config():
+    try:
+        with open(CONFIG_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_app_config(cfg):
+    """Returns False if the program folder is read-only."""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def init_storage():
+    """Run once at start-up: finds/creates the data folder and, the first time after an update,
+    copies the old files that used to sit next to the program. Returns messages to show the user."""
+    notices = []
+    wanted = str(load_app_config().get('data_dir') or '').strip()
+    path = wanted or DEFAULT_DATA_DIR
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        if wanted:
+            notices.append(f"Ο φάκελος δεδομένων\n{wanted}\nδεν είναι διαθέσιμος αυτή τη στιγμή (π.χ. "
+                           "αποσυνδεδεμένος δίσκος). Χρησιμοποιείται προσωρινά ο προεπιλεγμένος φάκελος.")
+        path = DEFAULT_DATA_DIR
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            path = os.path.join(os.path.expanduser('~'), 'ELSTAT_Data')
+            os.makedirs(path, exist_ok=True)
+    set_data_dir(path)
+    if _same_path(path, DEFAULT_DATA_DIR) and not data_exists(path) and data_exists(BASE_DIR):
+        try:
+            copy_data_files(BASE_DIR, path)
+            notices.append("Τα δεδομένα του προγράμματος (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) "
+                           f"αντιγράφηκαν στον φάκελο:\n{path}\n\nΤα παλιά αρχεία έμειναν στη θέση τους ως "
+                           "αντίγραφο ασφαλείας - μπορείτε να τα σβήσετε όταν βεβαιωθείτε ότι όλα λειτουργούν.\n"
+                           "Τον φάκελο δεδομένων τον αλλάζετε από την καρτέλα «Ρυθμίσεις».")
+        except Exception:
+            pass
+    return notices
+
+
+# ------------------------------------------------------------- preferences
+BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees')
+DEFAULT_PREFS = {
+    'output_mode': 'program',                  # 'program' | 'excel' | 'custom'
+    'output_dir': '',                          # used when output_mode == 'custom'
+    'filename_pattern': 'ELSTAT_{year}_{month}',
+    'excel_dir': '',                           # '' = remember the last folder
+    'template_pdf': '',                        # '' = template_elstat_report.pdf next to the program
+    'open_after': False,
+    'confirm_overwrite': True,
+    'keep_archive': True,
+    'show_reminder': True,
+    'prefill_employees': False,
+}
+
+
+def pattern_error(pattern):
+    """None if the file-name pattern is fine, else a Greek explanation."""
+    if not pattern.strip():
+        return "Το όνομα δεν μπορεί να είναι κενό."
+    try:
+        pattern.format(year=2026, month="01")
+    except Exception:
+        return "Μη έγκυρο όνομα. Χρησιμοποιήστε μόνο τα {year} και {month} μέσα σε άγκιστρα."
+    if '{year}' not in pattern or '{month}' not in pattern:
+        return ("Πρέπει να περιέχει και το {year} και το {month}, αλλιώς κάθε μήνας θα γράφει "
+                "πάνω στον προηγούμενο.")
+    return None
+
+
+def build_pdf_name(pattern, year, month):
+    """File name (with .pdf) for a month; characters Windows does not allow become '_'."""
+    mm = f"{int(month):02d}"
+    try:
+        name = pattern.format(year=year, month=mm)
+    except (KeyError, IndexError, ValueError, AttributeError):
+        name = DEFAULT_PREFS['filename_pattern'].format(year=year, month=mm)
+    name = ''.join('_' if (ch in '<>:"/\\|?*' or ord(ch) < 32) else ch for ch in name).strip().rstrip('.')
+    if name.lower().endswith('.pdf'):
+        name = name[:-4]
+    return (name or f"ELSTAT_{year}_{mm}") + ".pdf"
+
+
+def load_prefs():
+    prefs = dict(DEFAULT_PREFS)
+    try:
+        with open(PREFS_JSON, encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k, default in DEFAULT_PREFS.items():
+                if k in data:
+                    prefs[k] = bool(data[k]) if isinstance(default, bool) else str(data[k] or '')
+    except Exception:
+        pass
+    if prefs['output_mode'] not in ('program', 'excel', 'custom'):
+        prefs['output_mode'] = 'program'
+    if pattern_error(prefs['filename_pattern']):
+        prefs['filename_pattern'] = DEFAULT_PREFS['filename_pattern']
+    return prefs
+
+
+def save_prefs(prefs):
+    ensure_data_dir()
+    with open(PREFS_JSON, 'w', encoding='utf-8') as f:
+        json.dump(prefs, f, ensure_ascii=False, indent=2)
 
 _LATIN_TO_GREEK = str.maketrans({
     'A': 'Α', 'B': 'Β', 'E': 'Ε', 'H': 'Η', 'I': 'Ι', 'K': 'Κ', 'M': 'Μ',
@@ -53,6 +225,7 @@ def load_hotel_settings():
     return settings
 
 def save_hotel_settings(settings_data):
+    ensure_data_dir()
     df = pd.DataFrame([settings_data])
     df.to_csv(SETTINGS_CSV, index=False, encoding='utf-8-sig')
 
@@ -317,8 +490,7 @@ def resolve_country(name):
     return COUNTRY_MAPPING_NORM.get(k) or (k if k in MAPPED_TARGETS else None)
 
 
-ARCHIVE_DIR = os.path.join(BASE_DIR, "ELSTAT_Archive")
-MONTHS_CSV = os.path.join(BASE_DIR, "elstat_months.csv")
+# (ARCHIVE_DIR / MONTHS_CSV are set by set_data_dir() at the top of the file)
 
 
 def archive_path(year, month):
@@ -358,6 +530,7 @@ def save_month_record(year, month, employees, days, date_to):
             df = pd.concat([old[keep], df], ignore_index=True)
         except Exception:
             pass
+    ensure_data_dir()
     df.to_csv(MONTHS_CSV, index=False, encoding='utf-8-sig')
 
 
@@ -739,6 +912,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
             keep = ~((pd.to_numeric(old_df['Etos'], errors='coerce') == int(monthly_data['year'])) &
                      (pd.to_numeric(old_df['Minas'], errors='coerce') == int(monthly_data['month'])))
             df_csv = pd.concat([old_df[keep], df_csv.astype(str)], ignore_index=True)
+        ensure_data_dir()
         df_csv.to_csv(csv_filename, index=False, encoding='utf-8-sig')
 
     computed = (totals['9']['clients'], totals['9']['nights'])
@@ -948,6 +1122,9 @@ def setup_styles(root):
     st.configure('TSeparator', background=BORDER)
     st.configure('Status.TLabel', background=CARD, foreground=MUTED, font=(FONT, 9), padding=(14, 6))
     st.configure('TRadiobutton', background=BG, focuscolor=BG)
+    for name in ('Card.TRadiobutton', 'Card.TCheckbutton'):
+        st.configure(name, background=CARD, focuscolor=CARD)
+        st.map(name, background=[('active', CARD)])
     st.configure('TCombobox', fieldbackground='white', background='#e8edf4', bordercolor=BORDER,
                  lightcolor=BORDER, darkcolor=BORDER, arrowcolor=TEXT, padding=4)
     st.map('TCombobox', fieldbackground=[('readonly', 'white')], bordercolor=[('focus', ACCENT)])
@@ -1120,6 +1297,8 @@ class ElstatApp(tk.Tk):
         self.minsize(640, 560)
         self.configure(bg=BG)
 
+        self._storage_notices = init_storage()
+        self.prefs = load_prefs()
         self.current_settings = load_hotel_settings()
         self.output_custom = False      # True once the user picks the output file themselves
         self._busy = False
@@ -1128,6 +1307,8 @@ class ElstatApp(tk.Tk):
         setup_styles(self)
         self._init_vars()
         self._build_ui()
+        self.pv['filename_pattern'].trace_add('write', self._update_name_note)
+        self._after_prefs_change()
 
         watched = (list(self.set_vars.values()) + list(self.mon_vars.values()) +
                    [self.excel_var, self.out_var, self.pdf_var])
@@ -1145,6 +1326,9 @@ class ElstatApp(tk.Tk):
         self.bind('<Control-p>', lambda e: self._try_generate(print_after=True))
         self._center()
         self.after(150, self.excel_btn.focus_set)
+        if self._storage_notices:
+            self.after(400, lambda: messagebox.showinfo("Ρυθμίσεις", "\n\n".join(self._storage_notices),
+                                                        parent=self))
 
     # ------------------------------------------------------------------ setup
     def _init_vars(self):
@@ -1153,8 +1337,9 @@ class ElstatApp(tk.Tk):
         # month details start EMPTY: the Excel fills most of them, the rest are typed by hand
         self.mon_vars = {k: tk.StringVar() for k in ('year', 'month', 'date_to', 'days_of_month', 'employees')}
         self.excel_var = tk.StringVar()
-        self.out_var = tk.StringVar(value=os.path.join(BASE_DIR, "ELSTAT_Report.pdf"))
-        self.pdf_var = tk.StringVar(value=os.path.join(BASE_DIR, "template_elstat_report.pdf"))
+        self.out_var = tk.StringVar(value=self._suggest_output())
+        saved_tpl = self.prefs.get('template_pdf', '')
+        self.pdf_var = tk.StringVar(value=saved_tpl if saved_tpl and os.path.isfile(saved_tpl) else DEFAULT_TEMPLATE)
         self.period_var = tk.StringVar()
         self.month_name_var = tk.StringVar()
         self.afm_counter_var = tk.StringVar()
@@ -1165,6 +1350,13 @@ class ElstatApp(tk.Tk):
         self.hist_metric_var = tk.StringVar(value='nights')
         self._hist = {}
         self._reminder_dismissed = False
+        # settings-tab variables
+        self.pv = {k: tk.StringVar(value=self.prefs[k])
+                   for k in ('output_mode', 'output_dir', 'filename_pattern', 'excel_dir')}
+        self.pv.update({k: tk.BooleanVar(value=self.prefs[k]) for k in BOOL_PREFS})
+        self.data_dir_var = tk.StringVar(value=DATA_DIR)
+        self.name_note_var = tk.StringVar()
+        self.out_note_var = tk.StringVar()
 
     def _build_ui(self):
         header = tk.Frame(self, bg=NAVY)
@@ -1196,12 +1388,15 @@ class ElstatApp(tk.Tk):
         self.tab_report = ttk.Frame(self.notebook)
         self.tab_hotel = ttk.Frame(self.notebook)
         self.tab_history = ttk.Frame(self.notebook)
+        self.tab_settings = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_report, text="Δελτίο μήνα")
         self.notebook.add(self.tab_hotel, text="Στοιχεία ξενοδοχείου")
         self.notebook.add(self.tab_history, text="Ιστορικό")
+        self.notebook.add(self.tab_settings, text="Ρυθμίσεις")
         self._build_report_tab()
         self._build_hotel_tab()
         self._build_history_tab()
+        self._build_settings_tab()
         self.refresh_history()
 
     def _build_report_tab(self):
@@ -1302,7 +1497,7 @@ class ElstatApp(tk.Tk):
         c3.columnconfigure(0, weight=1)
         ttk.Entry(c3, textvariable=self.out_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(c3, text="Αλλαγή…", command=self.browse_output).grid(row=0, column=1, padx=(8, 0))
-        h3 = ttk.Label(c3, text="Προτείνεται αυτόματα στον φάκελο του Excel, με το όνομα του μήνα.",
+        h3 = ttk.Label(c3, text="Προτείνεται αυτόματα με βάση την καρτέλα «Ρυθμίσεις» (φάκελος και όνομα αρχείου).",
                        style='CardHint.TLabel', justify="left")
         h3.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         autowrap(h3, body, margin=110)
@@ -1387,6 +1582,303 @@ class ElstatApp(tk.Tk):
                                 "Συνήθως δεν χρειάζεται να το αλλάξετε.", style='CardHint.TLabel', justify="left")
         h2.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         autowrap(h2, body, margin=110)
+
+    # ------------------------------------------------------------ settings tab
+    def _build_settings_tab(self):
+        sf = ScrollFrame(self.tab_settings)
+        sf.pack(fill="both", expand=True)
+        body = sf.body
+        body.columnconfigure(0, weight=1)
+        pv = self.pv
+
+        def hint(parent, text, row, columnspan=1, pady=(8, 0), margin=110, padx=0):
+            lbl = ttk.Label(parent, text=text, style='CardHint.TLabel', justify="left")
+            lbl.grid(row=row, column=0, columnspan=columnspan, sticky="w", pady=pady, padx=padx)
+            autowrap(lbl, body, margin=margin)
+            return lbl
+
+        def commit_on(entry):
+            entry.bind('<FocusOut>', self._pref_changed)
+            entry.bind('<Return>', self._pref_changed)
+
+        # ---- 1. where the PDFs go
+        c1 = Card(body, None, "Πού αποθηκεύονται τα PDF")
+        c1.grid(row=0, column=0, sticky="ew", padx=4, pady=(12, 6))
+        f = c1.body
+        f.columnconfigure(0, weight=1)
+        for r, (text, value) in enumerate((("Στον φάκελο του προγράμματος", 'program'),
+                                           ("Στον φάκελο του αρχείου Excel (από το Protel)", 'excel'),
+                                           ("Σε συγκεκριμένο φάκελο:", 'custom'))):
+            ttk.Radiobutton(f, text=text, value=value, variable=pv['output_mode'], style='Card.TRadiobutton',
+                            command=self._pref_changed).grid(row=r, column=0, columnspan=2, sticky="w",
+                                                             pady=(0 if r == 0 else 6, 0))
+        self.out_dir_entry = ttk.Entry(f, textvariable=pv['output_dir'])
+        self.out_dir_entry.grid(row=3, column=0, sticky="ew", padx=(24, 0), pady=(4, 0))
+        commit_on(self.out_dir_entry)
+        self.out_dir_btn = ttk.Button(f, text="Αναζήτηση…", command=self.browse_output_dir)
+        self.out_dir_btn.grid(row=3, column=1, padx=(8, 0), pady=(4, 0))
+        ttk.Separator(f, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=14)
+        ttk.Label(f, text="Όνομα αρχείου PDF:", style='CardBold.TLabel').grid(row=5, column=0, columnspan=2,
+                                                                              sticky="w")
+        name_entry = ttk.Entry(f, textvariable=pv['filename_pattern'])
+        name_entry.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        commit_on(name_entry)
+        self.name_note = hint(f, "", 7, columnspan=2)
+        self.name_note.configure(textvariable=self.name_note_var)
+        self.out_note = hint(f, "", 8, columnspan=2, pady=(6, 0))
+        self.out_note.configure(textvariable=self.out_note_var)
+
+        # ---- 2. data folder
+        c2 = Card(body, None, "Φάκελος δεδομένων")
+        c2.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
+        f2 = c2.body
+        f2.columnconfigure(0, weight=1)
+        ttk.Entry(f2, textvariable=self.data_dir_var, state='readonly').grid(row=0, column=0, sticky="ew")
+        ttk.Button(f2, text="Αλλαγή…", command=self.change_data_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(f2, text="Άνοιγμα", command=lambda: open_file(DATA_DIR)).grid(row=0, column=2, padx=(6, 0))
+        hint(f2, "Εδώ αποθηκεύονται τα στοιχεία του ξενοδοχείου, το ιστορικό, τα αρχειοθετημένα PDF και οι "
+                 "ρυθμίσεις. Μπορείτε να διαλέξετε π.χ. φάκελο μέσα στο OneDrive ώστε να υπάρχει αυτόματο "
+                 "αντίγραφο. Η θέση του φακέλου θυμάται το αρχείο elstat_config.json δίπλα στο πρόγραμμα.",
+             1, columnspan=3)
+        row2 = ttk.Frame(f2, style='Card.TFrame')
+        row2.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Button(row2, text="Προεπιλεγμένος φάκελος",
+                   command=lambda: self._switch_data_dir(DEFAULT_DATA_DIR)).pack(side="left")
+        ttk.Button(row2, text="Αντίγραφο ασφαλείας (.zip)…", command=self.backup_data).pack(side="left", padx=8)
+
+        # ---- 3. Excel folder
+        c3 = Card(body, None, "Αρχεία Excel από το Protel")
+        c3.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
+        f3 = c3.body
+        f3.columnconfigure(0, weight=1)
+        ex_entry = ttk.Entry(f3, textvariable=pv['excel_dir'])
+        ex_entry.grid(row=0, column=0, sticky="ew")
+        commit_on(ex_entry)
+        ttk.Button(f3, text="Αναζήτηση…", command=self.browse_excel_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(f3, text="Καθαρισμός", command=self.clear_excel_dir).grid(row=0, column=2, padx=(6, 0))
+        hint(f3, "Από ποιον φάκελο ξεκινούν τα «Επιλογή Excel…» και «Πιο πρόσφατο». "
+                 "Κενό = ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.", 1, columnspan=3)
+
+        # ---- 4. behaviour
+        c4 = Card(body, None, "Συμπεριφορά του προγράμματος")
+        c4.grid(row=3, column=0, sticky="ew", padx=4, pady=6)
+        f4 = c4.body
+        f4.columnconfigure(0, weight=1)
+        behaviours = [
+            ('open_after', "Άνοιγμα του PDF αμέσως μετά τη δημιουργία", None),
+            ('confirm_overwrite', "Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη", None),
+            ('keep_archive', "Αρχειοθέτηση αντιγράφου κάθε δελτίου στον φάκελο δεδομένων",
+             "Επιτρέπει να ξανανοίξετε ή να εκτυπώσετε παλιούς μήνες από το Ιστορικό. Αν το κλείσετε, το "
+             "δελτίο ξαναφτιάχνεται από τα δεδομένα του ιστορικού όταν το ζητήσετε."),
+            ('show_reminder', "Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα", None),
+            ('prefill_employees', "Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή",
+             "Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο."),
+        ]
+        for r, (key, text, note) in enumerate(behaviours):
+            ttk.Checkbutton(f4, text=text, variable=pv[key], style='Card.TCheckbutton',
+                            command=self._pref_changed).grid(row=r * 2, column=0, sticky="w",
+                                                             pady=(8 if r else 0, 0))
+            if note:
+                hint(f4, note, r * 2 + 1, padx=(24, 0), pady=(2, 0), margin=130)
+
+        # ---- reset
+        bottom = ttk.Frame(body)
+        bottom.grid(row=4, column=0, sticky="ew", padx=4, pady=(6, 16))
+        ttk.Button(bottom, text="Επαναφορά ρυθμίσεων", style='Danger.TButton',
+                   command=self.reset_prefs).pack(side="left")
+        ttk.Label(bottom, text="Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
+                  style='Hint.TLabel').pack(side="left", padx=10)
+
+    # ---- settings: reading / saving
+    def _save_prefs(self):
+        try:
+            save_prefs(self.prefs)
+        except OSError as e:
+            self._status(f"⚠ Δεν ήταν δυνατή η αποθήκευση των ρυθμίσεων: {e}")
+
+    def _pref_changed(self, *_):
+        p, pv = self.prefs, self.pv
+        p['output_mode'] = pv['output_mode'].get()
+        p['output_dir'] = pv['output_dir'].get().strip()
+        p['excel_dir'] = pv['excel_dir'].get().strip()
+        pattern = pv['filename_pattern'].get().strip()
+        if pattern_error(pattern) is None:
+            p['filename_pattern'] = pattern
+        for k in BOOL_PREFS:
+            p[k] = bool(pv[k].get())
+        self._save_prefs()
+        self._after_prefs_change()
+
+    def _sync_pref_vars(self):
+        for k, var in self.pv.items():
+            var.set(self.prefs[k])
+
+    def _after_prefs_change(self):
+        custom = self.prefs['output_mode'] == 'custom'
+        for w in (self.out_dir_entry, self.out_dir_btn):
+            w.state(['!disabled' if custom else 'disabled'])
+        self._update_name_note()
+        self._refresh_output_suggestion()
+        self.out_note_var.set("Στο Βήμα 3 του δελτίου προτείνεται: " + self._suggest_output() +
+                              "  (μπορείτε πάντα να το αλλάξετε εκεί)")
+        self.update_reminder()
+
+    def _update_name_note(self, *_):
+        pattern = self.pv['filename_pattern'].get().strip()
+        err = pattern_error(pattern)
+        if err:
+            self.name_note_var.set("⚠ " + err + " (δεν αποθηκεύτηκε)")
+            self.name_note.configure(style='CardBad.TLabel')
+        else:
+            today = datetime.date.today()
+            self.name_note_var.set(f"Παράδειγμα: {build_pdf_name(pattern, today.year, today.month)}   ·   " +
+                                   "{year} = έτος, {month} = μήνας (2 ψηφία)")
+            self.name_note.configure(style='CardHint.TLabel')
+
+    # ---- settings: where PDFs / Excel files go
+    def _output_folder(self, excel=None):
+        mode, folder = self.prefs['output_mode'], self.prefs['output_dir']
+        if mode == 'excel':
+            excel = excel or self.excel_var.get().strip()
+            if excel and os.path.dirname(excel):
+                return os.path.dirname(excel)
+        elif mode == 'custom' and folder:
+            return folder
+        return BASE_DIR
+
+    def _suggest_output(self, excel=None):
+        year, month = self.mon_vars['year'].get().strip(), self.mon_vars['month'].get().strip()
+        if year.isascii() and year.isdigit() and len(year) == 4 and month.isascii() and month.isdigit() \
+                and 1 <= int(month) <= 12:
+            name = build_pdf_name(self.prefs['filename_pattern'], year, int(month))
+        else:
+            name = "ELSTAT_Report.pdf"
+        return os.path.join(self._output_folder(excel), name)
+
+    def _refresh_output_suggestion(self, excel=None):
+        if not self.output_custom:        # never overwrite a location the user picked by hand
+            self.out_var.set(self._suggest_output(excel))
+
+    def _excel_start_dir(self):
+        d = self.prefs.get('excel_dir', '')
+        return d if d and os.path.isdir(d) else self._start_dir()
+
+    def _pdf_start_dir(self):
+        d = self.prefs.get('output_dir', '')
+        if self.prefs['output_mode'] == 'custom' and d and os.path.isdir(d):
+            return d
+        return self._start_dir()
+
+    def _pick_folder(self, title, current):
+        return filedialog.askdirectory(title=title, initialdir=current if current and os.path.isdir(current)
+                                       else BASE_DIR)
+
+    def browse_output_dir(self):
+        d = self._pick_folder("Διαλέξτε φάκελο για τα PDF", self.pv['output_dir'].get().strip())
+        if d:
+            self.pv['output_dir'].set(os.path.normpath(d))
+            self.pv['output_mode'].set('custom')
+            self._pref_changed()
+
+    def browse_excel_dir(self):
+        d = self._pick_folder("Διαλέξτε φάκελο των Excel", self.pv['excel_dir'].get().strip())
+        if d:
+            self.pv['excel_dir'].set(os.path.normpath(d))
+            self._pref_changed()
+
+    def clear_excel_dir(self):
+        self.pv['excel_dir'].set('')
+        self._pref_changed()
+
+    def _remember_template(self, path):
+        self.prefs['template_pdf'] = '' if _same_path(path, DEFAULT_TEMPLATE) else path
+        self._save_prefs()
+
+    # ---- settings: data folder
+    def change_data_dir(self):
+        d = self._pick_folder("Διαλέξτε τον φάκελο δεδομένων", DATA_DIR)
+        if d:
+            self._switch_data_dir(os.path.normpath(d))
+
+    def _switch_data_dir(self, new):
+        old = DATA_DIR
+        if _same_path(new, old):
+            return
+        if _is_inside(new, os.path.join(old, ARCHIVE_NAME)):
+            messagebox.showerror("Φάκελος δεδομένων", "Δεν μπορείτε να διαλέξετε φάκελο μέσα στο αρχείο PDF.")
+            return
+        copy = False
+        if data_exists(new):
+            if not messagebox.askyesno(
+                    "Φάκελος δεδομένων",
+                    f"Ο φάκελος\n{new}\nπεριέχει ήδη δεδομένα του προγράμματος.\n\n"
+                    "Να χρησιμοποιηθούν αυτά; (Τα τωρινά δεδομένα δεν διαγράφονται.)", default='yes'):
+                return
+        elif data_exists(old):
+            ans = messagebox.askyesnocancel(
+                "Φάκελος δεδομένων",
+                "Να αντιγραφούν τα υπάρχοντα δεδομένα (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) στον "
+                "νέο φάκελο;\n\nΝαι = αντιγραφή (τα παλιά αρχεία μένουν και στον παλιό φάκελο)\n"
+                "Όχι = ξεκίνημα από το μηδέν στον νέο φάκελο\nΑκύρωση = καμία αλλαγή", default='yes')
+            if ans is None:
+                return
+            copy = ans
+        try:
+            os.makedirs(new, exist_ok=True)
+            if copy:
+                copy_data_files(old, new)
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η αντιγραφή στον νέο φάκελο:\n{e}")
+            return
+        set_data_dir(new)
+        if not save_app_config({'data_dir': '' if _same_path(new, DEFAULT_DATA_DIR) else new}):
+            set_data_dir(old)
+            messagebox.showerror("Σφάλμα", "Δεν μπορώ να θυμηθώ τη νέα θέση, γιατί ο φάκελος του προγράμματος "
+                                           "δεν επιτρέπει εγγραφή. Η αλλαγή ακυρώθηκε.")
+            return
+        # preferences live in the data folder: use the ones found there, or carry the current ones over
+        if os.path.exists(PREFS_JSON):
+            self.prefs = load_prefs()
+            self._sync_pref_vars()
+        else:
+            self._save_prefs()
+        if os.path.exists(SETTINGS_CSV):
+            self.current_settings = load_hotel_settings()
+            for k in SETTING_KEYS:
+                self.set_vars[k].set(self.current_settings.get(k, ''))
+        self.data_dir_var.set(DATA_DIR)
+        self.refresh_history()
+        self._after_prefs_change()
+        self._status(f"✓ Ο φάκελος δεδομένων είναι τώρα: {DATA_DIR}")
+
+    def backup_data(self):
+        name = f"ELSTAT_backup_{datetime.date.today().strftime('%Y-%m-%d')}.zip"
+        fp = filedialog.asksaveasfilename(title="Αντίγραφο ασφαλείας", defaultextension=".zip",
+                                          initialdir=self._start_dir(), initialfile=name,
+                                          filetypes=[("ZIP", "*.zip")])
+        if not fp:
+            return
+        try:
+            ensure_data_dir()
+            with tempfile.TemporaryDirectory() as tmp:
+                z = shutil.make_archive(os.path.join(tmp, 'backup'), 'zip', DATA_DIR)
+                shutil.copy2(z, fp)
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η δημιουργία αντιγράφου:\n{e}")
+            return
+        self._status(f"✓ Αντίγραφο ασφαλείας: {fp}")
+
+    def reset_prefs(self):
+        if not messagebox.askyesno("Επαναφορά ρυθμίσεων",
+                                   "Να γυρίσουν όλες οι ρυθμίσεις στις προεπιλογές;\n"
+                                   "(Δεν διαγράφονται δεδομένα ή ιστορικό.)", default='no'):
+            return
+        keep_template = self.prefs.get('template_pdf', '')
+        self.prefs = dict(DEFAULT_PREFS, template_pdf=keep_template)
+        self._sync_pref_vars()
+        self._save_prefs()
+        self._after_prefs_change()
+        self._status("Οι ρυθμίσεις επανήλθαν στις προεπιλογές.")
 
     # ---------------------------------------------------- window behaviour
     def _center(self):
@@ -1503,7 +1995,7 @@ class ElstatApp(tk.Tk):
         return d if d and os.path.isdir(d) else BASE_DIR
 
     def browse_excel(self):
-        fp = filedialog.askopenfilename(title="Διαλέξτε το Excel από το Protel", initialdir=self._start_dir(),
+        fp = filedialog.askopenfilename(title="Διαλέξτε το Excel από το Protel", initialdir=self._excel_start_dir(),
                                         filetypes=[("Excel Files", "*.xls *.xlsx")])
         if fp:
             self.excel_var.set(fp)
@@ -1529,8 +2021,10 @@ class ElstatApp(tk.Tk):
             self.mon_vars['month'].set(str(month))
             self.mon_vars['date_to'].set(f"{last:02d}/{month:02d}/{year}")
             self.mon_vars['days_of_month'].set(str(last))
-            if not self.output_custom:
-                self.out_var.set(os.path.join(os.path.dirname(fp), f"ELSTAT_{year}_{month:02d}.pdf"))
+            self._refresh_output_suggestion(excel=fp)
+            last_emp = self.current_settings.get('last_employees', '')
+            if self.prefs['prefill_employees'] and last_emp and not self.mon_vars['employees'].get().strip():
+                self.mon_vars['employees'].set(last_emp)
             self.period_var.set(f"✓ Το Excel αφορά τον μήνα {GREEK_MONTHS[month - 1]} {year}. "
                                 "Τα στοιχεία του μήνα συμπληρώθηκαν αυτόματα - πληκτρολογήστε μόνο τον αριθμό εργαζομένων.")
             self.period_label.configure(style='CardGood.TLabel')
@@ -1541,10 +2035,10 @@ class ElstatApp(tk.Tk):
 
     def use_recent_excel(self):
         """Picks the newest Excel in the folder used last time (or next to the program)."""
-        fp = find_recent_excel(self._start_dir())
+        fp = find_recent_excel(self._excel_start_dir())
         if not fp:
             messagebox.showinfo("Δεν βρέθηκε αρχείο",
-                                f"Δεν υπάρχει αρχείο Excel στον φάκελο:\n{self._start_dir()}\n\n"
+                                f"Δεν υπάρχει αρχείο Excel στον φάκελο:\n{self._excel_start_dir()}\n\n"
                                 "Πατήστε «Επιλογή Excel…» για να το διαλέξετε.")
             return
         self.excel_var.set(fp)
@@ -1814,7 +2308,8 @@ class ElstatApp(tk.Tk):
 
     # ---- reminder banner
     def update_reminder(self):
-        r = None if self._reminder_dismissed else missing_month_reminder(self._hist)
+        r = None if (self._reminder_dismissed or not self.prefs['show_reminder']) \
+            else missing_month_reminder(self._hist)
         if r:
             self.reminder_label.configure(
                 text=f"Υπενθύμιση: δεν υπάρχει ακόμη δελτίο για τον {GREEK_MONTHS[r[1] - 1]} {r[0]}. "
@@ -1898,7 +2393,7 @@ class ElstatApp(tk.Tk):
         if not path:
             return
         fp = filedialog.asksaveasfilename(title="Αποθήκευση δελτίου ως", defaultextension=".pdf",
-                                          initialdir=self._start_dir(),
+                                          initialdir=self._pdf_start_dir(),
                                           initialfile=os.path.basename(path), filetypes=[("PDF Files", "*.pdf")])
         if not fp:
             return
@@ -1946,7 +2441,7 @@ class ElstatApp(tk.Tk):
         name = f"ELSTAT_Synopsi_{year}.pdf"
         if mode == 'save':
             fp = filedialog.asksaveasfilename(title="Αποθήκευση σύνοψης έτους", defaultextension=".pdf",
-                                              initialdir=self._start_dir(), initialfile=name,
+                                              initialdir=self._pdf_start_dir(), initialfile=name,
                                               filetypes=[("PDF Files", "*.pdf")])
             if not fp:
                 return
@@ -1972,6 +2467,7 @@ class ElstatApp(tk.Tk):
                                         filetypes=[("PDF Files", "*.pdf")])
         if fp:
             self.pdf_var.set(fp)
+            self._remember_template(fp)
 
     def browse_output(self):
         cur = self.out_var.get().strip()
@@ -2000,12 +2496,24 @@ class ElstatApp(tk.Tk):
                     default='no'):
                 return
 
+        if self.prefs['confirm_overwrite'] and os.path.exists(out):
+            if not messagebox.askyesno("Υπάρχει ήδη αρχείο",
+                                       f"Το αρχείο υπάρχει ήδη:\n{out}\n\nΝα αντικατασταθεί;", default='no'):
+                return
+
         saved = dict(s, last_dir=os.path.dirname(excel), last_employees=m['employees'])
-        save_hotel_settings(saved)
+        try:
+            save_hotel_settings(saved)
+        except Exception as e:
+            messagebox.showwarning("Προσοχή", f"Δεν ήταν δυνατή η αποθήκευση των στοιχείων στον φάκελο "
+                                              f"δεδομένων:\n{DATA_DIR}\n\n{e}")
         self.current_settings = saved
+        if template != (self.prefs.get('template_pdf') or DEFAULT_TEMPLATE):
+            self._remember_template(template)
 
         self._set_busy(True)
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             result = process_elstat_report(excel, template, out, s, m)
         except PermissionError:
             messagebox.showerror("Σφάλμα", "Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε άλλο "
@@ -2027,7 +2535,8 @@ class ElstatApp(tk.Tk):
 
         try:
             gy, gm = int(m['year']), int(m['month'])
-            archive_copy(gy, gm, out)
+            if self.prefs['keep_archive']:
+                archive_copy(gy, gm, out)
             save_month_record(gy, gm, m['employees'], m['days_of_month'], m['date_to'])
             self._status(f"✓ Το δελτίο {GREEK_MONTHS[gm - 1]} {gy} δημιουργήθηκε και αρχειοθετήθηκε.")
         except Exception:
@@ -2040,6 +2549,8 @@ class ElstatApp(tk.Tk):
                                        "Ελέγξτε το δελτίο και μετά πατήστε «Εκτύπωση».")
             else:
                 print_status = print_file(out)
+        if self.prefs['open_after'] and not print_after:
+            open_file(out)
         ResultDialog(self, result, out, warnings_txt, print_status)
 
 
