@@ -12,9 +12,13 @@ import shutil
 import math
 import sys
 import json
+import hashlib
+import base64
 import tempfile
+import copy
+import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -135,7 +139,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "elstat_config.json")
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "ELSTAT_Data")
 DEFAULT_TEMPLATE = os.path.join(BASE_DIR, "template_elstat_report.pdf")
 ARCHIVE_NAME = "ELSTAT_Archive"
-DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json", "elstat_country_mappings.json")
+DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json", "elstat_country_mappings.json", "elstat_template_layout.json", "elstat_manual_layout.json")
 
 DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = COUNTRY_MAPPINGS_FILE = ""
 
@@ -244,7 +248,7 @@ def init_storage():
 
 
 # ------------------------------------------------------------- preferences
-BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees')
+BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result')
 DEFAULT_PREFS = {
     'language': 'el',                          # 'el' | 'en'  (interface language)
     'theme': 'light',                          # 'light' | 'dark' | 'auto'  (follow the system)
@@ -253,11 +257,14 @@ DEFAULT_PREFS = {
     'filename_pattern': 'ELSTAT_{year}_{month}',
     'excel_dir': '',                           # '' = remember the last folder
     'template_pdf': '',                        # '' = template_elstat_report.pdf next to the program
+    'smart_ack': False,                        # the 'experimental' notice of smart layout was accepted
+    'pdf_mode': 'overlay',                     # 'overlay' (fixed positions) | 'smart' (layout read from the template) | 'manual' (layout editor)
     'open_after': False,
     'confirm_overwrite': True,
     'keep_archive': True,
     'show_reminder': True,
     'prefill_employees': False,
+    'preview_before_result': False,             # show an in-app PDF preview before the Result dialog
 }
 
 
@@ -306,6 +313,8 @@ def load_prefs():
         prefs['output_mode'] = 'program'
     if prefs['language'] not in LANGUAGES:
         prefs['language'] = DEFAULT_PREFS['language']
+    if prefs['pdf_mode'] not in ('overlay', 'smart', 'manual'):
+        prefs['pdf_mode'] = DEFAULT_PREFS['pdf_mode']
     if prefs['theme'] not in ('light', 'dark', 'auto'):
         prefs['theme'] = DEFAULT_PREFS['theme']
     if pattern_error(prefs['filename_pattern']):
@@ -938,8 +947,818 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
     c.save()
 
 
+# ------------------------------------------------------- template layout ("smart layout" mode)
+# Default mode writes every value at fixed positions on top of the blank PDF.  "Smart layout" mode
+# first READS the template (every piece of text and where it sits), compares it with a saved
+# snapshot of the template the fixed positions were made for (the "reference layout") and moves
+# every value by exactly as much as that part of the form has moved.
+LAYOUT_NAME = "elstat_template_layout.json"
+MIN_MATCH_RATIO = 0.6       # share of the reference's text that must be found again in the new template
+MIN_ANCHORS = 8             # ...and at least this many matches on every page
+LARGE_SHIFT = 40.0         # points: a bigger move than this deserves a human look
+DUP_TOLERANCE = 30.0        # points: how far a repeated word may be from where it is expected
+
+
+def layout_file():
+    return os.path.join(DATA_DIR, LAYOUT_NAME)
+
+
+def _median(values):
+    v = sorted(values)
+    n = len(v)
+    if not n:
+        return 0.0
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def _fit_line(pairs):
+    """Robust v = a*u + b through (u, v) pairs. `a` stays 1.0 unless the data clearly shows a scale change."""
+    if not pairs:
+        return 1.0, 0.0
+    sample = pairs if len(pairs) <= 150 else pairs[::max(1, len(pairs) // 150)]
+    a = 1.0
+    if len(sample) >= 6:
+        slopes = [(v2 - v1) / (u2 - u1) for i, (u1, v1) in enumerate(sample)
+                  for (u2, v2) in sample[i + 1:] if abs(u2 - u1) > 20]
+        if slopes:
+            s = _median(slopes)
+            if 0.8 <= s <= 1.25 and abs(s - 1.0) > 0.002:
+                a = s
+    return a, _median([v - a * u for u, v in pairs])
+
+
+def read_template_snapshot(template_pdf):
+    """What the program needs to know about a template: for its first 2 pages the page size and every
+    piece of text with its position (x, y in PDF points, in the page's own coordinates)."""
+    reader = pypdf.PdfReader(template_pdf)
+    if len(reader.pages) < 2:
+        raise ValueError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
+    with open(template_pdf, 'rb') as f:
+        digest = hashlib.sha1(f.read()).hexdigest()
+    pages = []
+    for i in range(2):
+        page = reader.pages[i]
+        items = []
+
+        def visit(text, cm, tm, font_dict, font_size, _items=items):
+            n = norm(text)
+            if not n:
+                return
+            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+            if not any(t == n and abs(x - ox) < 0.5 and abs(y - oy) < 0.5 for t, ox, oy in _items):
+                _items.append([n, round(float(x), 2), round(float(y), 2)])
+
+        page.extract_text(visitor_text=visit)
+        box = page.mediabox
+        pages.append({'size': [float(box.width), float(box.height)], 'items': items})
+    return {'version': 1, 'sha1': digest, 'pages': pages}
+
+
+def load_layout_reference():
+    """The saved reference layout, or None."""
+    try:
+        with open(layout_file(), encoding='utf-8') as f:
+            data = json.load(f)
+        pages = data['pages']
+        if len(pages) == 2 and all(isinstance(p.get('items'), list) for p in pages):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_layout_reference(template_pdf):
+    snap = read_template_snapshot(template_pdf)
+    snap['saved'] = datetime.datetime.now().isoformat(timespec='seconds')
+    snap['template'] = os.path.basename(template_pdf)
+    ensure_data_dir()
+    with open(layout_file(), 'w', encoding='utf-8') as f:
+        json.dump(snap, f, ensure_ascii=False)
+    return snap
+
+
+def match_snapshots(ref, new):
+    """Pairs the text of the reference template with the text of a new one, page by page.
+    -> [{'anchors': [(ref_x, ref_y, dx, dy), ...], 'matched': n, 'total': n}, ...]"""
+    out = []
+    for p in range(2):
+        r_items, n_items = ref['pages'][p]['items'], new['pages'][p]['items']
+        r_by, n_by = {}, {}
+        for t, x, y in r_items:
+            r_by.setdefault(t, []).append((x, y))
+        for t, x, y in n_items:
+            n_by.setdefault(t, []).append((x, y))
+        # words that appear once in both templates give a safe first estimate of the overall shift/scale
+        pairs = [(r_by[t][0], n_by[t][0]) for t in r_by if len(r_by[t]) == 1 and len(n_by.get(t, ())) == 1]
+        ax, bx = _fit_line([(r[0], n[0]) for r, n in pairs])
+        ay, by = _fit_line([(r[1], n[1]) for r, n in pairs])
+        # repeated words are paired with the closest candidate to where they are expected
+        for t, rs in r_by.items():
+            ns = list(n_by.get(t, ()))
+            if not ns or (len(rs) == 1 and len(ns) == 1):
+                continue
+            for rx, ry in sorted(rs, key=lambda q: (-q[1], q[0])):
+                if not ns:
+                    break
+                px, py = ax * rx + bx, ay * ry + by
+                best = min(ns, key=lambda q: (q[0] - px) ** 2 + (q[1] - py) ** 2)
+                if math.hypot(best[0] - px, best[1] - py) <= DUP_TOLERANCE:
+                    ns.remove(best)
+                    pairs.append(((rx, ry), best))
+        # one overall shift/scale for the page, from every pair that was found
+        mx = _fit_line([(r[0], n[0]) for r, n in pairs])
+        my = _fit_line([(r[1], n[1]) for r, n in pairs])
+        out.append({'anchors': [(r[0], r[1], n[0] - r[0], n[1] - r[1]) for r, n in pairs],
+                    'model': (mx, my), 'matched': len(pairs), 'total': len(r_items)})
+    return out
+
+
+class TemplateLayout:
+    """Tells where a value that belongs at (x, y) on the reference template goes on the new template.
+    Two things are combined: the overall shift/scale of the page, and the small local differences
+    measured at the text around the position (every matched piece of text is an anchor that knows
+    how far it moved), so a section that moved on its own is followed and the rest stays put."""
+    NEAREST = 6
+    AGREE = 4.0         # points: a neighbour that disagrees with the others by more than this is ignored
+
+    def __init__(self, pages, sizes, models):
+        self.sizes, self.models = sizes, models
+        self.pages = []                 # per page: anchors as (x, y, what the overall model misses in x / y)
+        for anchors, ((ax, bx), (ay, by)) in zip(pages, models):
+            self.pages.append([(x, y, dx - ((ax - 1.0) * x + bx), dy - ((ay - 1.0) * y + by))
+                               for x, y, dx, dy in anchors])
+
+    def size(self, page):
+        return tuple(self.sizes[page])
+
+    def offset(self, page, x, y):
+        (ax, bx), (ay, by) = self.models[page]
+        gx, gy = (ax - 1.0) * x + bx, (ay - 1.0) * y + by
+        anchors = self.pages[page]
+        if not anchors:
+            return gx, gy
+        near = sorted(anchors, key=lambda a: (a[0] - x) ** 2 + (a[1] - y) ** 2)[:self.NEAREST]
+        mdx, mdy = _median([a[2] for a in near]), _median([a[3] for a in near])
+        keep = [a for a in near if abs(a[2] - mdx) <= self.AGREE and abs(a[3] - mdy) <= self.AGREE] or near
+        wsum = sx = sy = 0.0
+        for a in keep:
+            w = 1.0 / ((a[0] - x) ** 2 + (a[1] - y) ** 2 + 25.0)
+            wsum += w
+            sx += w * a[2]
+            sy += w * a[3]
+        return gx + sx / wsum, gy + sy / wsum
+
+    def place(self, page, x, y):
+        dx, dy = self.offset(page, x, y)
+        return x + dx, y + dy
+
+
+def analyze_template(template_pdf):
+    """-> (TemplateLayout or None, report). The report says what was found (see describe_report)."""
+    rep = {'ok': False, 'identical': False, 'reason': '', 'pages': []}
+    ref = load_layout_reference()
+    if ref is None:
+        rep['reason'] = 'no_reference'
+        return None, rep
+    try:
+        new = read_template_snapshot(template_pdf)
+    except Exception as e:
+        rep['reason'], rep['error'] = 'unreadable', str(e)
+        return None, rep
+    rep['identical'] = bool(ref.get('sha1')) and ref.get('sha1') == new['sha1']
+    matches = match_snapshots(ref, new)
+    for p, m in enumerate(matches):
+        ratio = m['matched'] / m['total'] if m['total'] else 0.0
+        n = len(m['anchors'])
+        rep['pages'].append({
+            'matched': m['matched'], 'total': m['total'], 'ratio': ratio,
+            'mean_dx': sum(a[2] for a in m['anchors']) / n if n else 0.0,
+            'mean_dy': sum(a[3] for a in m['anchors']) / n if n else 0.0,
+            'max_shift': max((math.hypot(a[2], a[3]) for a in m['anchors']), default=0.0)})
+        if not rep['reason'] and (m['matched'] < MIN_ANCHORS or ratio < MIN_MATCH_RATIO):
+            rep['reason'] = 'low_match'
+    if rep['reason']:
+        return None, rep
+    rep['ok'] = True
+    return TemplateLayout([m['anchors'] for m in matches], [pg['size'] for pg in new['pages']],
+                          [m['model'] for m in matches]), rep
+
+
+def describe_report(rep):
+    """The report of analyze_template() in words (current language)."""
+    reason = rep.get('reason')
+    if reason == 'no_reference':
+        return T("Δεν έχει αποθηκευτεί ακόμη διάταξη αναφοράς.\n\nΠατήστε «Αποθήκευση ως αναφορά…» όταν το δελτίο "
+                 "συμπληρώνεται σωστά με το τρέχον template.",
+                 "No reference layout has been saved yet.\n\nPress “Save as reference…” when the form fills in "
+                 "correctly with the current template.")
+    if reason == 'unreadable':
+        return T(f"Δεν μπόρεσα να διαβάσω το template: {rep.get('error', '')}\n\n"
+                 "Βεβαιωθείτε ότι το αρχείο είναι έγκυρο PDF με 2 σελίδες και ότι δεν είναι κατεστραμμένο.",
+                 f"I could not read the template: {rep.get('error', '')}\n\n"
+                 "Make sure the file is a valid 2-page PDF and is not damaged.")
+    if reason == 'low_match':
+        head = T("✗ Το template δεν αναγνωρίζεται με ασφάλεια: έχει λίγα κοινά στοιχεία με την αναφορά.\n"
+                 "Ίσως δεν είναι το σωστό έντυπο ή άλλαξε πολύ. Διαλέξτε το σωστό αρχείο στην καρτέλα «Στοιχεία "
+                 "ξενοδοχείου» ή χρησιμοποιήστε την προεπιλεγμένη μέθοδο.",
+                 "✗ The template cannot be recognised safely: it has too little in common with the reference.\n"
+                 "It may not be the right form, or it changed a lot. Pick the right file in the “Hotel details” tab "
+                 "or use the default method.")
+    elif rep.get('identical'):
+        head = T("✓ Το template είναι ίδιο με την αναφορά - δεν χρειάζεται καμία προσαρμογή.",
+                 "✓ The template is identical to the reference - no adjustment is needed.")
+    else:
+        head = T("✓ Το template αναγνωρίστηκε. Κάθε τιμή θα τοποθετηθεί σύμφωνα με τη νέα του διάταξη.",
+                 "✓ The template was recognised. Every value will be placed according to its new layout.")
+    lines = [head, ""]
+    for i, pg in enumerate(rep.get('pages', []), 1):
+        lines.append(T(f"Σελίδα {i}: ταυτίστηκαν {pg['matched']} από {pg['total']} στοιχεία · "
+                       f"μέση μετατόπιση {pg['mean_dx']:+.1f} / {pg['mean_dy']:+.1f} pt (μέγιστη {pg['max_shift']:.1f} pt)",
+                       f"Page {i}: {pg['matched']} of {pg['total']} items matched · "
+                       f"average shift {pg['mean_dx']:+.1f} / {pg['mean_dy']:+.1f} pt (largest {pg['max_shift']:.1f} pt)"))
+    if rep.get('ok') and max((pg['max_shift'] for pg in rep.get('pages', [])), default=0.0) > LARGE_SHIFT:
+        lines += ["", T("⚠ Το template έχει μετακινηθεί πολύ. Δημιουργήστε ένα «Δοκιμαστικό δελτίο» και ελέγξτε το πριν το υποβάλετε.",
+                         "⚠ The template moved a lot. Create a “Test form” and check it before submitting.")]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------- manual layout ("Set manually" mode)
+# In this mode the person decides where every value goes. The positions, fonts, sizes and colours
+# are made in the built-in layout editor (class LayoutEditor) and kept in elstat_manual_layout.json.
+MANUAL_LAYOUT_NAME = "elstat_manual_layout.json"
+MANUAL_TOTAL_KEYS = ('2.1', '2.2', '2.3', '2', '3', '4', '5', '6', '8', '9')
+MANUAL_TOTAL_Y = {'2.1': 46.5, '2.2': 699.5, '2.3': 520.0, '2': 500.1, '3': 407.1,
+                  '4': 231.7, '5': 141.5, '6': 95.2, '8': 60.5, '9': 43.5}
+MANUAL_TOTAL_NAMES = {
+    '2.1': ("2.1 Σύνολο χωρών Ε.Ε.", "2.1 Total EU countries"),
+    '2.2': ("2.2 Σύνολο χωρών Ε.Ζ.Ε.Σ.", "2.2 Total EFTA countries"),
+    '2.3': ("2.3 Σύνολο λοιπών ευρωπαϊκών χωρών", "2.3 Total other European countries"),
+    '2': ("2. Σύνολο Ευρώπης", "2. Total Europe"),
+    '3': ("3. Σύνολο Αμερικής", "3. Total America"),
+    '4': ("4. Σύνολο Ασίας", "4. Total Asia"),
+    '5': ("5. Σύνολο Αφρικής", "5. Total Africa"),
+    '6': ("6. Σύνολο Ωκεανίας", "6. Total Oceania"),
+    '8': ("8. Σύνολο αλλοδαπών", "8. Total foreign"),
+    '9': ("9. ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "9. GRAND TOTAL"),
+}
+MANUAL_GROUPS = [
+    ('header', ("Επικεφαλίδα", "Heading")),
+    ('hotel', ("Στοιχεία καταλύματος", "Hotel details")),
+    ('period', ("Περίοδος και προσωπικό", "Period and staff")),
+    ('totals', ("Σύνολα κατηγοριών", "Category totals")),
+    ('rows', ("Γραμμές χωρών", "Country rows")),
+    ('sign', ("Ημερομηνία υπογραφής", "Signature date")),
+    ('extra', ("Πρόσθετα στοιχεία", "Extra items")),
+    ('custom', ("Δικά μου κείμενα", "My own texts")),
+]
+# fields whose text has a fixed length can be split into one item per character
+MANUAL_SPLIT_LEN = {'afm': 9, 'days': 2, 'employees': 3, 'year': 4}
+
+
+def _manual_field_table():
+    """[(id, group, (greek, english), page, x, y, size, step)] - the places the program always used."""
+    t = []
+
+    def add(fid, group, label, page, x, y, size=11, step=0.0):
+        t.append((fid, group, label, page, float(x), float(y), float(size), float(step)))
+
+    add('year', 'header', ("Έτος έρευνας", "Survey year"), 0, 380, 675)
+    add('month', 'header', ("Μήνας", "Month"), 0, 480, 675)
+    add('type', 'hotel', ("Είδος καταλύματος", "Type of accommodation"), 0, 160, 613)
+    add('category', 'hotel', ("Κατηγορία", "Category"), 0, 340, 612)
+    add('name', 'hotel', ("Τίτλος καταλύματος", "Hotel name"), 0, 165, 597)
+    add('phone', 'hotel', ("Τηλέφωνο", "Phone"), 0, 110, 548)
+    add('email', 'hotel', ("E-mail", "E-mail"), 0, 420, 548)
+    add('company', 'hotel', ("Επωνυμία επιχείρησης", "Company name"), 0, 435, 385)
+    add('afm', 'hotel', ("ΑΦΜ (ένα ψηφίο ανά κουτάκι)", "VAT number (one digit per box)"), 0, 424, 342, step=14)
+    add('date_from_d', 'period', ("Από: ημέρα", "From: day"), 0, 420, 261)
+    add('date_from_m', 'period', ("Από: μήνας", "From: month"), 0, 465.9, 261)
+    add('date_from_y', 'period', ("Από: έτος", "From: year"), 0, 511.7, 261)
+    add('date_to_d', 'period', ("Έως: ημέρα", "To: day"), 0, 420, 233)
+    add('date_to_m', 'period', ("Έως: μήνας", "To: month"), 0, 465.9, 233)
+    add('date_to_y', 'period', ("Έως: έτος", "To: year"), 0, 511.7, 233)
+    add('days', 'period', ("Ημέρες λειτουργίας", "Days of operation"), 0, 457, 169, step=16)
+    add('employees', 'period', ("Σύνολο εργαζομένων", "Total employees"), 0, 448, 94, step=16)
+    for key in MANUAL_TOTAL_KEYS:
+        page = 0 if key == '2.1' else 1
+        el, en = MANUAL_TOTAL_NAMES[key]
+        add(f'tot_{key}_c', 'totals', (el + " · Πελάτες", en + " · Guests"), page, 265, MANUAL_TOTAL_Y[key], 10)
+        add(f'tot_{key}_n', 'totals', (el + " · Διανυκτ.", en + " · Nights"), page, 335, MANUAL_TOTAL_Y[key], 10)
+    add('rows0_c', 'rows', ("Σελίδα 1 · στήλη Πελάτες (όλες οι χώρες)", "Page 1 · Guests column (all countries)"), 0, 265, 0, 9)
+    add('rows0_n', 'rows', ("Σελίδα 1 · στήλη Διανυκτ. (όλες οι χώρες)", "Page 1 · Nights column (all countries)"), 0, 335, 0, 9)
+    add('rows1_c', 'rows', ("Σελίδα 2 · στήλη Πελάτες (όλες οι χώρες)", "Page 2 · Guests column (all countries)"), 1, 265, 0, 9)
+    add('rows1_n', 'rows', ("Σελίδα 2 · στήλη Διανυκτ. (όλες οι χώρες)", "Page 2 · Nights column (all countries)"), 1, 335, 0, 9)
+    add('sign_d', 'sign', ("Ημερομηνία: ημέρα", "Date: day"), 1, 454, 206, 10)
+    add('sign_m', 'sign', ("Ημερομηνία: μήνας", "Date: month"), 1, 481.8, 206, 10)
+    add('sign_y', 'sign', ("Ημερομηνία: έτος", "Date: year"), 1, 520.7, 206, 10)
+    return t
+
+
+MANUAL_FIELDS = _manual_field_table()
+MANUAL_FIELD_INDEX = {f[0]: f for f in MANUAL_FIELDS}
+
+
+def manual_new_item(page=0, x=100.0, y=400.0, size=11.0, step=0.0, custom=False, text=""):
+    it = {'page': int(page), 'x': float(x), 'y': float(y), 'size': float(size), 'font': '',
+          'bold': False, 'italic': False, 'color': '#000000', 'align': 'left',
+          'step': float(step), 'visible': True}
+    if custom:
+        it['custom'] = True
+        it['text'] = text
+    return it
+
+
+def manual_default_layout():
+    items = {}
+    for fid, _group, _label, page, x, y, size, step in MANUAL_FIELDS:
+        items[fid] = manual_new_item(page, x, y, size, step)
+    return {'version': 1, 'items': items}
+
+
+def manual_layout_file():
+    return os.path.join(DATA_DIR, MANUAL_LAYOUT_NAME)
+
+
+def manual_layout_saved():
+    return os.path.isfile(manual_layout_file())
+
+
+def _merge_manual_item(base, saved):
+    """Copies the usable values of a saved item over `base` (anything odd is ignored)."""
+    for key in ('x', 'y', 'size', 'step'):
+        try:
+            value = float(saved[key])
+            if math.isfinite(value):
+                base[key] = value
+        except (KeyError, TypeError, ValueError):
+            pass
+    base['size'] = min(max(base['size'], 3.0), 96.0)
+    base['step'] = min(max(base['step'], 0.0), 200.0)
+    if saved.get('page') in (0, 1):
+        base['page'] = saved['page']
+    if isinstance(saved.get('font'), str):
+        base['font'] = saved['font']
+    for key in ('bold', 'italic', 'visible'):
+        if isinstance(saved.get(key), bool):
+            base[key] = saved[key]
+    if isinstance(saved.get('color'), str) and re.fullmatch(r'#[0-9a-fA-F]{6}', saved['color']):
+        base['color'] = saved['color'].lower()
+    if saved.get('align') in ('left', 'center', 'right'):
+        base['align'] = saved['align']
+    if base.get('custom') and isinstance(saved.get('text'), str):
+        base['text'] = saved['text']
+    for key in ('parent', 'country', 'source'):
+        if isinstance(saved.get(key), str) and saved[key]:
+            base[key] = saved[key]
+    if isinstance(saved.get('index'), int) and not isinstance(saved.get('index'), bool):
+        base['index'] = saved['index']
+    if isinstance(saved.get('split'), bool):
+        base['split'] = saved['split']
+
+
+def load_manual_layout():
+    """The saved manual layout merged over the program's own positions (so new fields always exist)."""
+    layout = manual_default_layout()
+    try:
+        with open(manual_layout_file(), encoding='utf-8') as f:
+            data = json.load(f)
+        saved = data.get('items', {}) if isinstance(data, dict) else {}
+    except Exception:
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    for fid, it in saved.items():
+        if not isinstance(it, dict):
+            continue
+        if fid in layout['items']:
+            _merge_manual_item(layout['items'][fid], it)
+        elif not isinstance(fid, str):
+            continue
+        elif it.get('custom') and fid.startswith('custom_'):
+            layout['items'][fid] = base = manual_new_item(custom=True)
+            _merge_manual_item(base, it)
+        elif it.get('source') and fid.startswith('extra_'):
+            layout['items'][fid] = base = manual_new_item(size=10.0)
+            _merge_manual_item(base, it)
+        elif it.get('parent') and '@' in fid:
+            layout['items'][fid] = base = manual_new_item()
+            _merge_manual_item(base, it)
+    items = layout['items']
+    for fid in [f for f, i in items.items() if i.get('parent') and not items.get(i['parent'], {}).get('split')]:
+        del items[fid]                      # a piece whose whole is not split any more
+    for fid, i in items.items():
+        if i.get('split') and not any(c.get('parent') == fid for c in items.values()):
+            i['split'] = False
+    return layout
+
+
+def save_manual_layout(layout):
+    ensure_data_dir()
+    with open(manual_layout_file(), 'w', encoding='utf-8') as f:
+        json.dump({'version': 1, 'items': layout['items']}, f, ensure_ascii=False, indent=1)
+
+
+def delete_manual_layout():
+    try:
+        os.remove(manual_layout_file())
+    except FileNotFoundError:
+        pass
+
+
+def _pretty_target(key):
+    """Readable name of a form row stored as a normalised key."""
+    for v in country_mapping_destinations():
+        if norm(v) == key:
+            return v
+    return pretty_country(key)
+
+
+_EXTRA_SOURCES = (
+    ('month_name', ("Όνομα μήνα (π.χ. Μάρτιος)", "Month name (e.g. March)")),
+    ('year2', ("Έτος (2 ψηφία)", "Year (2 digits)")),
+    ('date_from_full', ("Από: πλήρης ημερομηνία", "From: full date")),
+    ('date_to_full', ("Έως: πλήρης ημερομηνία", "To: full date")),
+    ('sign_full', ("Ημερομηνία υπογραφής (πλήρης)", "Signing date (full)")),
+    ('hotel_line', ("Είδος · Τίτλος · Κατηγορία", "Type · Name · Category")),
+)
+
+
+def manual_source_catalog():
+    """[(key, (greek, english), group)] - everything that can be put on the form (searched in the editor)."""
+    cat = []
+    for fid, group, label, *_rest in MANUAL_FIELDS:
+        if group != 'rows':
+            cat.append((fid, label, group))
+    for key, label in _EXTRA_SOURCES:
+        cat.append((key, label, 'extra'))
+    for name in country_mapping_destinations():
+        key = norm(name)
+        cat.append((f'country:{key}:c', (f"{name} · Πελάτες", f"{name} · Guests"), 'country'))
+        cat.append((f'country:{key}:n', (f"{name} · Διανυκτ.", f"{name} · Nights"), 'country'))
+    return cat
+
+
+def manual_source_label(source):
+    for key, label, _group in manual_source_catalog():
+        if key == source:
+            return T(*label)
+    return source
+
+
+def manual_group(fid, it):
+    if it.get('custom'):
+        return 'custom'
+    if it.get('source'):
+        return 'extra'
+    if it.get('parent'):
+        fid = it['parent']
+    return MANUAL_FIELD_INDEX[fid][1] if fid in MANUAL_FIELD_INDEX else 'custom'
+
+
+def manual_label(fid, it):
+    if it.get('custom'):
+        return it.get('text') or T("(κενό κείμενο)", "(empty text)")
+    if it.get('source'):
+        return manual_source_label(it['source'])
+    parent = it.get('parent')
+    if parent and it.get('country'):
+        col = T("Πελάτες", "Guests") if parent.endswith('_c') else T("Διανυκτ.", "Nights")
+        return f"{_pretty_target(it['country'])} · {col} · " + T(f"Σελ. {it.get('page', 0) + 1}", f"Pg {it.get('page', 0) + 1}")
+    if parent:
+        return f"{manual_label(parent, {})} · #{it.get('index', 0) + 1}"
+    entry = MANUAL_FIELD_INDEX.get(fid)
+    return T(*entry[2]) if entry else fid
+
+
+def manual_split_item(layout, fid, sample_text, row_keys):
+    """Replaces one grouped item (country column, digit boxes) by individual items. Returns the new ids."""
+    items = layout['items']
+    it = items[fid]
+    if it.get('split') or it.get('parent') or it.get('custom') or it.get('source'):
+        return []
+    keep = {k: it[k] for k in ('page', 'size', 'font', 'bold', 'italic', 'color', 'visible', 'align')}
+    made = []
+    if fid.startswith('rows'):
+        for key in row_keys:
+            cid = f"{fid}@{key}"
+            child = manual_new_item(it['page'], it['x'], it['y'], it['size'])
+            child.update(keep, parent=fid, country=key, step=0.0)
+            items[cid] = child
+            made.append(cid)
+    else:
+        text = sample_text
+        if len(text) < 2:
+            return []
+        step = it['step']
+        if step:
+            xs = [it['x'] + i * step for i in range(len(text))]
+            align = it['align']
+        else:
+            font = manual_pdf_font(it['font'], it['bold'], it['italic'])
+            widths = [pdfmetrics.stringWidth(ch, font, it['size']) for ch in text]
+            total = sum(widths)
+            start = it['x'] - {'left': 0.0, 'center': total / 2.0, 'right': total}.get(it['align'], 0.0)
+            xs = [start + sum(widths[:i]) for i in range(len(text))]
+            align = 'left'
+        for i, x in enumerate(xs):
+            cid = f"{fid}@{i}"
+            child = manual_new_item(it['page'], round(x, 2), it['y'], it['size'])
+            child.update(keep, parent=fid, index=i, step=0.0, align=align)
+            items[cid] = child
+            made.append(cid)
+    if made:
+        it['split'] = True
+    return made
+
+
+def manual_merge_item(layout, fid):
+    """Removes the individual pieces of `fid` and makes it a single item again."""
+    items = layout['items']
+    for cid in [c for c, i in items.items() if i.get('parent') == fid]:
+        del items[cid]
+    if fid in items:
+        items[fid]['split'] = False
+
+
+# ---- fonts: only families that are really installed are offered
+_FONT_DIRS = [r"C:\Windows\Fonts", "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation",
+              "/usr/share/fonts/truetype/liberation2", "/usr/share/fonts/TTF", "/usr/share/fonts/dejavu",
+              "/Library/Fonts", "/System/Library/Fonts/Supplemental", os.path.expanduser("~/Library/Fonts"),
+              os.path.expanduser("~/.fonts"), os.path.expanduser("~/.local/share/fonts")]
+# family -> candidate file names of (regular, bold, italic, bold italic)
+_FONT_FILES = {
+    'Arial': (('arial.ttf', 'Arial.ttf'), ('arialbd.ttf', 'Arial Bold.ttf'), ('ariali.ttf', 'Arial Italic.ttf'),
+              ('arialbi.ttf', 'Arial Bold Italic.ttf')),
+    'Tahoma': (('tahoma.ttf',), ('tahomabd.ttf',), (), ()),
+    'DejaVu Sans': (('DejaVuSans.ttf',), ('DejaVuSans-Bold.ttf',), ('DejaVuSans-Oblique.ttf',),
+                    ('DejaVuSans-BoldOblique.ttf',)),
+    'Liberation Sans': (('LiberationSans-Regular.ttf',), ('LiberationSans-Bold.ttf',),
+                        ('LiberationSans-Italic.ttf',), ('LiberationSans-BoldItalic.ttf',)),
+    'Calibri': (('calibri.ttf',), ('calibrib.ttf',), ('calibrii.ttf',), ('calibriz.ttf',)),
+    'Segoe UI': (('segoeui.ttf',), ('segoeuib.ttf',), ('segoeuii.ttf',), ('segoeuiz.ttf',)),
+    'Verdana': (('verdana.ttf', 'Verdana.ttf'), ('verdanab.ttf', 'Verdana Bold.ttf'),
+                ('verdanai.ttf', 'Verdana Italic.ttf'), ('verdanaz.ttf', 'Verdana Bold Italic.ttf')),
+    'Times New Roman': (('times.ttf', 'Times New Roman.ttf'), ('timesbd.ttf', 'Times New Roman Bold.ttf'),
+                        ('timesi.ttf', 'Times New Roman Italic.ttf'), ('timesbi.ttf', 'Times New Roman Bold Italic.ttf')),
+    'Courier New': (('cour.ttf', 'Courier New.ttf'), ('courbd.ttf', 'Courier New Bold.ttf'),
+                    ('couri.ttf', 'Courier New Italic.ttf'), ('courbi.ttf', 'Courier New Bold Italic.ttf')),
+    'DejaVu Serif': (('DejaVuSerif.ttf',), ('DejaVuSerif-Bold.ttf',), ('DejaVuSerif-Italic.ttf',),
+                     ('DejaVuSerif-BoldItalic.ttf',)),
+    'Liberation Serif': (('LiberationSerif-Regular.ttf',), ('LiberationSerif-Bold.ttf',),
+                         ('LiberationSerif-Italic.ttf',), ('LiberationSerif-BoldItalic.ttf',)),
+    'DejaVu Sans Mono': (('DejaVuSansMono.ttf',), ('DejaVuSansMono-Bold.ttf',), ('DejaVuSansMono-Oblique.ttf',),
+                         ('DejaVuSansMono-BoldOblique.ttf',)),
+    'Liberation Mono': (('LiberationMono-Regular.ttf',), ('LiberationMono-Bold.ttf',),
+                        ('LiberationMono-Italic.ttf',), ('LiberationMono-BoldItalic.ttf',)),
+}
+_FONT_FAMILIES_CACHE = []
+
+
+def _find_font_file(names):
+    for folder in _FONT_DIRS:
+        for name in names:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def manual_font_families():
+    """Font families that are installed on this computer (the first one is the program's usual font)."""
+    if not _FONT_FAMILIES_CACHE:
+        _FONT_FAMILIES_CACHE.extend(f for f, files in _FONT_FILES.items() if _find_font_file(files[0]))
+    return list(_FONT_FAMILIES_CACHE)
+
+
+def manual_pdf_font(family, bold=False, italic=False):
+    """Name of a reportlab font for the family/style (registered on first use)."""
+    families = manual_font_families()
+    if family not in families:
+        family = families[0] if families else None
+    if family is None:
+        return ('Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique', 'Helvetica-BoldOblique')[(1 if bold else 0) + (2 if italic else 0)]
+    files = _FONT_FILES[family]
+    wanted = (1 if bold else 0) + (2 if italic else 0)            # 0 regular, 1 bold, 2 italic, 3 bold italic
+    order = [wanted] + ([1] if bold and wanted == 3 else []) + ([2] if italic and wanted == 3 else []) + [0]
+    for idx in order:
+        path = _find_font_file(files[idx]) if files[idx] else None
+        if not path:
+            continue
+        name = f"MF_{family.replace(' ', '')}_{idx}"
+        if name not in pdfmetrics.getRegisteredFontNames():
+            try:
+                pdfmetrics.registerFont(TTFont(name, path))
+            except Exception:
+                continue
+        return name
+    return 'Helvetica'
+
+
+# ---- the text that goes into each field
+def manual_field_values(settings_data, monthly_data, totals):
+    """{field id: text} for every automatic field."""
+    v = {k: settings_data.get(k, '') for k in ('type', 'category', 'name', 'phone', 'email', 'company', 'afm')}
+    v['year'] = monthly_data['year']
+    v['month'] = monthly_data['month']
+    v.update(date_from_d='01', date_from_m='01', date_from_y=monthly_data['year'])
+    parts = monthly_data['date_to'].split('/')
+    if len(parts) == 3:
+        v.update(date_to_d=parts[0], date_to_m=parts[1], date_to_y=parts[2])
+    else:
+        v.update(date_to_d=monthly_data['date_to'], date_to_m='', date_to_y='')
+    v['days'] = monthly_data['days_of_month'].zfill(2)
+    v['employees'] = monthly_data.get('employees', '0').zfill(3)
+    try:
+        today = datetime.datetime.strptime(monthly_data.get('sign_date', ''), "%d/%m/%Y").date()
+    except ValueError:
+        today = datetime.date.today()
+    v.update(sign_d=today.strftime('%d'), sign_m=today.strftime('%m'),
+             sign_y=str(today.year)[-2:] if str(today.year).startswith("20") else str(today.year))
+    for key in MANUAL_TOTAL_KEYS:
+        if totals[key]['clients'] > 0:
+            v[f'tot_{key}_c'] = str(totals[key]['clients'])
+            v[f'tot_{key}_n'] = str(totals[key]['nights'])
+    try:
+        mi = int(monthly_data['month'])
+    except (ValueError, TypeError):
+        mi = 0
+    v['month_name'] = GREEK_MONTHS[mi - 1] if 1 <= mi <= 12 else ''
+    v['year2'] = str(monthly_data['year'])[-2:]
+    v['date_from_full'] = f"01/01/{monthly_data['year']}"
+    v['date_to_full'] = monthly_data['date_to']
+    v['sign_full'] = today.strftime('%d/%m/%Y')
+    v['hotel_line'] = ' · '.join(x for x in (v['type'], v['name'], v['category']) if x)
+    return v
+
+
+def manual_sample_inputs():
+    """Made-up hotel + month, used for the editor preview and its test PDF."""
+    sample = {'type': 'ΞΕΝΟΔΟΧΕΙΟ', 'name': 'TEST HOTEL', 'category': '5*', 'email': 'test@example.com',
+              'phone': '2310000000', 'afm': '123456789', 'company': 'TEST COMPANY'}
+    today = datetime.date.today()
+    last = calendar.monthrange(today.year, today.month)[1]
+    mon = dict(year=str(today.year), month=str(today.month), date_to=f"{last:02d}/{today.month:02d}/{today.year}",
+               days_of_month=str(last), employees='25', sign_date=today.strftime('%d/%m/%Y'))
+    return sample, mon
+
+
+def manual_sample_values():
+    sample, mon = manual_sample_inputs()
+    totals = {key: {'clients': 1234, 'nights': 5678} for key in MANUAL_TOTAL_KEYS}
+    return manual_field_values(sample, mon, totals)
+
+
+# ---- drawing
+def _hex_rgb(color):
+    try:
+        return tuple(int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    except (ValueError, TypeError, IndexError):
+        return (0.0, 0.0, 0.0)
+
+
+def _manual_put(can, it, x, y, text):
+    step = it.get('step') or 0
+    draw = {'center': can.drawCentredString, 'right': can.drawRightString}.get(it.get('align'), can.drawString)
+    if step:
+        for i, ch in enumerate(text):
+            draw(x + i * step, y, ch)
+    else:
+        draw(x, y, text)
+
+
+def draw_manual_page(can, page_num, layout, values, row_ys, row_vals):
+    """Writes every visible item of one page. row_ys: {country: y on this page}; row_vals: {country: {...}}."""
+    for fid, it in layout['items'].items():
+        if it.get('page') != page_num or not it.get('visible', True) or it.get('split'):
+            continue
+        can.setFont(manual_pdf_font(it.get('font', ''), it.get('bold', False), it.get('italic', False)), it['size'])
+        can.setFillColorRGB(*_hex_rgb(it.get('color', '#000000')))
+        parent, country, source = it.get('parent'), it.get('country'), it.get('source')
+        if country:                               # one country of a split column
+            column = 'clients' if parent.endswith('_c') else 'nights'
+            if country in row_ys and country in row_vals:
+                _manual_put(can, it, it['x'], row_ys[country] + it['y'], str(row_vals[country][column]))
+        elif parent:                              # one character of a split field
+            text = str(values.get(parent, ''))
+            idx = it.get('index', 0)
+            if 0 <= idx < len(text):
+                _manual_put(can, it, it['x'], it['y'], text[idx])
+        elif fid.startswith('rows'):
+            column = 'clients' if fid.endswith('_c') else 'nights'
+            for country, y in row_ys.items():
+                if country in row_vals:
+                    _manual_put(can, it, it['x'], y + it['y'], str(row_vals[country][column]))
+        elif source and source.startswith('country:'):
+            _tag, target, col = source.split(':')
+            if target in row_vals:
+                _manual_put(can, it, it['x'], it['y'],
+                            str(row_vals[target]['clients' if col == 'c' else 'nights']))
+        else:
+            text = it.get('text', '') if it.get('custom') else values.get(source or fid, '')
+            if text:
+                _manual_put(can, it, it['x'], it['y'], str(text))
+
+
+# ---- reading the template (used by the editor)
+def detect_template_rows(template_pdf):
+    """[{country: y}, {country: y}] - where each country row sits on page 1 and page 2 of the template."""
+    reader = pypdf.PdfReader(template_pdf)
+    targets = sorted(MAPPED_TARGETS | {norm('ΕΛΛΑΔΑ')}, key=len, reverse=True)
+    found = [{}, {}]
+    for i in range(min(2, len(reader.pages))):
+        def visitor_text(text, cm, tm, fontDict, fontSize, _i=i):
+            n = norm(text)
+            if not n:
+                return
+            for target in targets:
+                if n.startswith(target):
+                    found[_i].setdefault(target, tm[5])
+                    break
+        reader.pages[i].extract_text(visitor_text=visitor_text)
+    if norm('ΤΟΥΡΚΙΑ') not in found[1]:
+        found[1][norm('ΤΟΥΡΚΙΑ')] = 555.2222
+    return found
+
+
+def template_text_items(template_pdf):
+    """[[(text, x, y, size)], [...]] for the 2 pages - a plain stand-in when the page cannot be drawn."""
+    reader = pypdf.PdfReader(template_pdf)
+    pages = [[], []]
+    for i in range(min(2, len(reader.pages))):
+        def visitor_text(text, cm, tm, fontDict, fontSize, _i=i):
+            if text.strip():
+                x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+                y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                pages[_i].append((text.strip(), x, y, max(5.0, float(fontSize or 8) * abs(cm[0] or 1))))
+        reader.pages[i].extract_text(visitor_text=visitor_text)
+    return pages
+
+
+def _png_bytes(width, height, rgb):
+    import struct
+    import zlib
+    stride = width * 3
+    raw = b''.join(b'\x00' + rgb[y * stride:(y + 1) * stride] for y in range(height))
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 3)) + chunk(b'IEND', b''))
+
+
+def render_pdf_page_png(pdf_path, page_index, scale):
+    """PNG bytes of one PDF page drawn at `scale` pixels per point, or None if nothing here can draw PDFs.
+    Tried in turn: pypdfium2, PyMuPDF, Poppler's pdftoppm."""
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(pdf_path)
+        try:
+            bitmap = doc[page_index].render(scale=scale)
+            try:
+                buf = io.BytesIO()
+                bitmap.to_pil().convert('RGB').save(buf, format='PNG')
+                return buf.getvalue()
+            except Exception:
+                arr = bitmap.to_numpy()
+                rgb = arr[:, :, :3][:, :, ::-1].copy().tobytes()
+                return _png_bytes(arr.shape[1], arr.shape[0], rgb)
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            return doc[page_index].get_pixmap(matrix=fitz.Matrix(scale, scale)).tobytes('png')
+        finally:
+            doc.close()
+    except Exception:
+        pass
+    exe = shutil.which('pdftoppm')
+    if exe:
+        tmp = tempfile.mkdtemp()
+        try:
+            prefix = os.path.join(tmp, 'p')
+            subprocess.run([exe, '-png', '-r', f"{72 * scale:.1f}", '-f', str(page_index + 1), '-l', str(page_index + 1),
+                            '-singlefile', pdf_path, prefix], check=True, capture_output=True, timeout=40,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            with open(prefix + '.png', 'rb') as f:
+                return f.read()
+        except Exception:
+            pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return None
+
+
 def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, monthly_data,
-                         rows_override=None, save_history=True):
+                         rows_override=None, save_history=True, pdf_mode='overlay', manual_layout=None):
     # 1. Φόρτωση Γραμματοσειράς
     font_name = "Helvetica"
     font_paths = [
@@ -1017,6 +1836,29 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     reader = pypdf.PdfReader(template_pdf)
     if len(reader.pages) < 2:
         raise ValueError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
+
+    # "Smart layout": find out where everything sits on THIS template; any failure -> default method
+    layout, layout_warning, layout_info = None, None, None
+    if pdf_mode == 'smart':
+        layout, layout_report = analyze_template(template_pdf)
+        if layout is None:
+            layout_warning = (T("Η έξυπνη διάταξη δεν εφαρμόστηκε - χρησιμοποιήθηκε η προεπιλεγμένη μέθοδος.\n",
+                                "Smart layout was not applied - the default method was used.\n")
+                              + describe_report(layout_report))
+        else:
+            shifts = layout_report['pages']
+            biggest = max(p['max_shift'] for p in shifts)
+            layout_info = T(f"Έξυπνη διάταξη: μέγιστη μετατόπιση {biggest:.1f} pt.",
+                            f"Smart layout: largest shift {biggest:.1f} pt.")
+            if biggest > LARGE_SHIFT:
+                layout_warning = T(f"Η έξυπνη διάταξη εφαρμόστηκε, αλλά το template έχει μετακινηθεί πολύ ({biggest:.0f} pt). "
+                                   "Ελέγξτε προσεκτικά το δελτίο πριν το υποβάλετε.",
+                                   f"Smart layout was applied, but the template moved a lot ({biggest:.0f} pt). "
+                                   "Check the form carefully before submitting.")
+
+    def place(page_num, x, y):
+        return layout.place(page_num, x, y) if layout else (x, y)
+
     coord_map = {0: {}, 1: {}}
     for i in range(2):
         page = reader.pages[i]
@@ -1026,12 +1868,13 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
                 return
             for target in sorted(pdf_data.keys(), key=len, reverse=True):
                 if n.startswith(target):
-                    coord_map[_i].setdefault(target, tm[5])
+                    y = tm[5] if layout is None else tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                    coord_map[_i].setdefault(target, y)
                     break
         page.extract_text(visitor_text=visitor_text)
 
     if norm('ΤΟΥΡΚΙΑ') in pdf_data and norm('ΤΟΥΡΚΙΑ') not in coord_map[1]:
-        coord_map[1][norm('ΤΟΥΡΚΙΑ')] = 555.2222
+        coord_map[1][norm('ΤΟΥΡΚΙΑ')] = place(1, 265, 555.2222)[1]
 
     fixed_y = {
         '2.1': 46.5, '2.2': 699.5, '2.3': 520.0, '2': 500.1,
@@ -1041,37 +1884,44 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
 
     def create_overlay(page_num, data_dict, coords, totals_dict):
         packet = io.BytesIO()
-        can = canvas.Canvas(packet)
+        can = canvas.Canvas(packet, pagesize=layout.size(page_num)) if layout else canvas.Canvas(packet)
+
+        def put(x, y, s):
+            nx, ny = place(page_num, x, y)
+            can.drawString(nx, ny, s)
+
+        def put_row(x, y, s):       # country rows: y was read from this template, only x may need to move
+            can.drawString(x + (layout.offset(page_num, x, y)[0] if layout else 0.0), y, s)
         
         # ΣΕΛΙΔΑ 1
         if page_num == 0:
             can.setFont(font_name, 11)
-            can.drawString(160, 613, settings_data['type'])
-            can.drawString(340, 612, settings_data['category'])
-            can.drawString(165, 597, settings_data['name'])
-            can.drawString(110, 548, settings_data['phone'])
-            can.drawString(420, 548, settings_data['email'])  
-            can.drawString(435, 385, settings_data['company'])
+            put(160, 613, settings_data['type'])
+            put(340, 612, settings_data['category'])
+            put(165, 597, settings_data['name'])
+            put(110, 548, settings_data['phone'])
+            put(420, 548, settings_data['email'])  
+            put(435, 385, settings_data['company'])
             
             afm_str = settings_data['afm']
             afm_start_x = 424  
             afm_step = 14.0    
             
             for i, digit in enumerate(afm_str):
-                can.drawString(afm_start_x + (i * afm_step), 342, digit)
+                put(afm_start_x + (i * afm_step), 342, digit)
             
-            can.drawString(380, 675, monthly_data['year'])
-            can.drawString(480, 675, monthly_data['month'])
+            put(380, 675, monthly_data['year'])
+            put(480, 675, monthly_data['month'])
             
             date_from_str = f"01           01           {monthly_data['year']}"
-            can.drawString(420, 261, date_from_str)
+            put(420, 261, date_from_str)
             
             dt_parts = monthly_data['date_to'].split('/')
             if len(dt_parts) == 3:
                 date_to_str = f"{dt_parts[0]}           {dt_parts[1]}           {dt_parts[2]}"
             else:
                 date_to_str = monthly_data['date_to']
-            can.drawString(420, 233, date_to_str)
+            put(420, 233, date_to_str)
             
             days_val = monthly_data['days_of_month']
             if len(days_val) == 1:
@@ -1081,7 +1931,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
             days_step = 16.0    
             
             for i, digit in enumerate(days_val):
-                can.drawString(days_start_x + (i * days_step), 169, digit)
+                put(days_start_x + (i * days_step), 169, digit)
                 
             emp_val = monthly_data.get('employees', '0')
             emp_val = emp_val.zfill(3) if len(emp_val) < 3 else emp_val
@@ -1091,20 +1941,20 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
             emp_y = 94       
             
             for i, digit in enumerate(emp_val):
-                can.drawString(emp_start_x + (i * emp_step), emp_y, digit)
+                put(emp_start_x + (i * emp_step), emp_y, digit)
             
             can.setFont(font_name, 10)
             if totals_dict['2.1']['clients'] > 0:
-                can.drawString(265, fixed_y['2.1'], str(totals_dict['2.1']['clients']))
-                can.drawString(335, fixed_y['2.1'], str(totals_dict['2.1']['nights']))
+                put(265, fixed_y['2.1'], str(totals_dict['2.1']['clients']))
+                put(335, fixed_y['2.1'], str(totals_dict['2.1']['nights']))
 
         # ΣΕΛΙΔΑ 2
         else:
             can.setFont(font_name, 10)
             for key in fixed_y.keys():
                 if key != '2.1' and totals_dict[key]['clients'] > 0:
-                    can.drawString(265, fixed_y[key], str(totals_dict[key]['clients']))
-                    can.drawString(335, fixed_y[key], str(totals_dict[key]['nights']))
+                    put(265, fixed_y[key], str(totals_dict[key]['clients']))
+                    put(335, fixed_y[key], str(totals_dict[key]['nights']))
                     
             try:
                 today = datetime.datetime.strptime(monthly_data.get('sign_date', ''), "%d/%m/%Y").date()
@@ -1112,15 +1962,30 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
                 today = datetime.date.today()
             year_suffix = str(today.year)[-2:] if str(today.year).startswith("20") else str(today.year)
             today_str = f"{today.strftime('%d')}      {today.strftime('%m')}          {year_suffix}"
-            can.drawString(454, 206, today_str)
+            put(454, 206, today_str)
 
         can.setFont(font_name, 9)
         for country, y_val in coords.items():
             if country in data_dict:
                 cl, ni = data_dict[country]['clients'], data_dict[country]['nights']
-                can.drawString(265, y_val, str(cl))
-                can.drawString(335, y_val, str(ni))
+                put_row(265, y_val, str(cl))
+                put_row(335, y_val, str(ni))
                 
+        can.save()
+        packet.seek(0)
+        return pypdf.PdfReader(packet)
+
+    # "Set manually": positions, fonts and colours come from the layout made in the layout editor
+    manual = manual_values = None
+    if pdf_mode == 'manual':
+        manual = manual_layout if manual_layout is not None else load_manual_layout()
+        manual_values = manual_field_values(settings_data, monthly_data, totals)
+
+    def create_manual_overlay(page_num):
+        box = reader.pages[page_num].mediabox
+        packet = io.BytesIO()
+        can = canvas.Canvas(packet, pagesize=(float(box.width), float(box.height)))
+        draw_manual_page(can, page_num, manual, manual_values, coord_map[page_num], pdf_data)
         can.save()
         packet.seek(0)
         return pypdf.PdfReader(packet)
@@ -1128,12 +1993,18 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     writer = pypdf.PdfWriter()
     for i in range(2):
         page = reader.pages[i]
-        overlay_pdf = create_overlay(i, pdf_data, coord_map[i], totals)
+        overlay_pdf = create_manual_overlay(i) if manual is not None else create_overlay(i, pdf_data, coord_map[i], totals)
         page.merge_page(overlay_pdf.pages[0])
         writer.add_page(page)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
+
+    if save_history and pdf_mode == 'overlay' and load_layout_reference() is None:
+        try:        # the first real form made the default way shows the template the fixed positions fit
+            save_layout_reference(template_pdf)
+        except Exception:
+            pass
 
     if save_history:
         # Αυτόματη δημιουργία ή ενημέρωση ιστορικού CSV
@@ -1174,7 +2045,8 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         (T("8.  Σύνολο αλλοδαπών", "8.  Total foreign"), totals['8']['clients'], totals['8']['nights'], True),
         (T("9.  ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "9.  GRAND TOTAL"), totals['9']['clients'], totals['9']['nights'], True),
     ]
-    return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary}
+    return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary,
+            'layout_warning': layout_warning, 'layout_info': layout_info}
 
 
 # ----------------------------------------------------------------- look & feel
@@ -1636,6 +2508,7 @@ MANUAL = [
                "δελτίο της ΕΛΣΤΑΤ σε PDF. Ο μήνας ολοκληρώνεται σε πέντε βήματα:",
                "The program takes the Excel file that Protel produces and fills in the monthly ELSTAT form as a PDF "
                "automatically. A month takes five steps:")),
+        ('live', 'next'),
         ('step', ("Την πρώτη φορά, ανοίξτε την καρτέλα **Στοιχεία ξενοδοχείου** και συμπληρώστε τα στοιχεία σας. "
                   "Γίνεται μία φορά και το πρόγραμμα τα θυμάται.",
                   "The first time, open the **Hotel details** tab and fill in your details. You do this once; "
@@ -1653,6 +2526,30 @@ MANUAL = [
         ('tip', ("Κάθε δελτίο αρχειοθετείται αυτόματα. Μπορείτε να το ξανανοίξετε ή να το εκτυπώσετε όποτε θέλετε από το **Ιστορικό**.",
                  "Every form is archived automatically. You can reopen or print it whenever you like from **History**.")),
         ('go', ("Ξεκινήστε από το Δελτίο μήνα", "Go to the Monthly form"), 'tab:report'),
+    ]),
+    dict(id='status', title=("Κατάσταση συστήματος", "Live status"), blocks=[
+        ('p', ("Αυτή η σελίδα ελέγχει το πρόγραμμα αυτή τη στιγμή και ανανεώνεται κάθε φορά που την ανοίγετε. "
+               "Πατήστε σε μια γραμμή για να πάτε εκεί που διορθώνεται.",
+               "This page checks the program right now and refreshes every time you open it. "
+               "Click a line to jump to where it is fixed.")),
+        ('live', 'next'),
+        ('h', ("Έλεγχοι", "Checks")),
+        ('live', 'status'),
+        ('h', ("Γρήγορες ενέργειες", "Quick actions")),
+        ('act', ("Επιλογή Excel του μήνα", "Choose the month's Excel"), 'choose_excel'),
+        ('act', ("Άνοιγμα του επεξεργαστή διάταξης", "Open the layout editor"), 'open_editor'),
+        ('act', ("Άνοιγμα του φακέλου δεδομένων", "Open the data folder"), 'open_data'),
+        ('act', ("Αντίγραφο ασφαλείας (.zip)…", "Backup (.zip)…"), 'backup'),
+        ('act', ("Εναλλαγή εμφάνισης (φωτεινή / σκούρα)", "Switch appearance (light / dark)"), 'theme'),
+        ('h', ("Τρέχουσες ρυθμίσεις", "Current settings")),
+        ('li', ("Μέθοδος συμπλήρωσης PDF: **[[pdf_mode_name]]**", "PDF filling method: **[[pdf_mode_name]]**")),
+        ('li', ("Φάκελος δεδομένων: `[[data_dir]]`", "Data folder: `[[data_dir]]`")),
+        ('li', ("Το επόμενο PDF θα αποθηκευτεί ως: `[[next_pdf]]`", "The next PDF will be saved as: `[[next_pdf]]`")),
+        ('li', ("Template: `[[template_name]]`", "Template: `[[template_name]]`")),
+        ('li', ("Γλώσσα: [[language_name]] · Εμφάνιση: [[theme_name]]", "Language: [[language_name]] · Appearance: [[theme_name]]")),
+        ('li', ("Δελτία στο ιστορικό: **[[months_count]]** · Τελευταίο: [[last_month]]",
+                "Forms in the history: **[[months_count]]** · Latest: [[last_month]]")),
+        ('li', ("Δικές σας αντιστοιχίσεις χωρών: **[[custom_count]]**", "Your own country mappings: **[[custom_count]]**")),
     ]),
     dict(id='monthly', title=("Δελτίο μήνα", "Monthly form"), blocks=[
         ('p', ("Η καρτέλα που θα χρησιμοποιείτε κάθε μήνα. Έχει τρία βήματα και, κάτω, τα κουμπιά δημιουργίας.",
@@ -1688,6 +2585,7 @@ MANUAL = [
         ('h', ("Βήμα 3 - Πού αποθηκεύεται το PDF", "Step 3 - Where the PDF is saved")),
         ('p', ("Η θέση προτείνεται αυτόματα με βάση τις Ρυθμίσεις (φάκελος και όνομα αρχείου). Για άλλη θέση πατήστε **Αλλαγή…**.",
                "The location is suggested automatically from the Settings (folder and file name). For another location click **Change…**.")),
+        ('li', ("Αυτή τη στιγμή προτείνεται: `[[next_pdf]]`", "Right now it suggests: `[[next_pdf]]`")),
         ('h', ("Δημιουργία του δελτίου", "Creating the form")),
         ('p', ("Πάνω από τα κουμπιά υπάρχει πάντα ένα μήνυμα ελέγχου. Αν κάτι λείπει ή είναι λάθος, το μήνυμα το απαριθμεί και τα κουμπιά "
                "είναι γκρι. Όταν όλα είναι σωστά γράφει «Όλα είναι έτοιμα».",
@@ -1797,6 +2695,51 @@ MANUAL = [
         ('h', ("Αρχεία Excel από το Protel", "Excel files from Protel")),
         ('p', ("Από ποιον φάκελο ξεκινούν τα **Επιλογή Excel…** και **Πιο πρόσφατο**. Κενό σημαίνει ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
                "The folder where **Choose Excel…** and **Latest** start. Empty means the folder of the last Excel you used.")),
+        ('h', ("Τρόπος συμπλήρωσης του PDF (η έξυπνη διάταξη είναι πειραματική)",
+               "How the PDF is filled in (smart layout is experimental)")),
+        ('p', ("**Πάνω στο template** (προεπιλογή) γράφει τις τιμές σε σταθερές θέσεις πάνω στο άδειο PDF. "
+               "**Έξυπνη διάταξη** (πειραματική) διαβάζει το template, βρίσκει πού βρίσκεται τώρα κάθε τμήμα του και "
+               "τοποθετεί τις τιμές αναλόγως - χρήσιμο αν η ΕΛΣΤΑΤ αλλάξει λίγο το έντυπο (μετατοπισμένες γραμμές, περιθώρια, αποστάσεις).",
+               "**On top of the template** (default) writes the values at fixed positions on the blank PDF. "
+               "**Smart layout** (experimental) reads the template, finds where each part of it now sits and places "
+               "the values accordingly - useful if ELSTAT changes the form slightly (shifted lines, margins, spacing).")),
+        ('warn', ("Η έξυπνη διάταξη είναι πειραματική λειτουργία. Ελέγχετε πάντα το δελτίο πριν το υποβάλετε. "
+                  "Αν κάτι δεν πάει καλά, επιλέξτε ξανά «Πάνω στο template».",
+                  "Smart layout is an experimental feature. Always check the form before submitting it. "
+                  "If anything looks wrong, select “On top of the template” again.")),
+        ('step', ("Επιλέξτε «Έξυπνη διάταξη». Τα πρόσθετα κουμπιά εμφανίζονται μόνο όταν είναι επιλεγμένη.",
+                  "Select “Smart layout”. The extra buttons appear only while it is selected.")),
+        ('step', ("Αποθηκεύστε το σημείο σύγκρισης: το πρόγραμμα το κάνει μόνο του με το πρώτο δελτίο που φτιάχνετε με την "
+                  "προεπιλεγμένη μέθοδο, ή πατήστε **Αποθήκευση ως αναφορά…** όταν το δελτίο συμπληρώνεται σωστά.",
+                  "Save the point of comparison: the program does it by itself with the first form you make in the default "
+                  "mode, or press **Save as reference…** when the form fills in correctly.")),
+        ('step', ("Όταν αλλάξει το template, πατήστε **Έλεγχος template** (δείχνει αν αναγνωρίζεται και πόσο μετακινήθηκε) "
+                  "και **Δοκιμαστικό δελτίο** (PDF με πλασματικά στοιχεία για οπτικό έλεγχο - μην το υποβάλετε).",
+                  "When the template changes, press **Check template** (shows whether it is recognised and how far it moved) "
+                  "and **Test form** (a PDF with made-up data for a visual check - do not submit it).")),
+        ('tip', ("Αν το template δεν αναγνωριστεί με ασφάλεια ή έχει μετακινηθεί πάρα πολύ, το δελτίο φτιάχνεται με την "
+                 "προεπιλεγμένη μέθοδο ή εμφανίζεται προειδοποίηση και δεν γίνεται αυτόματη εκτύπωση.",
+                 "If the template is not recognised safely or has moved a lot, the form is made with the default method "
+                 "or a warning appears and nothing is printed automatically.")),
+        ('p', ("**Χειροκίνητη τοποθέτηση**: επιλέξτε την και ανοίγει ο **επεξεργαστής διάταξης**. Βλέπετε το έντυπο ως σελίδα· "
+               "κάθε στοιχείο (ΑΦΜ, ημερομηνίες, σύνολα, στήλες χωρών…) είναι ένα κείμενο που το σέρνετε εκεί που ανήκει.",
+               "**Set manually**: select it and the **layout editor** opens. You see the form as a page; "
+               "every item (VAT number, dates, totals, country columns…) is a piece of text you drag to where it belongs.")),
+        ('step', ("Πατήστε ένα στοιχείο στη σελίδα ή στη λίστα. Δεξιά αλλάζετε **γραμματοσειρά, μέγεθος, χρώμα, στοίχιση** και την ακριβή θέση. "
+                  "Τα βελάκια του πληκτρολογίου μετακινούν ανά 0,5 pt (με Shift ανά 5 pt).",
+                  "Click an item on the page or in the list. On the right you change the **font, size, colour, alignment** and the exact position. "
+                  "The arrow keys move it by 0.5 pt (5 pt with Shift).")),
+        ('step', ("Οι στήλες χωρών, ο Α.Φ.Μ., οι ημέρες λειτουργίας και οι εργαζόμενοι μετακινούνται αρχικά ως σύνολο. "
+                  "Πατήστε **Χωρισμός σε μεμονωμένα στοιχεία** για να μετακινείτε κάθε χώρα ή κάθε ψηφίο ξεχωριστά (**Συγχώνευση** για να ξαναενωθούν).",
+                  "The country columns, the VAT number, operating days and employees first move as one. "
+                  "Press **Split into individual items** to move each country or digit on its own (**Merge** puts them back together).")),
+        ('step', ("Με το **+ Προσθήκη στοιχείου…** ψάχνετε ό,τι μπορεί να μπει στο δελτίο (στοιχεία ξενοδοχείου, σύνολα, ημερομηνίες, αριθμοί συγκεκριμένης χώρας) "
+                  "και το τοποθετείτε όσες φορές θέλετε. Το πεδίο **Αναζήτηση** φιλτράρει τη λίστα στοιχείων. Ctrl+Z / Ctrl+Y = αναίρεση / επανάληψη, Ctrl+D = διπλασιασμός.",
+                  "**+ Add item…** lets you search for anything that can go on the form (hotel details, totals, dates, numbers of a specific country) "
+                  "and place it as many times as you like. The **Search** box filters the item list. Ctrl+Z / Ctrl+Y = undo / redo, Ctrl+D = duplicate.")),
+        ('step', ("Πατήστε **Δοκιμαστικό PDF** για να δείτε το αποτέλεσμα με πλασματικά στοιχεία και **Αποθήκευση** (Ctrl+S) όταν είστε έτοιμοι.",
+                  "Press **Test PDF** to see the result with made-up data and **Save** (Ctrl+S) when you are happy.")),
+        ('go', ("Δείτε τον πλήρη οδηγό του επεξεργαστή", "See the full layout editor guide"), 'sec:editor'),
         ('h', ("Συμπεριφορά του προγράμματος", "Program behaviour")),
         ('li', ("Άνοιγμα του PDF αμέσως μετά τη δημιουργία.", "Open the PDF right after it is created.")),
         ('li', ("Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη.", "Ask before replacing a PDF that already exists.")),
@@ -1808,6 +2751,84 @@ MANUAL = [
         ('p', ("**Επαναφορά ρυθμίσεων** γυρίζει τις ρυθμίσεις στις προεπιλογές. Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
                "**Reset settings** returns the settings to their defaults. It does not delete the history or the hotel details.")),
         ('go', ("Άνοιγμα της καρτέλας Ρυθμίσεις", "Open the Settings tab"), 'tab:settings'),
+    ]),
+    dict(id='editor', title=("Επεξεργαστής διάταξης", "Layout editor"), blocks=[
+        ('p', ("Ο επεξεργαστής διάταξης σας αφήνει να τοποθετήσετε μόνοι σας κάθε τιμή πάνω στο έντυπο της ΕΛΣΤΑΤ - "
+               "θέση, γραμματοσειρά, μέγεθος, χρώμα, στοίχιση. Ανοίγει όταν πατήσετε **Άνοιγμα επεξεργαστή διάταξης** στις Ρυθμίσεις.",
+               "The layout editor lets you place every value on the ELSTAT form yourself - position, font, size, colour, alignment. "
+               "It opens when you press **Open layout editor** in Settings.")),
+        ('act', ("Άνοιγμα του επεξεργαστή διάταξης", "Open the layout editor"), 'open_editor'),
+        ('li', ("Τρέχουσα μέθοδος συμπλήρωσης: **[[pdf_mode_name]]**", "Current filling method: **[[pdf_mode_name]]**")),
+        ('h', ("Η οθόνη", "The screen")),
+        ('li', ("**Αριστερά**: η λίστα όλων των στοιχείων, με πεδίο αναζήτησης από πάνω.", "**Left**: the list of every item, with a search box on top.")),
+        ('li', ("**Στο κέντρο**: η σελίδα του εντύπου. Κάθε τιμή φαίνεται εκεί που θα τυπωθεί. Το κουμπί **Σελίδα 1 / Σελίδα 2** αλλάζει σελίδα, τα **− / + / Προσαρμογή** το μέγεθος (Ctrl + τροχός = ζουμ).",
+                "**Centre**: the page of the form. Every value appears where it will be printed. **Page 1 / Page 2** switches the page, **− / + / Fit** the size (Ctrl + wheel = zoom).")),
+        ('li', ("**Δεξιά**: οι ιδιότητες του επιλεγμένου στοιχείου. Στο κάτω μέρος του παραθύρου μια μπάρα συμβουλών αλλάζει ανάλογα με το τι έχετε επιλέξει.",
+                "**Right**: the properties of the selected item. At the bottom of the window a tip bar changes with what you have selected.")),
+        ('h', ("Επιλογή και μετακίνηση", "Selecting and moving")),
+        ('step', ("Πατήστε ένα στοιχείο πάνω στη σελίδα ή στη λίστα.", "Click an item on the page or in the list.")),
+        ('step', ("Σύρτε το με το ποντίκι ή χρησιμοποιήστε τα βελάκια του πληκτρολογίου: 0,5 pt ανά πάτημα, 5 pt με Shift.",
+                  "Drag it with the mouse or use the arrow keys: 0.5 pt per press, 5 pt with Shift.")),
+        ('step', ("Για ακριβή θέση γράψτε τιμές στα **X** και **Y**, ή χρησιμοποιήστε τα βελάκια ◀ ▲ ▼ ▶ με επιλεγμένο βήμα (0,1 έως 5 pt).",
+                  "For an exact position type values in **X** and **Y**, or use the ◀ ▲ ▼ ▶ buttons with a chosen step (0.1 to 5 pt).")),
+        ('p', ("Οι συντεταγμένες είναι σε σημεία PDF (pt) από την κάτω αριστερή γωνία της σελίδας - 72 pt = 1 ίντσα. Καθώς περνάτε το ποντίκι πάνω από τη σελίδα, το X και το Y του δείκτη φαίνονται κάτω αριστερά.",
+               "Coordinates are in PDF points (pt) from the bottom-left corner of the page - 72 pt = 1 inch. As you move the mouse over the page, the pointer's X and Y show at the bottom left.")),
+        ('h', ("Μορφοποίηση", "Formatting")),
+        ('li', ("**Γραμματοσειρά**: προσφέρονται μόνο όσες υπάρχουν στον υπολογιστή σας (όλες υποστηρίζουν ελληνικά).", "**Font**: only the ones installed on your computer are offered (all support Greek).")),
+        ('li', ("**Μέγεθος, Έντονα, Πλάγια, Χρώμα** (παλέτα, κωδικός #rrggbb ή γρήγορα χρώματα) και **Στοίχιση**.", "**Size, Bold, Italic, Colour** (palette, #rrggbb code or quick colours) and **Align**.")),
+        ('li', ("**Απόσταση ψηφίων**: 0 = κανονικό κείμενο. Μεγαλύτερη τιμή βάζει κάθε γράμμα σε σταθερή απόσταση, για τα κουτάκια του Α.Φ.Μ., των ημερών και των εργαζομένων.",
+                "**Digit spacing**: 0 = normal text. A larger value puts every character at a fixed distance, for the boxes of the VAT number, days and employees.")),
+        ('li', ("**Εμφάνιση στο PDF**: αν το ξετσεκάρετε, το στοιχείο κρύβεται (στη λίστα σημειώνεται με ○).", "**Show in the PDF**: untick it to hide the item (marked ○ in the list).")),
+        ('h', ("Μεμονωμένα στοιχεία", "Individual items")),
+        ('p', ("Κάποια στοιχεία κινούνται αρχικά ως ομάδα: οι στήλες χωρών (πελάτες και διανυκτερεύσεις, ανά σελίδα), ο Α.Φ.Μ., οι ημέρες λειτουργίας, οι εργαζόμενοι και το έτος. "
+               "Για να τα ελέγχετε ένα-ένα:",
+               "Some items first move as a group: the country columns (guests and nights, per page), the VAT number, operating days, employees and the year. "
+               "To control them one by one:")),
+        ('step', ("Επιλέξτε το στοιχείο και πατήστε **Χωρισμός σε μεμονωμένα στοιχεία**.", "Select the item and press **Split into individual items**.")),
+        ('step', ("Στη λίστα εμφανίζονται τα μέλη του (κάθε χώρα ή κάθε ψηφίο) κάτω από το στοιχείο - ανοίξτε το με το βελάκι. Κάθε μέλος σέρνεται και μορφοποιείται ξεχωριστά.",
+                  "Its members (each country or digit) appear under it in the list - open it with the arrow. Each member is dragged and formatted on its own.")),
+        ('step', ("**Ίδια μορφή σε όλα τα αδέλφια** αντιγράφει γραμματοσειρά, μέγεθος, χρώμα και στοίχιση ενός μέλους στα υπόλοιπα. **Συγχώνευση ξανά σε ένα** τα ενώνει πάλι.",
+                  "**Same format for all siblings** copies one member's font, size, colour and alignment to the others. **Merge back into one** joins them again.")),
+        ('tip', ("Στις μεμονωμένες χώρες το X είναι ελεύθερο, ενώ το Y είναι μετατόπιση από τη γραμμή της χώρας στο template - έτσι ακολουθούν αυτόματα το ύψος των γραμμών.",
+                 "For individual countries X is free while Y is an offset from the country's row in the template - so they automatically follow the row heights.")),
+        ('h', ("Προσθήκη και αναζήτηση", "Adding and searching")),
+        ('li', ("Το πεδίο **Αναζήτηση** (`Ctrl+F`) φιλτράρει τη λίστα στοιχείων ανά όνομα ή ομάδα.", "The **Search** box (`Ctrl+F`) filters the item list by name or group.")),
+        ('li', ("**+ Προσθήκη στοιχείου…** ανοίγει έναν κατάλογο με ό,τι μπορεί να μπει στο δελτίο: στοιχεία ξενοδοχείου, σύνολα, ημερομηνίες, όνομα μήνα και πελάτες ή διανυκτερεύσεις συγκεκριμένης χώρας. Διπλό κλικ προσθέτει, και μπορείτε να το προσθέσετε πολλές φορές.",
+                "**+ Add item…** opens a catalog of everything that can go on the form: hotel details, totals, dates, the month name and the guests or nights of a specific country. Double-click adds it, and you can add it many times.")),
+        ('li', ("**+ Δικό μου κείμενο** βάζει ελεύθερο κείμενο που γράφετε εσείς.", "**+ My own text** places free text that you type.")),
+        ('li', ("**Διπλασιασμός** (`Ctrl+D`) φτιάχνει αντίγραφο του επιλεγμένου στοιχείου και **Διαγραφή** (`Delete`) αφαιρεί όσα προσθέσατε εσείς.",
+                "**Duplicate** (`Ctrl+D`) makes a copy of the selected item and **Delete** (`Delete`) removes the ones you added.")),
+        ('h', ("Έλεγχος και αποθήκευση", "Checking and saving")),
+        ('li', ("**Δείγμα δεδομένων**: δείχνει πλασματικές τιμές πάνω στη σελίδα. Αν το ξετσεκάρετε βλέπετε μόνο τα ονόματα των στοιχείων.", "**Sample data**: shows made-up values on the page. Untick it to see only the item names.")),
+        ('li', ("**Δοκιμαστικό PDF** φτιάχνει ένα πραγματικό PDF με πλασματικά στοιχεία, ώστε να δείτε το τελικό αποτέλεσμα. Μην το υποβάλετε.", "**Test PDF** makes a real PDF with made-up data so you can see the final result. Do not submit it.")),
+        ('li', ("**↶ / ↷** (`Ctrl+Z` / `Ctrl+Y`) αναιρούν και επαναλαμβάνουν μέχρι 60 αλλαγές.", "**↶ / ↷** (`Ctrl+Z` / `Ctrl+Y`) undo and redo up to 60 changes.")),
+        ('li', ("**Αποθήκευση** (`Ctrl+S`) κρατά τη διάταξη. Αν κλείσετε με μη αποθηκευμένες αλλαγές, το πρόγραμμα ρωτά.", "**Save** (`Ctrl+S`) keeps the layout. If you close with unsaved changes, the program asks.")),
+        ('li', ("**Επαναφορά αυτού του στοιχείου** και **Επαναφορά όλων** γυρίζουν στις προεπιλεγμένες θέσεις.", "**Reset this item** and **Reset all** go back to the default positions.")),
+        ('warn', ("Η διάταξη αποθηκεύεται στον φάκελο δεδομένων (`elstat_manual_layout.json`) και ισχύει για όλα τα επόμενα δελτία. Κάντε πάντα ένα δοκιμαστικό PDF μετά από αλλαγές.",
+                  "The layout is saved in the data folder (`elstat_manual_layout.json`) and applies to every following form. Always make a test PDF after changes.")),
+        ('p', ("Πατήστε `F1` μέσα στον επεξεργαστή για να ανοίξει αυτός ο οδηγός.", "Press `F1` inside the editor to open this guide.")),
+    ]),
+    dict(id='countries', title=("Χώρες και αντιστοιχίσεις", "Countries and mappings"), blocks=[
+        ('p', ("Το Protel γράφει τις χώρες με αγγλικά ονόματα. Το πρόγραμμα τις αντιστοιχίζει στις γραμμές του δελτίου της ΕΛΣΤΑΤ με μια ενσωματωμένη λίστα.",
+               "Protel writes countries with English names. The program maps them to the lines of the ELSTAT form with a built-in list.")),
+        ('h', ("Όταν μια χώρα είναι άγνωστη", "When a country is unknown")),
+        ('step', ("Στο Βήμα 1 η άγνωστη χώρα εμφανίζεται με κόκκινο και η στήλη «Στο δελτίο» γράφει ότι λείπει.", "In Step 1 the unknown country shows in red and the “On the form” column says it is missing.")),
+        ('step', ("Επιλέξτε την και πατήστε **Προσθήκη / αντιστοίχιση επιλεγμένης χώρας…** (ή κάντε διπλό κλικ πάνω της).", "Select it and press **Add / map selected country…** (or double-click it).")),
+        ('step', ("Διαλέξτε σε ποια γραμμή ή κατηγορία του δελτίου ανήκει και πατήστε **Αποθήκευση**.", "Choose which row or category of the form it belongs to and press **Save mapping**.")),
+        ('step', ("Πατήστε ξανά **Δημιουργία PDF**. Η αντιστοίχιση θυμάται και για τους επόμενους μήνες.", "Press **Create PDF** again. The mapping is remembered for future months.")),
+        ('li', ("Έχετε ήδη **[[custom_count]]** δικές σας αντιστοιχίσεις. Αποθηκεύονται στο `elstat_country_mappings.json` του φακέλου δεδομένων και μπαίνουν στο αντίγραφο ασφαλείας.",
+                "You already have **[[custom_count]]** mappings of your own. They are stored in `elstat_country_mappings.json` in the data folder and included in the backup.")),
+        ('h', ("Οι κατηγορίες του δελτίου", "The categories of the form")),
+        ('kb', ("1", ("Ελλάδα", "Greece"))),
+        ('kb', ("2.1", ("Χώρες Ευρωπαϊκής Ένωσης", "European Union countries"))),
+        ('kb', ("2.2", ("Χώρες Ε.Ζ.Ε.Σ. (Ελβετία, Λιχτενστάιν, Ισλανδία, Νορβηγία)", "EFTA countries (Switzerland, Liechtenstein, Iceland, Norway)"))),
+        ('kb', ("2.3", ("Λοιπές ευρωπαϊκές χώρες", "Other European countries"))),
+        ('kb', ("3 - 6", ("Αμερική, Ασία, Αφρική, Ωκεανία", "America, Asia, Africa, Oceania"))),
+        ('kb', ("7", ("Δεν δήλωσαν χώρα", "Country not declared"))),
+        ('p', ("Μια χώρα χωρίς δική της γραμμή πηγαίνει στη γραμμή «Λοιπές χώρες» της ηπείρου της.", "A country without a line of its own goes to the “Other countries” line of its continent.")),
+        ('warn', ("Μετά τη δημιουργία το πρόγραμμα συγκρίνει το γενικό σύνολο με του Excel. Αν διαφέρουν, κάτι δεν μπήκε - ελέγξτε τις χώρες πριν υποβάλετε το δελτίο.",
+                  "After creating the form the program compares the grand total with the Excel's. If they differ, something was left out - check the countries before submitting.")),
+        ('go', ("Δείτε τα Συχνά προβλήματα", "See Troubleshooting"), 'sec:trouble'),
     ]),
     dict(id='dnd', title=("Μεταφορά αρχείων (drag & drop)", "Drag and drop"), blocks=[
         ('p', ("Μπορείτε να σέρνετε αρχεία και φακέλους από τον Εξερευνητή μέσα στο πρόγραμμα. Ένα αρχείο κάθε φορά.",
@@ -1838,13 +2859,27 @@ MANUAL = [
         ('h', ("Στο παράθυρο αποτελέσματος", "In the result window")),
         ('kb', ("Ctrl+P", ("Εκτύπωση", "Print"))),
         ('kb', ("Esc", ("Κλείσιμο", "Close"))),
+        ('h', ("Στον επεξεργαστή διάταξης", "In the layout editor")),
+        ('kb', ("Ctrl+S", ("Αποθήκευση", "Save"))),
+        ('kb', ("Ctrl+Z / Ctrl+Y", ("Αναίρεση / επανάληψη", "Undo / redo"))),
+        ('kb', ("Ctrl+D", ("Διπλασιασμός στοιχείου", "Duplicate item"))),
+        ('kb', ("Ctrl+F", ("Αναζήτηση στη λίστα στοιχείων", "Search the item list"))),
+        ('kb', ("Βελάκια", ("Μετακίνηση 0,5 pt (Shift = 5 pt)", "Move 0.5 pt (Shift = 5 pt)"))),
+        ('kb', ("Ctrl + τροχός", ("Μεγέθυνση / σμίκρυνση", "Zoom in / out"))),
+        ('kb', ("Delete", ("Διαγραφή στοιχείου που προσθέσατε", "Delete an item you added"))),
+        ('kb', ("Esc", ("Αποεπιλογή", "Deselect"))),
+        ('kb', ("F1", ("Άνοιγμα αυτού του οδηγού", "Open this guide"))),
     ]),
     dict(id='data', title=("Δεδομένα και αντίγραφα ασφαλείας", "Data and backups"), blocks=[
         ('p', ("Όλα τα δεδομένα του προγράμματος βρίσκονται σε έναν φάκελο (δείτε Ρυθμίσεις → Φάκελος δεδομένων):",
                "All of the program's data lives in one folder (see Settings → Data folder):")),
+        ('li', ("Τρέχουσα θέση: `[[data_dir]]`", "Current location: `[[data_dir]]`")),
         ('li', ("`hotel_settings.csv` - τα στοιχεία του ξενοδοχείου.", "`hotel_settings.csv` - the hotel details.")),
         ('li', ("`elstat_history.csv` και `elstat_months.csv` - το ιστορικό.", "`elstat_history.csv` and `elstat_months.csv` - the history.")),
         ('li', ("`elstat_preferences.json` - οι ρυθμίσεις.", "`elstat_preferences.json` - the settings.")),
+        ('li', ("`elstat_country_mappings.json` - οι δικές σας αντιστοιχίσεις χωρών.", "`elstat_country_mappings.json` - your own country mappings.")),
+        ('li', ("`elstat_manual_layout.json` και `elstat_template_layout.json` - οι διατάξεις του επεξεργαστή και της έξυπνης διάταξης.",
+                "`elstat_manual_layout.json` and `elstat_template_layout.json` - the layouts of the editor and of smart layout.")),
         ('li', ("`ELSTAT_Archive` - τα αρχειοθετημένα PDF κάθε μήνα.", "`ELSTAT_Archive` - the archived PDF of every month.")),
         ('p', ("Δίπλα στο πρόγραμμα υπάρχει και το `elstat_config.json`, που θυμάται μόνο **πού** είναι ο φάκελος δεδομένων.",
                "Next to the program there is also `elstat_config.json`, which only remembers **where** the data folder is.")),
@@ -1856,6 +2891,39 @@ MANUAL = [
         ('tip', ("Αν ο φάκελος δεδομένων δεν είναι διαθέσιμος (π.χ. αποσυνδεδεμένος δίσκος), το πρόγραμμα χρησιμοποιεί προσωρινά τον προεπιλεγμένο και σας το λέει.",
                  "If the data folder is not available (e.g. a disconnected drive), the program temporarily uses the default one and tells you.")),
         ('go', ("Άνοιγμα των Ρυθμίσεων", "Open Settings"), 'tab:settings'),
+    ]),
+    dict(id='faq', title=("Συχνές ερωτήσεις", "FAQ"), blocks=[
+        ('h', ("Πού είναι αποθηκευμένα τα δεδομένα μου;", "Where is my data stored?")),
+        ('p', ("Στον φάκελο δεδομένων: `[[data_dir]]`. Τον αλλάζετε από τις Ρυθμίσεις.", "In the data folder: `[[data_dir]]`. You change it in Settings.")),
+        ('h', ("Μπορώ να το χρησιμοποιήσω σε δύο υπολογιστές;", "Can I use it on two computers?")),
+        ('p', ("Ναι: βάλτε τον φάκελο δεδομένων σε OneDrive ή άλλη υπηρεσία συγχρονισμού και διαλέξτε τον και στους δύο υπολογιστές. Μη δουλεύετε ταυτόχρονα και στους δύο.",
+               "Yes: put the data folder in OneDrive or another sync service and choose it on both computers. Do not work on both at the same time.")),
+        ('h', ("Έκανα λάθος στον αριθμό εργαζομένων. Τι κάνω;", "I typed the wrong number of employees. What now?")),
+        ('p', ("Ξανά-δημιουργήστε το δελτίο του μήνα με το σωστό αριθμό (το παλιό PDF αντικαθίσταται μετά από ερώτηση) ή διαγράψτε τον μήνα από το Ιστορικό και φτιάξτε τον από την αρχή.",
+               "Create the month's form again with the right number (the old PDF is replaced after a question) or delete the month from History and make it again.")),
+        ('h', ("Η ΕΛΣΤΑΤ άλλαξε το έντυπο. Τι κάνω;", "ELSTAT changed the form. What do I do?")),
+        ('p', ("Διαλέξτε το νέο PDF στην καρτέλα Στοιχεία ξενοδοχείου. Αν οι τιμές πέφτουν εκτός θέσης, δοκιμάστε την **Έξυπνη διάταξη** ή τοποθετήστε τα μόνοι σας με τον **επεξεργαστή διάταξης**. Κάντε πάντα δοκιμαστικό δελτίο πριν υποβάλετε.",
+               "Choose the new PDF in the Hotel details tab. If values land out of place, try **Smart layout** or place them yourself with the **layout editor**. Always make a test form before submitting.")),
+        ('go', ("Άνοιγμα του επεξεργαστή διάταξης", "See the layout editor"), 'sec:editor'),
+        ('h', ("Μπορώ να ξανατυπώσω παλιό μήνα;", "Can I reprint an old month?")),
+        ('p', ("Ναι, από το Ιστορικό: επιλέξτε τον μήνα και πατήστε Εκτύπωση. Αν λείπει το αρχειοθετημένο PDF, το πρόγραμμα ξαναφτιάχνει το δελτίο από το ιστορικό.",
+               "Yes, from History: select the month and press Print. If the archived PDF is missing, the program rebuilds the form from the history.")),
+        ('h', ("Το PDF γράφεται στα αγγλικά αν αλλάξω γλώσσα;", "Is the PDF written in English if I change the language?")),
+        ('p', ("Όχι. Η γλώσσα αφορά μόνο το πρόγραμμα. Το επίσημο δελτίο συμπληρώνεται πάντα στα ελληνικά.", "No. The language only affects the program. The official form is always filled in Greek.")),
+        ('h', ("Πόσους μήνες έχω ήδη καταχωρημένους;", "How many months do I already have recorded?")),
+        ('p', ("**[[months_count]]** μήνες. Τελευταίος: [[last_month]].", "**[[months_count]]** months. Latest: [[last_month]].")),
+    ]),
+    dict(id='glossary', title=("Γλωσσάρι", "Glossary"), blocks=[
+        ('p', ("Οι όροι που θα συναντήσετε στο πρόγραμμα.", "The terms you will meet in the program.")),
+        ('kb', ("Protel", ("Το πρόγραμμα του ξενοδοχείου που βγάζει το Excel «Nationalities Statistics».", "The hotel program that produces the “Nationalities Statistics” Excel."))),
+        ('kb', ("ΕΛΣΤΑΤ", ("Η Ελληνική Στατιστική Αρχή, στην οποία υποβάλλεται το δελτίο.", "The Hellenic Statistical Authority, to which the form is submitted."))),
+        ('kb', ("Template", ("Το κενό δελτίο PDF πάνω στο οποίο γράφονται οι τιμές.", "The blank PDF form on which the values are written."))),
+        ('kb', ("Αρχείο / Archive", ("Αντίγραφο κάθε δελτίου στον φάκελο δεδομένων, για να ξανανοίγεται από το Ιστορικό.", "A copy of every form in the data folder, so it can be reopened from History."))),
+        ('kb', ("Αναφορά", ("Το template όπως ήταν όταν το δελτίο συμπληρωνόταν σωστά - η έξυπνη διάταξη μετρά τις αλλαγές σε σχέση με αυτό.", "The template as it was when the form came out right - smart layout measures changes against it."))),
+        ('kb', ("pt", ("Σημείο PDF, 1/72 της ίντσας. Οι θέσεις του επεξεργαστή μετριούνται σε pt.", "A PDF point, 1/72 of an inch. The editor's positions are measured in pt."))),
+        ('kb', ("Α.Φ.Μ.", ("Ο 9ψήφιος Αριθμός Φορολογικού Μητρώου.", "The 9-digit tax number (AFM)."))),
+        ('kb', ("Ε.Ζ.Ε.Σ.", ("Ευρωπαϊκή Ζώνη Ελεύθερων Συναλλαγών (EFTA).", "European Free Trade Association (EFTA)."))),
+        ('kb', ("Μεμονωμένο", ("Στοιχείο που προέκυψε από τον χωρισμό μιας ομάδας (χώρα ή ψηφίο) και κινείται μόνο του.", "An item that came from splitting a group (a country or digit) and moves on its own."))),
     ]),
     dict(id='trouble', title=("Συχνά προβλήματα", "Troubleshooting"), blocks=[
         ('h', ("Δεν μπορώ να γράψω το PDF", "I can't write the PDF")),
@@ -1884,11 +2952,14 @@ MANUAL = [
 ]
 SECTION_BY_ID = {sec['id']: sec for sec in MANUAL}
 _INLINE = re.compile(r'(\*\*.+?\*\*|`.+?`)')
+_PLACEHOLDER = re.compile(r'\[\[(\w+)\]\]')
+HELP_CTX = {}          # live values the guide text can show as [[name]] (filled in by ElstatApp.help_context)
 
 
 def _tx(pair):
-    """The Greek or English half of a (greek, english) pair."""
-    return pair[1] if LANG == 'en' else pair[0]
+    """The Greek or English half of a (greek, english) pair, with [[name]] replaced by the live value."""
+    text = pair[1] if LANG == 'en' else pair[0]
+    return _PLACEHOLDER.sub(lambda m: str(HELP_CTX.get(m.group(1), m.group(0))), text)
 
 
 def _plain(text):
@@ -1979,7 +3050,7 @@ class HelpPanel(ttk.Frame):
         bar = tk.Frame(frame, width=4, bg=CARD)
         bar.pack(side="left", fill="y")
         lbl = tk.Label(frame, text=_tx(sec['title']), bg=CARD, fg=TEXT, font=(FONT, 10), anchor="w",
-                       justify="left", padx=12, pady=8, wraplength=190)
+                       justify="left", padx=12, pady=6, wraplength=190)
         lbl.pack(side="left", fill="x", expand=True)
         badge = tk.Label(frame, text="", bg=CARD, fg=MUTED, font=(FONT, 9), padx=10)
         badge.pack(side="right")
@@ -2042,7 +3113,7 @@ class HelpPanel(ttk.Frame):
                 else:
                     shortcut, description = blk[1], blk[2]
                 parts += [shortcut, _tx(description)]
-            elif blk[0] != 'go':
+            elif blk[0] not in ('go', 'live'):
                 parts.append(_tx(blk[1]))
         return _fold(_plain(' '.join(parts)))
 
@@ -2107,6 +3178,9 @@ class HelpPanel(ttk.Frame):
         t.tag_configure('b', font=(FONT, 11, 'bold'))
         t.tag_configure('kbd', font=(FONT, 10, 'bold'), background=BTN, foreground=NAVY)
         t.tag_configure('hit', background=ROW_HL, foreground=TEXT)
+        t.tag_configure('mark_ok', foreground=GOOD, font=(FONT, 11, 'bold'))
+        t.tag_configure('mark_bad', foreground=BAD, font=(FONT, 11, 'bold'))
+        t.tag_configure('mark_warn', foreground=WARN, font=(FONT, 11, 'bold'))
 
     def _reset_text(self):
         t = self.text
@@ -2204,10 +3278,41 @@ class HelpPanel(ttk.Frame):
         except tk.TclError:
             pass
 
+    def _nav(self, target):
+        if target.startswith('tab:'):
+            self.app.goto_tab(target[4:])
+        else:
+            self.show(target[4:])
+
+    def _live(self, what):
+        """Blocks whose content is worked out from the state of the program every time they are shown."""
+        t = self.text
+        if what == 'next':
+            label, target = self.app.help_next()
+            t.insert('end', T("Επόμενο βήμα:", "Next step:") + ' ', ('p', 'b'))
+            self._link(label + '  →', lambda tg=target: self._nav(tg), ('p',))
+            t.insert('end', '\n', ('p',))
+        elif what == 'status':
+            for state, label, detail, target in self.app.help_status():
+                t.insert('end', {'ok': '✓', 'bad': '✗', 'warn': '⚠'}[state] + '\t', ('li', 'mark_' + state))
+                self._link(label, lambda tg=target: self._nav(tg), ('li', 'b'))
+                t.insert('end', ' – ' + detail + '\n', ('li',))
+
+    def refresh_live(self):
+        """The guide tab was opened: show the current section again with fresh live values."""
+        if self.current:
+            y = self.text.yview()[0]
+            self.show(self.current)
+            self.text.yview_moveto(y)
+
     def show(self, sid):
         sec = SECTION_BY_ID.get(sid)
         if sec is None:
             return
+        try:
+            HELP_CTX.update(self.app.help_context())
+        except Exception:
+            pass
         self.current = sid
         self.app._help_last = sid
         self._paint_items()
@@ -2252,7 +3357,12 @@ class HelpPanel(ttk.Frame):
                     action = lambda n=target[4:]: self.app.goto_tab(n)
                 else:
                     action = lambda i=target[4:]: self.show(i)
-                self._link(_tx(blk[1]) + '  \u2192', action, ('p',))
+                self._link(_tx(blk[1]) + '  →', action, ('p',))
+                t.insert('end', '\n', ('p',))
+            elif kind == 'live':
+                self._live(blk[1])
+            elif kind == 'act':
+                self._link('▸  ' + _tx(blk[1]), lambda k=blk[2]: self.app.help_action(k), ('p',))
                 t.insert('end', '\n', ('p',))
             prev = kind
         # previous / next section
@@ -2290,6 +3400,133 @@ class HelpPanel(ttk.Frame):
                 self.app.notebook.select(prev)
         except tk.TclError:
             pass
+
+
+class PDFPreviewDialog(tk.Toplevel):
+    """In-app preview of the generated PDF; Continue opens the normal Result dialog."""
+
+    def __init__(self, parent, pdf_path, on_continue):
+        super().__init__(parent)
+        self.title(T("Προεπισκόπηση PDF", "PDF preview"))
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.minsize(720, 600)
+        self._on_continue = on_continue
+        self._continued = False
+        self._images = []
+
+        header = ttk.Frame(self, padding=(16, 12, 16, 8))
+        header.pack(fill="x")
+        ttk.Label(
+            header,
+            text=T("Ελέγξτε το δελτίο πριν συνεχίσετε",
+                   "Review the form before continuing"),
+            style='CardBold.TLabel'
+        ).pack(anchor="w")
+        ttk.Label(
+            header,
+            text=T("Αυτή είναι η προεπισκόπηση του PDF που δημιουργήθηκε. "
+                   "Όταν τελειώσετε τον έλεγχο, πατήστε «Συνέχεια στο αποτέλεσμα».",
+                   "This is a preview of the generated PDF. When you finish reviewing it, "
+                   "press “Continue to result”."),
+            style='Hint.TLabel',
+            wraplength=900,
+            justify="left"
+        ).pack(anchor="w", pady=(4, 0))
+
+        viewer = ttk.Frame(self)
+        viewer.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+        self.canvas = tk.Canvas(viewer, bg="#596579", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(viewer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        content = tk.Frame(self.canvas, bg="#596579")
+        self._content_window = self.canvas.create_window((0, 0), window=content, anchor="n")
+        content.bind("<Configure>", lambda _e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._resize_content)
+
+        rendered = 0
+        try:
+            reader = pypdf.PdfReader(pdf_path)
+            page_count = len(reader.pages)
+        except Exception:
+            page_count = 0
+
+        for page_index in range(page_count):
+            ttk.Label(
+                content,
+                text=T(f"Σελίδα {page_index + 1}", f"Page {page_index + 1}")
+            ).pack(pady=(14, 5))
+            png = render_pdf_page_png(pdf_path, page_index, 0.85)
+            if png:
+                try:
+                    photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+                    self._images.append(photo)
+                    image_label = tk.Label(content, image=photo, bg="white",
+                                            bd=1, relief="solid")
+                    image_label.pack(padx=12, pady=(0, 14))
+                    rendered += 1
+                except tk.TclError:
+                    pass
+
+        if not rendered:
+            ttk.Label(
+                content,
+                text=T("Δεν ήταν δυνατή η εμφάνιση προεπισκόπησης σε αυτόν τον υπολογιστή. "
+                       "Μπορείτε να ανοίξετε το PDF εξωτερικά και μετά να συνεχίσετε.",
+                       "A preview could not be rendered on this computer. "
+                       "You can open the PDF externally and then continue."),
+                style='CardHint.TLabel',
+                wraplength=650,
+                justify="center"
+            ).pack(padx=30, pady=50)
+            ttk.Button(
+                content,
+                text=T("Άνοιγμα PDF", "Open PDF"),
+                command=lambda: open_file(pdf_path)
+            ).pack(pady=(0, 24))
+
+        footer = ttk.Frame(self, padding=(14, 8, 14, 14))
+        footer.pack(fill="x")
+        ttk.Button(
+            footer,
+            text=T("Άνοιγμα PDF", "Open PDF"),
+            command=lambda: open_file(pdf_path)
+        ).pack(side="left")
+        ttk.Button(
+            footer,
+            text=T("Συνέχεια στο αποτέλεσμα  →", "Continue to result  →"),
+            style='Primary.TButton',
+            command=self._continue
+        ).pack(side="right")
+
+        self.bind("<Escape>", lambda _e: self._continue())
+        self.protocol("WM_DELETE_WINDOW", self._continue)
+        self.update_idletasks()
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = min(1100, sw - 50), min(900, sh - 70)
+            x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+            self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+            self.grab_set()
+        except tk.TclError:
+            self.geometry("1000x800")
+
+    def _resize_content(self, event):
+        self.canvas.coords(self._content_window, event.width // 2, 0)
+
+    def _continue(self):
+        if self._continued:
+            return
+        self._continued = True
+        callback = self._on_continue
+        self.destroy()
+        if callback:
+            callback()
 
 
 class ResultDialog(tk.Toplevel):
@@ -2393,6 +3630,1210 @@ class ResultDialog(tk.Toplevel):
         self._show_print(*print_file(self.out_path))
 
 
+class Segmented(tk.Frame):
+    """Small pill-shaped switch with a few options, e.g. [ Page 1 | Page 2 ]."""
+
+    def __init__(self, parent, options, command=None, value=None):
+        super().__init__(parent, bg=BORDER)
+        self._command = command
+        self._labels = {}
+        self.value = value
+        for i, (val, text) in enumerate(options):
+            lbl = tk.Label(self, text=text, font=(FONT, 9, 'bold'), padx=12, pady=5, cursor='hand2')
+            lbl.pack(side="left", padx=(1, 1 if i == len(options) - 1 else 0), pady=1)
+            lbl.bind('<Button-1>', lambda e, v=val: self.set(v, True))
+            self._labels[val] = lbl
+        self.set(value, False)
+
+    def set(self, value, notify=False):
+        self.value = value
+        for val, lbl in self._labels.items():
+            on = val == value
+            lbl.configure(bg=ACCENT if on else BTN, fg='white' if on else TEXT)
+        if notify and self._command:
+            self._command(value)
+
+
+class LayoutEditor(tk.Toplevel):
+    """Built-in layout editor of the "Set manually" mode: the blank form is shown as a page, every value
+    is a piece of text on it that can be dragged, and font, size, colour... are set on the right."""
+    PAD = 28
+    NUDGE_STEPS = ("0.1", "0.5", "1", "2", "5")
+    QUICK_COLORS = ('#000000', '#1f2937', '#1d4ed8', '#047857', '#b91c1c', '#7c3aed')
+
+    def __init__(self, app, template_path, on_save=None):
+        super().__init__(app)
+        self.app = app
+        self.template = template_path
+        self.on_save = on_save
+        self.layout = load_manual_layout()
+        self.page = 0
+        self.zoom = 1.0
+        self.ox = self.PAD
+        self.sel = None
+        self.dirty = False
+        self._loading = False
+        self._sync = False
+        self._drag = None
+        self._photos = {}
+        self._fit_pending = True
+        self._redraw_job = None
+        self._last_width = 0
+        self._fallback_texts = None
+        self.undo, self.redo = [], []
+        self._snap_key, self._snap_time, self._stagger = None, 0.0, 0
+        self.q_var = tk.StringVar()
+        self.tip_var = tk.StringVar()
+        self.sizes = [(595.0, 842.0), (595.0, 842.0)]
+        self.row_ys = [{}, {}]
+        self._read_template()
+        self.sample = manual_sample_values()
+        self.families = manual_font_families()
+        self.show_sample = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar()
+
+        self.configure(bg=BG)
+        self.minsize(1060, 680)
+        self._build()
+        self._fill_tree()
+        self._load_props()
+        self._update_title()
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        for seq in ('<Left>', '<Right>', '<Up>', '<Down>', '<Shift-Left>', '<Shift-Right>', '<Shift-Up>', '<Shift-Down>'):
+            self.bind(seq, self._on_arrow)
+        self.bind('<Control-s>', lambda e: self.save())
+        self.bind('<Control-S>', lambda e: self.save())
+        self.bind('<Delete>', self._on_delete_key)
+        self.bind('<Control-z>', lambda e: None if self._typing() else self._undo())
+        self.bind('<Control-y>', lambda e: None if self._typing() else self._redo())
+        self.bind('<Control-d>', lambda e: None if self._typing() else self._duplicate())
+        self.bind('<F1>', lambda e: self._open_guide())
+        self.bind('<Control-f>', lambda e: (self.search_entry.focus_set(), self.search_entry.select_range(0, 'end'), 'break')[2])
+        self.bind('<Escape>', lambda e: self._select(None))
+        self.transient(app)
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = min(1340, sw - 60), min(880, sh - 90)
+            x = app.winfo_rootx() + (app.winfo_width() - w) // 2
+            y = app.winfo_rooty() + (app.winfo_height() - h) // 2
+            self.geometry(f"{w}x{h}+{max(0, min(x, sw - w))}+{max(0, min(y, sh - h - 40))}")
+        except tk.TclError:
+            self.geometry("1280x820")
+        self.after(150, self._try_grab)
+
+    # ------------------------------------------------------------------ setup
+    def _try_grab(self):
+        try:
+            self.grab_set()
+            self.focus_set()
+        except tk.TclError:
+            pass
+
+    def _read_template(self):
+        try:
+            reader = pypdf.PdfReader(self.template)
+            for i in range(2):
+                box = reader.pages[i].mediabox
+                self.sizes[i] = (float(box.width), float(box.height))
+        except Exception:
+            pass
+        try:
+            self.row_ys = detect_template_rows(self.template)
+        except Exception:
+            self.row_ys = [{}, {}]
+
+    def _card(self, parent):
+        outer = tk.Frame(parent, bg=BORDER)
+        inner = ttk.Frame(outer, style='Card.TFrame')
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        return outer, inner
+
+    def _build(self):
+        st = ttk.Style(self)
+        st.configure('Editor.Treeview', rowheight=26)
+        st.configure('TSpinbox', fieldbackground=FIELD, foreground=TEXT, insertcolor=TEXT, bordercolor=BORDER,
+                     lightcolor=BORDER, darkcolor=BORDER, arrowcolor=TEXT, background=BTN, padding=5)
+        st.map('TSpinbox', bordercolor=[('focus', ACCENT)], lightcolor=[('focus', ACCENT)],
+               darkcolor=[('focus', ACCENT)])
+        st.configure('Horizontal.TScrollbar', background=SCROLL, troughcolor=BG, bordercolor=BG,
+                     arrowcolor=MUTED, relief='flat')
+        # ---- header strip, like the main window
+        head = tk.Frame(self, bg=HEADER_BG)
+        head.pack(fill="x")
+        tk.Label(head, text=T("Επεξεργαστής διάταξης", "Layout editor"), bg=HEADER_BG, fg=HEADER_FG,
+                 font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
+        tk.Label(head, text=T("Σύρετε κάθε στοιχείο εκεί που ανήκει στο έντυπο · βελάκια = λεπτομερής μετακίνηση",
+                              "Drag each item to where it belongs on the form · arrow keys = fine movement"),
+                 bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
+
+        # ---- toolbar
+        bar = ttk.Frame(self, padding=(14, 10, 14, 6))
+        bar.pack(fill="x")
+        self.page_seg = Segmented(bar, ((0, T("Σελίδα 1", "Page 1")), (1, T("Σελίδα 2", "Page 2"))),
+                                  self._on_page_seg, 0)
+        self.page_seg.pack(side="left")
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
+        ttk.Button(bar, text="−", width=3, command=lambda: self._set_zoom(self.zoom / 1.2)).pack(side="left")
+        self.zoom_lbl = ttk.Label(bar, text="100%", width=6, anchor="center")
+        self.zoom_lbl.pack(side="left")
+        ttk.Button(bar, text="+", width=3, command=lambda: self._set_zoom(self.zoom * 1.2)).pack(side="left")
+        ttk.Button(bar, text=T("Προσαρμογή", "Fit"), command=self._fit).pack(side="left", padx=(8, 0))
+        self.undo_btn = ttk.Button(bar, text="\u21b6", width=3, command=self._undo)
+        self.undo_btn.pack(side="left", padx=(14, 2))
+        self.redo_btn = ttk.Button(bar, text="\u21b7", width=3, command=self._redo)
+        self.redo_btn.pack(side="left")
+        self._update_undo_buttons()
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
+        ttk.Checkbutton(bar, text=T("Δείγμα δεδομένων", "Sample data"), variable=self.show_sample,
+                        command=self._draw_items).pack(side="left")
+        ttk.Button(bar, text=T("Αποθήκευση", "Save"), style='PrintSm.TButton', command=self.save).pack(side="right")
+        ttk.Button(bar, text=T("Δοκιμαστικό PDF", "Test PDF"), command=self._test_pdf).pack(side="right", padx=8)
+        ttk.Button(bar, text=T("Επαναφορά όλων", "Reset all"), style='Danger.TButton',
+                   command=self._reset_all).pack(side="right")
+
+        # ---- status line (bottom, packed before the body so it never disappears)
+        status = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        status.pack(side="bottom", fill="x")
+        ttk.Label(status, textvariable=self.status_var, style='Status.TLabel').pack(side="left")
+        self.render_note = ttk.Label(status, text="", style='Status.TLabel')
+        self.render_note.pack(side="right")
+
+        tipbar = tk.Frame(self, bg=ACCENT_SOFT, highlightthickness=1, highlightbackground=BORDER)
+        tipbar.pack(side="bottom", fill="x")
+        more = tk.Label(tipbar, text=T("Πλήρης οδηγός (F1) \u203a", "Full guide (F1) \u203a"), bg=ACCENT_SOFT, fg=ACCENT,
+                        font=(FONT, 9, 'underline'), cursor='hand2', padx=12)
+        more.pack(side="right")
+        more.bind('<Button-1>', lambda e: self._open_guide())
+        self.tip_lbl = tk.Label(tipbar, textvariable=self.tip_var, bg=ACCENT_SOFT, fg=TEXT, font=(FONT, 9),
+                                anchor="w", justify="left", padx=12, pady=6)
+        self.tip_lbl.pack(side="left", fill="x", expand=True)
+        tipbar.bind('<Configure>', lambda e: self.tip_lbl.configure(wraplength=max(300, e.width - 190)))
+
+        # ---- body: field list | page | properties
+        body = ttk.PanedWindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+
+        left_outer, left = self._card(body)
+        ttk.Label(left, text=T("Στοιχεία του δελτίου", "Items on the form"), style='CardBold.TLabel').pack(
+            anchor="w", padx=14, pady=(12, 4))
+        srow = ttk.Frame(left, style='Card.TFrame')
+        srow.pack(fill="x", padx=14, pady=(0, 6))
+        ttk.Label(srow, text=T("Αναζήτηση:", "Search:"), style='CardHint.TLabel').pack(side="left", padx=(0, 6))
+        self.search_entry = ttk.Entry(srow, textvariable=self.q_var)
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        clear = tk.Label(srow, text="\u2715", bg=CARD, fg=MUTED, font=(FONT, 10), cursor='hand2', padx=6)
+        clear.pack(side="left")
+        clear.bind('<Button-1>', lambda e: self.q_var.set(''))
+        self.q_var.trace_add('write', lambda *a: self._fill_tree())
+        tree_box = ttk.Frame(left, style='Card.TFrame')
+        tree_box.pack(fill="both", expand=True, padx=8)
+        self.tree = ttk.Treeview(tree_box, show='tree', selectmode='browse', height=18, style='Editor.Treeview')
+        self.tree.column('#0', width=250, minwidth=180, stretch=True)
+        sb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure('group', font=(FONT, 10, 'bold'), foreground=NAVY)
+        self.tree.tag_configure('hidden', foreground=MUTED)
+        self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
+        lrow = ttk.Frame(left, style='Card.TFrame')
+        lrow.pack(fill="x", padx=14, pady=(12, 4))
+        ttk.Button(lrow, text=T("+ Προσθήκη στοιχείου…", "+ Add item…"), style='PrintSm.TButton',
+                   command=self._add_item_dialog).pack(side="left")
+        ttk.Button(lrow, text=T("+ Δικό μου κείμενο", "+ My own text"), command=self._add_custom).pack(side="left", padx=8)
+        lrow2 = ttk.Frame(left, style='Card.TFrame')
+        lrow2.pack(fill="x", padx=14, pady=(0, 12))
+        self.dup_btn = ttk.Button(lrow2, text=T("Διπλασιασμός", "Duplicate"), command=self._duplicate)
+        self.dup_btn.pack(side="left")
+        self.del_btn = ttk.Button(lrow2, text=T("Διαγραφή", "Delete"), command=self._delete_selected)
+        self.del_btn.pack(side="left", padx=8)
+        body.add(left_outer, weight=0)
+
+        mid = tk.Frame(body, bg=BORDER)
+        mid_in = tk.Frame(mid, bg=TAB_BG)
+        mid_in.pack(fill="both", expand=True, padx=1, pady=1)
+        mid_in.rowconfigure(0, weight=1)
+        mid_in.columnconfigure(0, weight=1)
+        self.cv = tk.Canvas(mid_in, bg=TAB_BG, highlightthickness=0, width=640, height=560, takefocus=True)
+        vbar = ttk.Scrollbar(mid_in, orient="vertical", command=self.cv.yview)
+        hbar = ttk.Scrollbar(mid_in, orient="horizontal", command=self.cv.xview)
+        self.cv.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self.cv.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        self.cv.bind('<Configure>', self._on_canvas_configure)
+        self.cv.bind('<ButtonPress-1>', self._on_press)
+        self.cv.bind('<B1-Motion>', self._on_drag)
+        self.cv.bind('<ButtonRelease-1>', self._on_release)
+        self.cv.bind('<Motion>', self._on_hover)
+        self.cv.bind('<MouseWheel>', self._on_wheel)
+        self.cv.bind('<Button-4>', self._on_wheel)
+        self.cv.bind('<Button-5>', self._on_wheel)
+        body.add(mid, weight=1)
+
+        right_outer, right = self._card(body)
+        self._build_props(right)
+        body.add(right_outer, weight=0)
+
+    def _build_props(self, parent):
+        self.empty_lbl = ttk.Label(
+            parent, style='CardHint.TLabel', justify="left", wraplength=250,
+            text=T("Επιλέξτε ένα στοιχείο από τη λίστα ή πατήστε πάνω του στη σελίδα.\n\n"
+                   "Μετά σύρετέ το εκεί που θέλετε και διαλέξτε γραμματοσειρά, μέγεθος και χρώμα.",
+                   "Choose an item from the list or click it on the page.\n\n"
+                   "Then drag it where you want it and pick the font, size and colour."))
+        self.empty_lbl.pack(anchor="nw", padx=18, pady=18)
+        self.props = ttk.Frame(parent, style='Card.TFrame')
+        p = self.props
+        p.columnconfigure(1, weight=1)
+
+        self.v_text = tk.StringVar()
+        self.v_font = tk.StringVar()
+        self.v_size = tk.StringVar()
+        self.v_bold = tk.BooleanVar()
+        self.v_italic = tk.BooleanVar()
+        self.v_color = tk.StringVar()
+        self.v_step = tk.StringVar()
+        self.v_x = tk.StringVar()
+        self.v_y = tk.StringVar()
+        self.v_visible = tk.BooleanVar()
+        self.v_nudge = tk.StringVar(value="0.5")
+
+        self.p_title = ttk.Label(p, text="", style='CardBold.TLabel', wraplength=250, justify="left")
+        self.p_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 0))
+        self.p_sub = ttk.Label(p, text="", style='CardHint.TLabel')
+        self.p_sub.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+
+        def label(row, text):
+            ttk.Label(p, text=text, style='Card.TLabel').grid(row=row, column=0, sticky="w", padx=(16, 8), pady=5)
+
+        label(2, T("Κείμενο", "Text"))
+        self.e_text = ttk.Entry(p, textvariable=self.v_text, width=18)
+        self.e_text.grid(row=2, column=1, sticky="ew", padx=(0, 16))
+        self.text_row_widgets = [p.grid_slaves(row=2, column=0)[0], self.e_text]
+
+        label(3, T("Γραμματοσειρά", "Font"))
+        fonts = [T("(προεπιλογή)", "(default)")] + self.families
+        self.cb_font = ttk.Combobox(p, textvariable=self.v_font, values=fonts, state='readonly', width=18)
+        self.cb_font.grid(row=3, column=1, sticky="ew", padx=(0, 16))
+        self.cb_font.bind('<<ComboboxSelected>>', lambda e: self._prop_changed())
+
+        label(4, T("Μέγεθος", "Size"))
+        self.sp_size = ttk.Spinbox(p, textvariable=self.v_size, from_=3, to=96, increment=0.5, width=8,
+                                   command=self._prop_changed)
+        self.sp_size.grid(row=4, column=1, sticky="w")
+
+        style_row = ttk.Frame(p, style='Card.TFrame')
+        style_row.grid(row=5, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 2))
+        ttk.Checkbutton(style_row, text=T("Έντονα", "Bold"), variable=self.v_bold, style='Card.TCheckbutton',
+                        command=self._prop_changed).pack(side="left")
+        ttk.Checkbutton(style_row, text=T("Πλάγια", "Italic"), variable=self.v_italic, style='Card.TCheckbutton',
+                        command=self._prop_changed).pack(side="left", padx=14)
+
+        label(6, T("Χρώμα", "Colour"))
+        color_row = ttk.Frame(p, style='Card.TFrame')
+        color_row.grid(row=6, column=1, sticky="w")
+        self.swatch = tk.Label(color_row, width=4, bg='#000000', cursor='hand2', highlightthickness=1,
+                               highlightbackground=BORDER)
+        self.swatch.pack(side="left")
+        self.swatch.bind('<Button-1>', lambda e: self._pick_color())
+        ttk.Entry(color_row, textvariable=self.v_color, width=9).pack(side="left", padx=(8, 0))
+        quick = ttk.Frame(p, style='Card.TFrame')
+        quick.grid(row=7, column=1, sticky="w", pady=(2, 4))
+        for col in self.QUICK_COLORS:
+            dot = tk.Label(quick, width=2, bg=col, cursor='hand2', highlightthickness=1, highlightbackground=BORDER)
+            dot.pack(side="left", padx=(0, 5))
+            dot.bind('<Button-1>', lambda e, c=col: self.v_color.set(c))
+
+        label(8, T("Στοίχιση", "Align"))
+        self.align_seg = Segmented(p, (('left', T("Αριστερά", "Left")), ('center', T("Κέντρο", "Centre")),
+                                       ('right', T("Δεξιά", "Right"))), lambda v: self._prop_changed(), 'left')
+        self.align_seg.grid(row=8, column=1, sticky="w")
+
+        label(9, T("Απόσταση ψηφίων", "Digit spacing"))
+        self.sp_step = ttk.Spinbox(p, textvariable=self.v_step, from_=0, to=200, increment=0.5, width=8,
+                                   command=self._prop_changed)
+        self.sp_step.grid(row=9, column=1, sticky="w")
+        ttk.Label(p, text=T("0 = κανονικό κείμενο. Αλλιώς κάθε γράμμα μπαίνει σε σταθερή απόσταση (για κουτάκια).",
+                            "0 = normal text. Otherwise each character sits at a fixed distance (for digit boxes)."),
+                  style='CardHint.TLabel', wraplength=250, justify="left").grid(
+            row=10, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 4))
+
+        ttk.Separator(p, orient="horizontal").grid(row=11, column=0, columnspan=2, sticky="ew", padx=16, pady=8)
+        self.x_lbl = ttk.Label(p, text="X (pt)", style='Card.TLabel')
+        self.x_lbl.grid(row=12, column=0, sticky="w", padx=(16, 8), pady=5)
+        self.sp_x = ttk.Spinbox(p, textvariable=self.v_x, from_=-100, to=1000, increment=0.5, width=8,
+                                command=self._prop_changed)
+        self.sp_x.grid(row=12, column=1, sticky="w")
+        self.y_lbl = ttk.Label(p, text="Y (pt)", style='Card.TLabel')
+        self.y_lbl.grid(row=13, column=0, sticky="w", padx=(16, 8), pady=5)
+        self.sp_y = ttk.Spinbox(p, textvariable=self.v_y, from_=-1000, to=1500, increment=0.5, width=8,
+                                command=self._prop_changed)
+        self.sp_y.grid(row=13, column=1, sticky="w")
+
+        pad = ttk.Frame(p, style='Card.TFrame')
+        pad.grid(row=14, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 2))
+        for col, (txt, dx, dy) in enumerate((("◀", -1, 0), ("▲", 0, 1), ("▼", 0, -1), ("▶", 1, 0))):
+            ttk.Button(pad, text=txt, width=3, command=lambda a=dx, b=dy: self._nudge(a, b)).grid(row=0, column=col, padx=(0, 4))
+        ttk.Combobox(pad, textvariable=self.v_nudge, values=self.NUDGE_STEPS, width=4).grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(pad, text="pt", style='CardHint.TLabel').grid(row=0, column=5, padx=(4, 0))
+
+        ttk.Checkbutton(p, text=T("Εμφάνιση στο PDF", "Show in the PDF"), variable=self.v_visible,
+                        style='Card.TCheckbutton', command=self._prop_changed).grid(
+            row=15, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 0))
+        self.split_sep = ttk.Separator(p, orient="horizontal")
+        self.split_sep.grid(row=16, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 6))
+        self.split_btn = ttk.Button(p, text="", command=self._toggle_split)
+        self.split_btn.grid(row=17, column=0, columnspan=2, sticky="w", padx=16)
+        self.split_hint = ttk.Label(p, text="", style='CardHint.TLabel', wraplength=250, justify="left")
+        self.split_hint.grid(row=18, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 0))
+        self.sib_btn = ttk.Button(p, text=T("Ίδια μορφή σε όλα τα αδέλφια", "Same format for all siblings"),
+                                  command=self._apply_siblings)
+        self.sib_btn.grid(row=19, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
+        self.reset_btn = ttk.Button(p, text=T("Επαναφορά αυτού του στοιχείου", "Reset this item"),
+                                    command=self._reset_item)
+        self.reset_btn.grid(row=20, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 16))
+
+        for var in (self.v_text, self.v_size, self.v_color, self.v_step, self.v_x, self.v_y):
+            var.trace_add('write', lambda *a: self._prop_changed())
+
+    # ------------------------------------------------------------------ list of items
+    def _tree_text(self, fid, it):
+        return ("" if it.get('visible', True) else "○  ") + manual_label(fid, it)
+
+    def _fill_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        q = _fold(self.q_var.get().strip())
+        items = self.layout['items']
+        groups = dict(MANUAL_GROUPS)
+        rows = []
+        for fid, it in items.items():
+            gid = manual_group(fid, it)
+            if q and q not in _fold(manual_label(fid, it) + ' ' + T(*groups.get(gid, (gid, gid)))):
+                continue
+            rows.append((fid, it, gid))
+        used = {g for _f, _i, g in rows}
+        for gid, (gel, gen) in MANUAL_GROUPS:
+            if not q or gid in used:
+                self.tree.insert('', 'end', iid='g:' + gid, text=T(gel, gen), open=(gid != 'totals') or bool(q),
+                                 tags=('group',))
+        for fid, it, gid in rows:
+            parent = 'g:' + gid
+            if not q and it.get('parent') in items:       # pieces of a split item sit under it
+                parent = it['parent']
+            self.tree.insert(parent, 'end', iid=fid, text=self._tree_text(fid, it),
+                             tags=() if it.get('visible', True) else ('hidden',))
+        self._sync_tree_selection()
+
+    def _sync_tree_selection(self):
+        self._sync = True
+        try:
+            if self.sel and self.tree.exists(self.sel):
+                self.tree.selection_set(self.sel)
+                self.tree.see(self.sel)
+            else:
+                self.tree.selection_remove(*self.tree.selection())
+        finally:
+            self._sync = False
+
+    def _on_tree_select(self, _event=None):
+        if self._sync:
+            return
+        chosen = self.tree.selection()
+        if chosen and chosen[0] in self.layout['items'] and chosen[0] != self.sel:
+            self._select(chosen[0], from_tree=True)
+
+    # ------------------------------------------------------------------ drawing
+    def _px(self, x):
+        return self.ox + x * self.zoom
+
+    def _py(self, y):
+        return self.PAD + (self.sizes[self.page][1] - y) * self.zoom
+
+    def _page_photo(self):
+        key = (self.page, round(self.zoom, 3))
+        if key in self._photos:
+            return self._photos[key]
+        png = render_pdf_page_png(self.template, self.page, self.zoom)
+        photo = None
+        if png:
+            try:
+                photo = tk.PhotoImage(data=base64.b64encode(png).decode('ascii'))
+            except tk.TclError:
+                photo = None
+        if len(self._photos) > 8:
+            self._photos.clear()
+        self._photos[key] = photo
+        return photo
+
+    def _draw_all(self):
+        cv, z = self.cv, self.zoom
+        pw, ph = self.sizes[self.page]
+        w, h = pw * z, ph * z
+        cw = max(cv.winfo_width(), 100)
+        self.ox = max(self.PAD, int((cw - w) / 2))
+        cv.delete('all')
+        cv.configure(scrollregion=(0, 0, max(self.ox * 2 + w, cw), h + 2 * self.PAD))
+        cv.create_rectangle(self.ox + 4, self.PAD + 4, self.ox + w + 4, self.PAD + h + 4, fill=BORDER, outline='')
+        self.config(cursor='watch')
+        try:
+            photo = self._page_photo()
+        finally:
+            self.config(cursor='')
+        if photo:
+            cv.create_image(self.ox, self.PAD, image=photo, anchor='nw')
+            self.render_note.configure(text="")
+        else:
+            cv.create_rectangle(self.ox, self.PAD, self.ox + w, self.PAD + h, fill='white', outline='')
+            self._draw_fallback_texts()
+            self.render_note.configure(text=T("Η σελίδα του εντύπου δεν μπορεί να σχεδιαστεί εδώ - εγκαταστήστε το pypdfium2 "
+                                              "(pip install pypdfium2) για πλήρη προβολή.",
+                                              "The form page cannot be drawn here - install pypdfium2 "
+                                              "(pip install pypdfium2) for the full view."))
+        cv.create_rectangle(self.ox, self.PAD, self.ox + w, self.PAD + h, outline=ZONE_IDLE_LINE)
+        self.zoom_lbl.configure(text=f"{round(z * 100)}%")
+        self._draw_items()
+
+    def _draw_fallback_texts(self):
+        if self._fallback_texts is None:
+            try:
+                self._fallback_texts = template_text_items(self.template)
+            except Exception:
+                self._fallback_texts = [[], []]
+        for text, x, y, size in self._fallback_texts[self.page]:
+            self.cv.create_text(self._px(x), self._py(y), text=text, anchor='sw', fill='#9aa5b4',
+                                font=(FONT, -max(3, int(size * self.zoom))))
+
+    def _draw_items(self):
+        self.cv.delete('item')
+        for fid, it in self.layout['items'].items():
+            if it['page'] == self.page:
+                self._draw_item(fid, it)
+        self._draw_selection()
+
+    def _draw_item(self, fid, it):
+        if it.get('split'):                     # drawn through its individual pieces
+            return
+        cv, z = self.cv, self.zoom
+        tag = 'it_' + fid
+        px_size = max(3, int(round(it['size'] * z)))
+        family = it['font'] if it['font'] in self.families else (self.families[0] if self.families else FONT)
+        style = ' '.join(s for s, on in (('bold', it['bold']), ('italic', it['italic'])) if on) or 'normal'
+        anchor = {'left': 'sw', 'center': 's', 'right': 'se'}.get(it['align'], 'sw')
+        color = MUTED if not it.get('visible', True) else it['color']
+        drop = px_size * 0.2
+        step = it['step']
+        sample_on = self.show_sample.get()
+        parent, country, source = it.get('parent'), it.get('country'), it.get('source')
+        if country:
+            y0 = self.row_ys[it['page']].get(country)
+            if y0 is None:
+                return
+            shown = ('12' if parent.endswith('_c') else '34') if sample_on else ''
+            entries = [(it['x'], y0 + it['y'], shown)]
+        elif parent:
+            text = self.sample.get(parent, '')
+            idx = it.get('index', 0)
+            entries = [(it['x'], it['y'], text[idx] if sample_on and 0 <= idx < len(text) else '')]
+        elif fid.startswith('rows'):
+            ys = list(self.row_ys[it['page']].values()) or [400.0]
+            if sample_on:
+                shown = '12' if fid.endswith('_c') else '34'
+                entries = [(it['x'], y + it['y'], shown) for y in ys]
+            else:
+                entries = [(it['x'], ys[0] + it['y'], '')]
+        elif it.get('custom'):
+            entries = [(it['x'], it['y'], it.get('text', ''))]
+        elif source:
+            if source.startswith('country:'):
+                shown = ('1234' if source.endswith(':c') else '5678') if sample_on else ''
+            else:
+                shown = self.sample.get(source, '') if sample_on else ''
+            entries = [(it['x'], it['y'], shown)]
+        else:
+            entries = [(it['x'], it['y'], self.sample.get(fid, '') if sample_on else '')]
+        for x, y, txt in entries:
+            if not txt:           # nothing to show: the item's name stands in, so it can still be found
+                cv.create_text(self._px(x), self._py(y) + 2, text=manual_label(fid, it), anchor='sw', fill=ACCENT,
+                               font=(FONT, 9), tags=('item', tag))
+            elif step:
+                for i, ch in enumerate(txt):
+                    cv.create_text(self._px(x + i * step), self._py(y) + drop, text=ch, anchor=anchor, fill=color,
+                                   font=(family, -px_size, style), tags=('item', tag))
+            else:
+                cv.create_text(self._px(x), self._py(y) + drop, text=txt, anchor=anchor, fill=color,
+                               font=(family, -px_size, style), tags=('item', tag))
+
+    def _draw_selection(self):
+        self.cv.delete('selbox')
+        if not self.sel or self.sel not in self.layout['items']:
+            return
+        it = self.layout['items'][self.sel]
+        if it['page'] != self.page or it.get('split'):
+            return
+        box = self.cv.bbox('it_' + self.sel)
+        if box:
+            self.cv.create_rectangle(box[0] - 3, box[1] - 2, box[2] + 3, box[3] + 2, outline=ACCENT, dash=(4, 3),
+                                     tags='selbox')
+        x, y = self._px(it['x']), self._py(it['y'] + self._row_base_y(self.sel, it))
+        self.cv.create_oval(x - 3, y - 3, x + 3, y + 3, fill=ACCENT, outline='white', tags='selbox')
+
+    @staticmethod
+    def _is_rows(fid, it):
+        return fid.startswith('rows') and not it.get('parent')
+
+    def _row_base_y(self, fid, it):
+        if self._is_rows(fid, it):
+            return (list(self.row_ys[it['page']].values()) or [400.0])[0]
+        if it.get('country'):
+            return self.row_ys[it['page']].get(it['country'], 0.0)
+        return 0.0
+
+    def _on_canvas_configure(self, event):
+        if self._fit_pending and event.width > 300 and event.height > 200:
+            self._fit_pending = False
+            self.after(10, self._fit)
+            return
+        if abs(event.width - self._last_width) > 2:
+            self._last_width = event.width
+            if self._redraw_job:
+                self.after_cancel(self._redraw_job)
+            self._redraw_job = self.after(80, self._draw_all)
+
+    def _hit(self, event):
+        x, y = self.cv.canvasx(event.x), self.cv.canvasy(event.y)
+        for item in reversed(self.cv.find_overlapping(x - 4, y - 4, x + 4, y + 4)):
+            for tag in self.cv.gettags(item):
+                if tag.startswith('it_'):
+                    return tag[3:]
+        return None
+
+    def _on_press(self, event):
+        self.cv.focus_set()
+        fid = self._hit(event)
+        self._select(fid)
+        self._drag = [self.cv.canvasx(event.x), self.cv.canvasy(event.y), False] if fid else None
+
+    def _on_drag(self, event):
+        if not self._drag or not self.sel:
+            return
+        cx, cy = self.cv.canvasx(event.x), self.cv.canvasy(event.y)
+        dx, dy = cx - self._drag[0], cy - self._drag[1]
+        if not self._drag[2] and abs(dx) + abs(dy) < 3:
+            return
+        if not self._drag[2]:
+            self._snap(None)
+        self._drag[0], self._drag[1], self._drag[2] = cx, cy, True
+        it = self.layout['items'][self.sel]
+        it['x'] += dx / self.zoom
+        it['y'] -= dy / self.zoom
+        self.cv.move('it_' + self.sel, dx, dy)
+        self.cv.move('selbox', dx, dy)
+        self._set_dirty()
+        self._load_xy()
+
+    def _on_release(self, _event):
+        moved = bool(self._drag and self._drag[2])
+        self._drag = None
+        if moved and self.sel:
+            it = self.layout['items'][self.sel]
+            it['x'], it['y'] = round(it['x'], 1), round(it['y'], 1)
+            self._load_xy()
+            self._draw_items()
+
+    def _on_hover(self, event):
+        x = (self.cv.canvasx(event.x) - self.ox) / self.zoom
+        y = self.sizes[self.page][1] - (self.cv.canvasy(event.y) - self.PAD) / self.zoom
+        self.status_var.set(f"X {x:7.1f}   Y {y:7.1f}  pt")
+        self.cv.configure(cursor='fleur' if self._hit(event) else '')
+
+    def _on_wheel(self, event):
+        num = getattr(event, 'num', None)
+        delta = 120 if num == 4 else -120 if num == 5 else getattr(event, 'delta', 0)
+        if not delta:
+            return 'break'
+        if event.state & 0x4:                              # Ctrl + wheel = zoom
+            self._set_zoom(self.zoom * (1.12 if delta > 0 else 1 / 1.12))
+        elif event.state & 0x1:                            # Shift + wheel = sideways
+            self.cv.xview_scroll(-3 if delta > 0 else 3, 'units')
+        else:
+            self.cv.yview_scroll(-3 if delta > 0 else 3, 'units')
+        return 'break'
+
+    def _typing(self):
+        return isinstance(self.focus_get(), (tk.Entry, ttk.Entry, ttk.Spinbox, ttk.Combobox, tk.Text))
+
+    def _on_arrow(self, event):
+        if not self.sel or self._typing() or isinstance(self.focus_get(), ttk.Treeview):
+            return None
+        amount = 5.0 if event.state & 0x1 else 0.5
+        dx = {'Left': -1, 'Right': 1}.get(event.keysym, 0)
+        dy = {'Up': 1, 'Down': -1}.get(event.keysym, 0)
+        self._move_by(dx * amount, dy * amount)
+        return 'break'
+
+    def _on_delete_key(self, _event):
+        if self.sel and not self._typing():
+            self._delete_selected()
+
+    # ------------------------------------------------------------------ view
+    def _set_zoom(self, zoom):
+        zoom = min(max(zoom, 0.4), 3.0)
+        fx, fy = self.cv.xview()[0], self.cv.yview()[0]
+        self.zoom = zoom
+        self._draw_all()
+        self.cv.xview_moveto(fx)
+        self.cv.yview_moveto(fy)
+
+    def _fit(self):
+        pw, ph = self.sizes[self.page]
+        cw, ch = max(self.cv.winfo_width(), 300), max(self.cv.winfo_height(), 200)
+        self.zoom = min((cw - 2 * self.PAD) / pw, (ch - 2 * self.PAD) / ph)
+        self.zoom = min(max(round(self.zoom, 2), 0.4), 3.0)
+        self._draw_all()
+        self.cv.xview_moveto(0)
+        self.cv.yview_moveto(0)
+
+    def _on_page_seg(self, value):
+        self.page = value
+        if self.sel and self.layout['items'][self.sel]['page'] != value:
+            self.sel = None
+            self._sync_tree_selection()
+            self._load_props()
+        self._draw_all()
+
+    def _reveal(self):
+        box = self.cv.bbox('it_' + self.sel) if self.sel else None
+        if not box:
+            return
+        try:
+            sr = [float(v) for v in str(self.cv.cget('scrollregion')).split()]
+        except ValueError:
+            return
+        total_w, total_h = max(sr[2] - sr[0], 1), max(sr[3] - sr[1], 1)
+        cw, ch = self.cv.winfo_width(), self.cv.winfo_height()
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        x0, y0 = self.cv.canvasx(0), self.cv.canvasy(0)
+        if not (x0 + 30 < cx < x0 + cw - 30):
+            self.cv.xview_moveto(max(0.0, (cx - cw / 2) / total_w))
+        if not (y0 + 30 < cy < y0 + ch - 30):
+            self.cv.yview_moveto(max(0.0, (cy - ch / 2) / total_h))
+
+    # ------------------------------------------------------------------ selection / properties
+    def _select(self, fid, from_tree=False):
+        self.sel = fid if fid in self.layout['items'] else None
+        if self.sel and self.layout['items'][self.sel]['page'] != self.page:
+            self.page = self.layout['items'][self.sel]['page']
+            self.page_seg.set(self.page)
+            self._draw_all()
+        else:
+            self._draw_selection()
+        if not from_tree:
+            self._sync_tree_selection()
+        self._load_props()
+        if from_tree:
+            self._reveal()
+
+    def _load_props(self):
+        if not self.sel:
+            self.props.pack_forget()
+            self.empty_lbl.pack(anchor="nw", padx=18, pady=18)
+            self.del_btn.state(['disabled'])
+            self.dup_btn.state(['disabled'])
+            self.tip_var.set(self._context_tip())
+            return
+        self.tip_var.set(self._context_tip())
+        items = self.layout['items']
+        it = items[self.sel]
+        self.empty_lbl.pack_forget()
+        self.props.pack(fill="both", expand=True)
+        self._loading = True
+        try:
+            custom = bool(it.get('custom'))
+            rows = self._is_rows(self.sel, it)
+            rowchild = bool(it.get('country'))
+            child = bool(it.get('parent'))
+            deletable = custom or bool(it.get('source'))
+            self.p_title.configure(text=manual_label(self.sel, it))
+            sub = T(f"Σελίδα {it['page'] + 1}", f"Page {it['page'] + 1}")
+            if rows and not it.get('split'):
+                sub += T(" · μετακινεί όλες τις γραμμές της στήλης", " · moves every row of the column")
+            if it.get('split'):
+                sub += T(" · χωρισμένο - επεξεργαστείτε τα μέλη του ξεχωριστά",
+                         " · split - edit its individual members")
+            self.p_sub.configure(text=sub)
+            for w in self.text_row_widgets:
+                w.grid() if custom else w.grid_remove()
+            self.v_text.set(it.get('text', '') if custom else '')
+            self.v_font.set(it['font'] if it['font'] in self.families else T("(προεπιλογή)", "(default)"))
+            self.v_size.set(f"{it['size']:g}")
+            self.v_bold.set(it['bold'])
+            self.v_italic.set(it['italic'])
+            self.v_color.set(it['color'])
+            self.swatch.configure(bg=it['color'])
+            self.align_seg.set(it['align'])
+            self.v_step.set(f"{it['step']:g}")
+            self.v_visible.set(it.get('visible', True))
+            self.x_lbl.configure(text=T("X (στήλη, pt)", "X (column, pt)") if rows else "X (pt)")
+            self.y_lbl.configure(text=T("Μετατόπιση Y (pt)", "Y offset (pt)") if (rows or rowchild) else "Y (pt)")
+            self._load_xy()
+            can_reset = not custom and not child and not it.get('source') and self.sel in MANUAL_FIELD_INDEX
+            self.reset_btn.state(['!disabled'] if can_reset else ['disabled'])
+            self.del_btn.state(['!disabled'] if deletable else ['disabled'])
+            self.dup_btn.state(['!disabled'] if (not child and not rows and not it.get('split')) else ['disabled'])
+            # individual controls
+            tid = it.get('parent') or self.sel
+            can_split = (tid.startswith('rows') or tid in MANUAL_SPLIT_LEN) and not custom and not it.get('source')
+            if can_split:
+                is_split = bool(items[tid].get('split'))
+                self.split_btn.configure(text=T("Συγχώνευση ξανά σε ένα", "Merge back into one") if is_split
+                                         else T("Χωρισμός σε μεμονωμένα στοιχεία", "Split into individual items"))
+                if tid.startswith('rows'):
+                    hint = T("Κάθε χώρα γίνεται ξεχωριστό στοιχείο που μετακινείται ελεύθερα (το ύψος γραμμής ακολουθεί το template).",
+                             "Each country becomes its own item that moves freely (the row height still follows the template).")
+                else:
+                    hint = T("Κάθε ψηφίο γίνεται ξεχωριστό στοιχείο.", "Each digit becomes its own item.")
+                self.split_hint.configure(text=hint)
+                for w in (self.split_sep, self.split_btn, self.split_hint):
+                    w.grid()
+            else:
+                for w in (self.split_sep, self.split_btn, self.split_hint):
+                    w.grid_remove()
+            self.sib_btn.grid() if child else self.sib_btn.grid_remove()
+        finally:
+            self._loading = False
+
+    def _load_xy(self):
+        if not self.sel:
+            return
+        it = self.layout['items'][self.sel]
+        was, self._loading = self._loading, True
+        try:
+            self.v_x.set(f"{it['x']:.1f}")
+            self.v_y.set(f"{it['y']:.1f}")
+        finally:
+            self._loading = was
+
+    @staticmethod
+    def _num(var, low, high):
+        try:
+            return min(max(float(var.get().replace(',', '.')), low), high)
+        except ValueError:
+            return None
+
+    def _prop_changed(self, *_):
+        if self._loading or not self.sel:
+            return
+        self._snap('prop:' + self.sel)
+        it = self.layout['items'][self.sel]
+        if it.get('custom'):
+            it['text'] = self.v_text.get()
+        font = self.v_font.get()
+        it['font'] = font if font in self.families else ''
+        for key, var, low, high in (('size', self.v_size, 3, 96), ('step', self.v_step, 0, 200),
+                                    ('x', self.v_x, -100, 1000), ('y', self.v_y, -1000, 1500)):
+            value = self._num(var, low, high)
+            if value is not None:
+                it[key] = value
+        it['bold'], it['italic'] = bool(self.v_bold.get()), bool(self.v_italic.get())
+        color = self.v_color.get().strip()
+        if re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+            it['color'] = color.lower()
+            self.swatch.configure(bg=it['color'])
+        it['align'] = self.align_seg.value
+        it['visible'] = bool(self.v_visible.get())
+        self.p_title.configure(text=manual_label(self.sel, it))
+        if self.tree.exists(self.sel):
+            self.tree.item(self.sel, text=self._tree_text(self.sel, it),
+                           tags=() if it['visible'] else ('hidden',))
+        self._set_dirty()
+        self._draw_items()
+
+    def _pick_color(self):
+        if not self.sel:
+            return
+        current = self.layout['items'][self.sel]['color']
+        chosen = colorchooser.askcolor(color=current, parent=self, title=T("Χρώμα κειμένου", "Text colour"))
+        if chosen and chosen[1]:
+            self.v_color.set(chosen[1])
+
+    def _move_by(self, dx, dy):
+        if not self.sel:
+            return
+        self._snap('move:' + self.sel)
+        it = self.layout['items'][self.sel]
+        it['x'] = round(it['x'] + dx, 2)
+        it['y'] = round(it['y'] + dy, 2)
+        self._load_xy()
+        self._set_dirty()
+        self._draw_items()
+
+    def _nudge(self, dx, dy):
+        amount = self._num(self.v_nudge, 0.01, 100) or 0.5
+        self._move_by(dx * amount, dy * amount)
+
+    def _reset_item(self):
+        if not self.sel:
+            return
+        it = self.layout['items'][self.sel]
+        if it.get('custom') or it.get('source') or it.get('parent') or self.sel not in MANUAL_FIELD_INDEX:
+            return
+        self._snap(None)
+        manual_merge_item(self.layout, self.sel)
+        self.layout['items'][self.sel] = manual_default_layout()['items'][self.sel]
+        self._set_dirty()
+        self._fill_tree()
+        self._load_props()
+        self._draw_items()
+
+    def _add_custom(self):
+        self._snap(None)
+        n = 1
+        while f'custom_{n}' in self.layout['items']:
+            n += 1
+        fid = f'custom_{n}'
+        pw, ph = self.sizes[self.page]
+        try:                                           # drop it in the middle of what is on screen
+            cx = (self.cv.canvasx(self.cv.winfo_width() / 2) - self.ox) / self.zoom
+            cy = ph - (self.cv.canvasy(self.cv.winfo_height() / 2) - self.PAD) / self.zoom
+        except tk.TclError:
+            cx, cy = pw / 2, ph / 2
+        cx, cy = min(max(cx, 20), pw - 120), min(max(cy, 20), ph - 20)
+        it = manual_new_item(self.page, round(cx, 1), round(cy, 1), custom=True, text=T("Νέο κείμενο", "New text"))
+        self.layout['items'][fid] = it
+        self.tree.insert('g:custom', 'end', iid=fid, text=self._tree_text(fid, it))
+        self._set_dirty()
+        self._select(fid)
+        self._draw_items()
+
+    def _delete_selected(self):
+        if not self.sel:
+            return
+        it = self.layout['items'][self.sel]
+        if not (it.get('custom') or it.get('source')):
+            return
+        self._snap(None)
+        fid = self.sel
+        self.sel = None
+        del self.layout['items'][fid]
+        self._set_dirty()
+        self._fill_tree()
+        self._load_props()
+        self._draw_items()
+
+    def _reset_all(self):
+        if not messagebox.askyesno(T("Επαναφορά όλων", "Reset all"),
+                                   T("Όλες οι θέσεις και οι μορφοποιήσεις θα γυρίσουν στις προεπιλεγμένες και τα δικά σας "
+                                     "κείμενα θα διαγραφούν.\n\nΣυνέχεια;",
+                                     "Every position and format goes back to the default and your own texts are "
+                                     "deleted.\n\nContinue?"), default='no', parent=self):
+            return
+        self._snap(None)
+        self.layout = manual_default_layout()
+        self.sel = None
+        self._fill_tree()
+        self._set_dirty()
+        self._load_props()
+        self._draw_items()
+
+    def _context_tip(self):
+        """A short tip that fits what is selected right now."""
+        if not self.sel or self.sel not in self.layout['items']:
+            return T("Συμβουλή: πατήστε ένα στοιχείο στη σελίδα ή στη λίστα για να το μετακινήσετε. "
+                     "Ctrl+F = αναζήτηση · + Προσθήκη στοιχείου = βάλτε ό,τι άλλο θέλετε στο δελτίο.",
+                     "Tip: click an item on the page or in the list to move it. "
+                     "Ctrl+F = search · + Add item = put anything else you want on the form.")
+        it = self.layout['items'][self.sel]
+        if it.get('split'):
+            return T("Αυτό το στοιχείο είναι χωρισμένο: ανοίξτε το στη λίστα και επιλέξτε ένα μέλος του, ή πατήστε πάνω του στη σελίδα.",
+                     "This item is split: open it in the list and pick one of its members, or click it on the page.")
+        if it.get('country'):
+            return T("Μεμονωμένη χώρα: το X είναι ελεύθερο και το Y είναι μετατόπιση από τη γραμμή της στο template. Απλώς σύρτε την.",
+                     "Individual country: X is free and Y is an offset from its row in the template. Just drag it.")
+        if it.get('parent'):
+            return T("Ένα ψηφίο: μετακινείται μόνο του. «Ίδια μορφή σε όλα τα αδέλφια» περνά τη μορφή του στα υπόλοιπα ψηφία.",
+                     "One digit: it moves on its own. “Same format for all siblings” copies its format to the other digits.")
+        if self._is_rows(self.sel, it):
+            return T("Η στήλη μετακινείται ως σύνολο. Για να μετακινείτε κάθε χώρα ξεχωριστά πατήστε «Χωρισμός σε μεμονωμένα στοιχεία».",
+                     "The column moves as one. To move each country separately press “Split into individual items”.")
+        if self.sel in MANUAL_SPLIT_LEN:
+            return T("Κουτάκια ψηφίων: ρυθμίστε την «Απόσταση ψηφίων» ή χωρίστε το σε μεμονωμένα ψηφία για πλήρη ελευθερία.",
+                     "Digit boxes: adjust the “Digit spacing” or split it into single digits for full freedom.")
+        if it.get('custom'):
+            return T("Δικό σας κείμενο: αλλάξτε το από το πεδίο «Κείμενο». Ctrl+D = αντίγραφο, Delete = διαγραφή.",
+                     "Your own text: edit it in the “Text” field. Ctrl+D = copy, Delete = remove.")
+        if it.get('source'):
+            return T("Στοιχείο δεδομένων: η τιμή του μπαίνει αυτόματα όταν δημιουργείται το δελτίο. Μπορείτε να το βάλετε όσες φορές θέλετε.",
+                     "Data item: its value is filled in automatically when the form is created. You can place it as many times as you like.")
+        return T("Σύρτε για μετακίνηση · βελάκια = 0,5 pt (Shift = 5 pt) · «Εμφάνιση στο PDF» το κρύβει χωρίς να το διαγράψει.",
+                 "Drag to move · arrow keys = 0.5 pt (Shift = 5 pt) · “Show in the PDF” hides it without deleting it.")
+
+    def _open_guide(self):
+        """F1: open the guide at the layout-editor section (the editor stops being modal so the main window can be used)."""
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.app.open_help('editor')
+        self.app.lift()
+        self.app.focus_force()
+
+    # ------------------------------------------------------------------ undo / redo
+    def _snap(self, key):
+        """Remembers the layout before a change. The same `key` within a second counts as one change."""
+        now = time.time()
+        if key is not None and key == self._snap_key and now - self._snap_time < 1.0:
+            self._snap_time = now
+            return
+        self._snap_key, self._snap_time = key, now
+        self.undo.append(copy.deepcopy(self.layout['items']))
+        del self.undo[:-60]
+        self.redo.clear()
+        self._update_undo_buttons()
+
+    def _update_undo_buttons(self):
+        for btn, stack in ((getattr(self, 'undo_btn', None), self.undo), (getattr(self, 'redo_btn', None), self.redo)):
+            if btn is not None:
+                btn.state(['!disabled'] if stack else ['disabled'])
+
+    def _restore(self):
+        self._snap_key = None
+        if self.sel not in self.layout['items']:
+            self.sel = None
+        self._fill_tree()
+        self._load_props()
+        self._draw_items()
+        self._set_dirty()
+        self._update_undo_buttons()
+
+    def _undo(self):
+        if self.undo:
+            self.redo.append(copy.deepcopy(self.layout['items']))
+            self.layout['items'] = self.undo.pop()
+            self._restore()
+
+    def _redo(self):
+        if self.redo:
+            self.undo.append(copy.deepcopy(self.layout['items']))
+            self.layout['items'] = self.redo.pop()
+            self._restore()
+
+    # ------------------------------------------------------------------ individual items / catalog
+    def _toggle_split(self):
+        if not self.sel:
+            return
+        items = self.layout['items']
+        tid = items[self.sel].get('parent') or self.sel
+        target = items[tid]
+        self._snap(None)
+        if target.get('split'):
+            manual_merge_item(self.layout, tid)
+            new_sel = tid
+        elif tid.startswith('rows'):
+            ys = sorted(self.row_ys[target['page']].items(), key=lambda kv: -kv[1])
+            made = manual_split_item(self.layout, tid, '', [k for k, _ in ys])
+            new_sel = made[0] if made else tid
+        else:
+            made = manual_split_item(self.layout, tid, '0' * MANUAL_SPLIT_LEN.get(tid, 0), [])
+            new_sel = made[0] if made else tid
+        self._set_dirty()
+        self._fill_tree()
+        self._draw_items()
+        self._select(new_sel)
+
+    def _apply_siblings(self):
+        items = self.layout['items']
+        it = items.get(self.sel or '')
+        if not it or not it.get('parent'):
+            return
+        self._snap(None)
+        for other in items.values():
+            if other.get('parent') == it['parent']:
+                for key in ('font', 'size', 'bold', 'italic', 'color', 'align'):
+                    other[key] = it[key]
+        self._set_dirty()
+        self._draw_items()
+
+    def _view_center(self):
+        pw, ph = self.sizes[self.page]
+        try:
+            cx = (self.cv.canvasx(self.cv.winfo_width() / 2) - self.ox) / self.zoom
+            cy = ph - (self.cv.canvasy(self.cv.winfo_height() / 2) - self.PAD) / self.zoom
+        except tk.TclError:
+            cx, cy = pw / 2, ph / 2
+        self._stagger = (self._stagger + 1) % 6          # items added one after another do not hide each other
+        return min(max(cx, 20), pw - 120) + 12 * self._stagger, min(max(cy, 20), ph - 20) - 12 * self._stagger
+
+    def _free_id(self, prefix):
+        n = 1
+        while f'{prefix}{n}' in self.layout['items']:
+            n += 1
+        return f'{prefix}{n}'
+
+    def _add_source_item(self, key):
+        self._snap(None)
+        fid = self._free_id('extra_')
+        cx, cy = self._view_center()
+        it = manual_new_item(self.page, round(cx, 1), round(cy, 1), size=10.0)
+        it['source'] = key
+        self.layout['items'][fid] = it
+        self._set_dirty()
+        self._fill_tree()
+        self._draw_items()
+        self._select(fid)
+
+    def _duplicate(self):
+        if not self.sel:
+            return
+        items = self.layout['items']
+        it = items[self.sel]
+        if it.get('parent') or it.get('split') or self._is_rows(self.sel, it):
+            return
+        self._snap(None)
+        new = copy.deepcopy(it)
+        new['x'], new['y'] = round(it['x'] + 10, 1), round(it['y'] - 12, 1)
+        if it.get('custom'):
+            fid = self._free_id('custom_')
+        else:
+            fid = self._free_id('extra_')
+            new['source'] = it.get('source') or self.sel
+        items[fid] = new
+        self._set_dirty()
+        self._fill_tree()
+        self._draw_items()
+        self._select(fid)
+
+    def _add_item_dialog(self):
+        win = tk.Toplevel(self)
+        win.title(T("Προσθήκη στοιχείου", "Add item"))
+        win.configure(bg=BG)
+        win.transient(self)
+        box = ttk.Frame(win, padding=14)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text=T("Αναζητήστε ό,τι θέλετε να βάλετε στο δελτίο και πατήστε «Προσθήκη» (ή διπλό κλικ). "
+                              "Μπορείτε να προσθέσετε το ίδιο στοιχείο όσες φορές θέλετε και να το τοποθετήσετε ελεύθερα.",
+                              "Search for anything you want to put on the form and press “Add” (or double-click). "
+                              "You can add the same item as many times as you like and place it freely."),
+                  style='Hint.TLabel', wraplength=430, justify="left").pack(anchor="w")
+        qv = tk.StringVar()
+        ent = ttk.Entry(box, textvariable=qv)
+        ent.pack(fill="x", pady=8)
+        frame = ttk.Frame(box)
+        frame.pack(fill="both", expand=True)
+        tv = ttk.Treeview(frame, columns=('k',), show='tree headings', height=14, selectmode='extended')
+        tv.heading('#0', text=T("Στοιχείο", "Item"), anchor='w')
+        tv.heading('k', text=T("Ομάδα", "Group"), anchor='w')
+        tv.column('#0', width=290, stretch=True)
+        tv.column('k', width=130, stretch=False)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        kinds = dict(MANUAL_GROUPS)
+        kinds['country'] = ("Αριθμοί χωρών", "Country numbers")
+        catalog = manual_source_catalog()
+
+        def fill(*_):
+            tv.delete(*tv.get_children())
+            q = _fold(qv.get().strip())
+            for key, label, gid in catalog:
+                text, kind = T(*label), T(*kinds.get(gid, (gid, gid)))
+                if q and q not in _fold(text + ' ' + kind):
+                    continue
+                tv.insert('', 'end', iid=key, text=text, values=(kind,))
+
+        def add(_e=None):
+            for key in tv.selection():
+                self._add_source_item(key)
+            return 'break'
+
+        def close(_e=None):
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+            self._try_grab()
+
+        qv.trace_add('write', fill)
+        fill()
+        btns = ttk.Frame(box)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text=T("Προσθήκη", "Add"), style='PrintSm.TButton', command=add).pack(side="left")
+        ttk.Button(btns, text=T("Κλείσιμο", "Close"), command=close).pack(side="right")
+        tv.bind('<Double-1>', add)
+        ent.bind('<Return>', add)
+        win.bind('<Escape>', close)
+        win.protocol('WM_DELETE_WINDOW', close)
+        win.geometry(f"480x560+{self.winfo_rootx() + 90}+{self.winfo_rooty() + 70}")
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        ent.focus_set()
+
+    # ------------------------------------------------------------------ saving / closing / testing
+    def _set_dirty(self, value=True):
+        if self.dirty != value:
+            self.dirty = value
+            self._update_title()
+
+    def _update_title(self):
+        self.title(T("Επεξεργαστής διάταξης", "Layout editor") + (" *" if self.dirty else ""))
+
+    def save(self):
+        try:
+            save_manual_layout(self.layout)
+        except OSError as e:
+            messagebox.showerror(T("Αποθήκευση", "Save"),
+                                 T(f"Δεν ήταν δυνατή η αποθήκευση:\n{e}", f"Could not save:\n{e}"), parent=self)
+            return False
+        self._set_dirty(False)
+        self.status_var.set(T("✓ Η διάταξη αποθηκεύτηκε.", "✓ The layout was saved."))
+        if self.on_save:
+            self.on_save()
+        return True
+
+    def _close(self):
+        if self.dirty:
+            answer = messagebox.askyesnocancel(
+                T("Επεξεργαστής διάταξης", "Layout editor"),
+                T("Υπάρχουν αλλαγές που δεν έχουν αποθηκευτεί.\n\nΝα αποθηκευτούν;",
+                  "There are changes that are not saved.\n\nSave them?"), parent=self)
+            if answer is None:
+                return
+            if answer and not self.save():
+                return
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+    def _test_pdf(self):
+        title = T("Δοκιμαστικό PDF", "Test PDF")
+        sample, mon = manual_sample_inputs()
+        rows = [(name, 12, 34) for name in sorted(MAPPED_TARGETS)]
+        path = os.path.join(tempfile.gettempdir(), "ELSTAT_manual_layout_test.pdf")
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            process_elstat_report(None, self.template, path, sample, mon, rows_override=rows, save_history=False,
+                                  pdf_mode='manual', manual_layout=self.layout)
+        except PermissionError:
+            messagebox.showerror(title, T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
+                                          "I can't write the PDF. Close it if it is open and try again."), parent=self)
+            return
+        except Exception as e:
+            messagebox.showerror(title, T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"), parent=self)
+            return
+        finally:
+            self.config(cursor='')
+        open_file(path)
+        self.status_var.set(T("Το δοκιμαστικό PDF έχει πλασματικά στοιχεία - μην το υποβάλετε.",
+                              "The test PDF has made-up data - do not submit it."))
+
+
 class ElstatApp(TkBase):
     def __init__(self):
         super().__init__()
@@ -2482,11 +4923,12 @@ class ElstatApp(TkBase):
         self._reminder_dismissed = False
         # settings-tab variables
         self.pv = {k: tk.StringVar(value=self.prefs[k])
-                   for k in ('language', 'theme', 'output_mode', 'output_dir', 'filename_pattern', 'excel_dir')}
+                   for k in ('language', 'theme', 'output_mode', 'output_dir', 'filename_pattern', 'excel_dir', 'pdf_mode')}
         self.pv.update({k: tk.BooleanVar(value=self.prefs[k]) for k in BOOL_PREFS})
         self.data_dir_var = tk.StringVar(value=DATA_DIR)
         self.name_note_var = tk.StringVar()
         self.out_note_var = tk.StringVar()
+        self.layout_note_var = tk.StringVar()
 
     def _build_ui(self):
         self.title(T("ΕΛΣΤΑΤ – Μηνιαίο Δελτίο Κίνησης Καταλύματος",
@@ -2915,9 +5357,88 @@ class ElstatApp(TkBase):
                    "The folder where “Choose Excel…” and “Latest” start. "
                    "Empty = the folder of the last Excel you used."), 1, columnspan=3)
 
+        # ---- 3b. how the PDF is filled in
+        cp = Card(body, None, T("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in"))
+        cp.grid(row=4, column=0, sticky="ew", padx=4, pady=6)
+        polish_settings_card(cp)
+        fp = cp.body
+        fp.columnconfigure(0, weight=1)
+        ttk.Radiobutton(fp, text=T("Πάνω στο template (προεπιλογή)", "On top of the template (default)"),
+                        value='overlay', variable=pv['pdf_mode'], style='Card.TRadiobutton',
+                        command=self._pdf_mode_clicked).grid(row=0, column=0, sticky="w")
+        hint(fp, T("Οι τιμές γράφονται σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
+                   "Values are written at fixed positions on top of the blank PDF. This is how the program has always worked."),
+             1, padx=(24, 0), pady=(2, 0), margin=130)
+        ttk.Radiobutton(fp, text=T("Έξυπνη διάταξη (αναδημιουργία από το template)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
+                                   "Smart layout (rebuilt from the template)  ·  EXPERIMENTAL"),
+                        value='smart', variable=pv['pdf_mode'], style='Card.TRadiobutton',
+                        command=self._pdf_mode_clicked).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        hint(fp, T("Πριν συμπληρωθεί το δελτίο, το πρόγραμμα διαβάζει το template, βρίσκει πού βρίσκεται τώρα κάθε τμήμα του "
+                   "και τοποθετεί κάθε τιμή ακριβώς εκεί που ανήκει. Χρήσιμο αν η ΕΛΣΤΑΤ αλλάξει λίγο το έντυπο "
+                   "(μετατοπισμένες γραμμές, περιθώρια, αποστάσεις). Αν το template δεν αναγνωριστεί με ασφάλεια, "
+                   "χρησιμοποιείται αυτόματα η προεπιλεγμένη μέθοδος και εμφανίζεται προειδοποίηση.",
+                   "Before the form is filled in, the program reads the template, finds where each part of it now sits "
+                   "and places every value exactly where it belongs. Useful if ELSTAT changes the form slightly "
+                   "(shifted lines, margins, spacing). If the template is not recognised safely, the default method "
+                   "is used automatically and a warning is shown."),
+             3, padx=(24, 0), pady=(2, 0), margin=130)
+
+        # everything below is shown only while "Smart layout" is selected
+        self.smart_frame = sm = ttk.Frame(fp, style='Card.TFrame')
+        sm.grid(row=4, column=0, sticky="ew")
+        sm.columnconfigure(0, weight=1)
+        ttk.Separator(sm, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
+        warn = ttk.Label(sm, text=T("⚠ Πειραματική λειτουργία: ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Αν κάτι δεν "
+                                    "πάει καλά, γυρίστε στο «Πάνω στο template».",
+                                    "⚠ Experimental feature: always check the form before submitting it. If anything "
+                                    "looks wrong, switch back to “On top of the template”."),
+                         style='CardWarn.TLabel', justify="left")
+        warn.grid(row=1, column=0, sticky="w")
+        autowrap(warn, body, margin=110)
+        self.layout_note = ttk.Label(sm, textvariable=self.layout_note_var, style='CardHint.TLabel', justify="left")
+        self.layout_note.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        autowrap(self.layout_note, body, margin=110)
+        lrow = ttk.Frame(sm, style='Card.TFrame')
+        lrow.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(lrow, text=T("Έλεγχος template", "Check template"), command=self.layout_check).pack(side="left")
+        ttk.Button(lrow, text=T("Αποθήκευση ως αναφορά…", "Save as reference…"),
+                   command=self.layout_save_reference).pack(side="left", padx=8)
+        ttk.Button(lrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left")
+        hint(sm, T("Το «Δοκιμαστικό δελτίο» φτιάχνει ένα PDF με πλασματικά στοιχεία (μην το υποβάλετε) ώστε να δείτε αν όλα "
+                   "πέφτουν στη θέση τους με τη μέθοδο που έχετε διαλέξει.",
+                   "“Test form” creates a PDF with made-up data (do not submit it) so you can see whether everything "
+                   "lands in place with the method you chose."), 4, pady=(8, 0))
+
+        # ---- set manually (layout editor)
+        ttk.Radiobutton(fp, text=T("Χειροκίνητη τοποθέτηση (επεξεργαστής διάταξης)", "Set manually (layout editor)"),
+                        value='manual', variable=pv['pdf_mode'], style='Card.TRadiobutton',
+                        command=self._pdf_mode_clicked).grid(row=5, column=0, sticky="w", pady=(10, 0))
+        hint(fp, T("Ανοίγει ένας επεξεργαστής όπου βλέπετε το έντυπο και σέρνετε κάθε στοιχείο εκεί που ανήκει. "
+                   "Για κάθε τιμή ορίζετε επίσης γραμματοσειρά, μέγεθος, χρώμα και στοίχιση. "
+                   "Χρήσιμο όταν θέλετε πλήρη έλεγχο ή το έντυπο της ΕΛΣΤΑΤ αλλάξει.",
+                   "Opens an editor where you see the form and drag each item to where it belongs. "
+                   "For every value you also choose the font, size, colour and alignment. "
+                   "Useful when you want full control or the ELSTAT form changes."),
+             6, padx=(24, 0), pady=(2, 0), margin=130)
+        self.manual_note_var = tk.StringVar()
+        self.manual_frame = mf = ttk.Frame(fp, style='Card.TFrame')
+        mf.grid(row=7, column=0, sticky="ew")
+        mf.columnconfigure(0, weight=1)
+        ttk.Separator(mf, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
+        self.manual_note = ttk.Label(mf, textvariable=self.manual_note_var, style='CardHint.TLabel', justify="left")
+        self.manual_note.grid(row=1, column=0, sticky="w")
+        autowrap(self.manual_note, body, margin=110)
+        mrow = ttk.Frame(mf, style='Card.TFrame')
+        mrow.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(mrow, text=T("Άνοιγμα επεξεργαστή διάταξης", "Open layout editor"), style='PrintSm.TButton',
+                   command=self.open_layout_editor).pack(side="left")
+        ttk.Button(mrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left", padx=8)
+        ttk.Button(mrow, text=T("Επαναφορά θέσεων", "Reset positions"), command=self.manual_reset).pack(side="left")
+        self._update_smart_panel()
+
         # ---- 4. behaviour
         c4 = Card(body, None, T("Συμπεριφορά του προγράμματος", "Program behaviour"))
-        c4.grid(row=4, column=0, sticky="ew", padx=4, pady=6)
+        c4.grid(row=5, column=0, sticky="ew", padx=4, pady=6)
         polish_settings_card(c4)
         f4 = c4.body
         f4.columnconfigure(0, weight=1)
@@ -2938,6 +5459,11 @@ class ElstatApp(TkBase):
                                     "Pre-fill “Total employees” with the last value"),
              T("Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
                "Always check the number before creating the form.")),
+            ('preview_before_result', T("Προεπισκόπηση PDF πριν από το παράθυρο «Αποτέλεσμα»",
+                                        "Preview the PDF before the “Result” window"),
+             T("Εμφανίζει το δελτίο μέσα στο πρόγραμμα. Πατήστε «Συνέχεια στο αποτέλεσμα» για να δείτε "
+               "τους ελέγχους και τα σύνολα.",
+               "Shows the form inside the application. Press “Continue to result” to see the checks and totals.")),
         ]
         for r, (key, text, note) in enumerate(behaviours):
             ttk.Checkbutton(f4, text=text, variable=pv[key], style='Card.TCheckbutton',
@@ -2948,12 +5474,245 @@ class ElstatApp(TkBase):
 
         # ---- reset
         bottom = ttk.Frame(body)
-        bottom.grid(row=5, column=0, sticky="ew", padx=4, pady=(6, 16))
+        bottom.grid(row=6, column=0, sticky="ew", padx=4, pady=(6, 16))
         ttk.Button(bottom, text=T("Επαναφορά ρυθμίσεων", "Reset settings"), style='Danger.TButton',
                    command=self.reset_prefs).pack(side="left")
         ttk.Label(bottom, text=T("Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
                                  "Does not delete history or hotel details."),
                   style='Hint.TLabel').pack(side="left", padx=10)
+
+    # ---- manual layout (settings)
+    def _update_manual_panel(self):
+        frame = getattr(self, 'manual_frame', None)
+        if frame is None:
+            return
+        try:
+            if self.prefs.get('pdf_mode') == 'manual':
+                frame.grid()
+            else:
+                frame.grid_remove()
+            if manual_layout_saved():
+                note = T("✓ Υπάρχει αποθηκευμένη δική σας διάταξη. Πατήστε «Άνοιγμα επεξεργαστή διάταξης» για αλλαγές.",
+                         "✓ Your own layout is saved. Press “Open layout editor” to change it.")
+            else:
+                note = T("⚠ Δεν έχετε αποθηκεύσει ακόμη δική σας διάταξη - χρησιμοποιούνται οι προεπιλεγμένες θέσεις. "
+                         "Ανοίξτε τον επεξεργαστή για να τις προσαρμόσετε.",
+                         "⚠ You have not saved your own layout yet - the default positions are used. "
+                         "Open the editor to adjust them.")
+            self.manual_note_var.set(note)
+            self.manual_note.configure(style='CardHint.TLabel' if manual_layout_saved() else 'CardWarn.TLabel')
+        except tk.TclError:
+            pass
+
+    def open_layout_editor(self):
+        title = T("Επεξεργαστής διάταξης", "Layout editor")
+        existing = getattr(self, '_layout_editor', None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                return
+        except tk.TclError:
+            pass
+        template = self._template_or_error(title)
+        if not template:
+            return
+        try:
+            if len(pypdf.PdfReader(template).pages) < 2:
+                raise ValueError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
+        except Exception as e:
+            messagebox.showerror(title, T(f"Δεν μπορώ να διαβάσω το template:\n{e}", f"I could not read the template:\n{e}"))
+            return
+        self._layout_editor = LayoutEditor(self, template, on_save=self._update_manual_panel)
+
+    def manual_reset(self):
+        title = T("Επαναφορά θέσεων", "Reset positions")
+        if not manual_layout_saved():
+            messagebox.showinfo(title, T("Δεν υπάρχει αποθηκευμένη δική σας διάταξη - χρησιμοποιούνται ήδη οι προεπιλεγμένες θέσεις.",
+                                         "There is no saved layout of yours - the default positions are already in use."))
+            return
+        if messagebox.askyesno(title, T("Η αποθηκευμένη διάταξη θα διαγραφεί και θα ξαναχρησιμοποιηθούν οι προεπιλεγμένες θέσεις.\n\nΣυνέχεια;",
+                                        "The saved layout will be deleted and the default positions will be used again.\n\nContinue?"),
+                               default='no'):
+            try:
+                delete_manual_layout()
+            except OSError as e:
+                messagebox.showerror(title, str(e))
+                return
+            self._update_manual_panel()
+            self._status(T("✓ Οι προεπιλεγμένες θέσεις επανήλθαν.", "✓ The default positions are back."))
+
+    # ---- smart layout (settings)
+    def _template_path_now(self):
+        return self.pdf_var.get().strip() or DEFAULT_TEMPLATE
+
+    def _update_smart_panel(self):
+        """Shows the smart-layout options only while that method is selected."""
+        self._update_manual_panel()
+        frame = getattr(self, 'smart_frame', None)
+        if frame is None:
+            return
+        if self.prefs.get('pdf_mode') == 'smart':
+            frame.grid()
+        else:
+            frame.grid_remove()
+        self._update_layout_note()
+
+    def _update_layout_note(self):
+        var = getattr(self, 'layout_note_var', None)
+        if var is None:
+            return
+        ref = load_layout_reference()
+        if ref is None:
+            var.set(T("⚠ Δεν υπάρχει ακόμη σημείο σύγκρισης (διάταξη αναφοράς). Πατήστε «Αποθήκευση ως αναφορά…» όταν το "
+                      "δελτίο συμπληρώνεται σωστά με το τρέχον template.",
+                      "⚠ There is no point of comparison (reference layout) yet. Press “Save as reference…” when the "
+                      "form fills in correctly with the current template."))
+            style = 'CardWarn.TLabel'
+        else:
+            try:
+                when = datetime.datetime.fromisoformat(ref.get('saved', '')).strftime('%d/%m/%Y')
+            except ValueError:
+                when = "-"
+            name = ref.get('template', '')
+            var.set(T(f"✓ Διάταξη αναφοράς: {name} (αποθηκεύτηκε {when}).", f"✓ Reference layout: {name} (saved {when})."))
+            style = 'CardGood.TLabel'
+        try:
+            self.layout_note.configure(style=style)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _template_or_error(self, title):
+        template = self._template_path_now()
+        if not os.path.isfile(template):
+            messagebox.showerror(title, T("Το άδειο PDF (template) δεν βρέθηκε - δείτε την καρτέλα «Στοιχεία ξενοδοχείου».",
+                                          "The blank PDF (template) was not found - see the “Hotel details” tab."))
+            return None
+        return template
+
+    def _pdf_mode_clicked(self):
+        """A radio button of the PDF method was clicked."""
+        if self.pv['pdf_mode'].get() == 'manual':
+            # Selecting manual mode only reveals its controls; the editor opens
+            # only when the user presses the dedicated button.
+            self._pref_changed()
+            return
+        if self.pv['pdf_mode'].get() == 'smart' and not self.prefs.get('smart_ack'):
+            if not messagebox.askyesno(
+                    T("Πειραματική λειτουργία", "Experimental feature"),
+                    T("Η «Έξυπνη διάταξη» είναι πειραματική.\n\n"
+                      "Προσπαθεί να βρει μόνη της πού πρέπει να γραφτεί κάθε τιμή αν το έντυπο της ΕΛΣΤΑΤ αλλάξει λίγο. "
+                      "Μπορεί να κάνει λάθος, γι' αυτό ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η προεπιλεγμένη "
+                      "μέθοδος παραμένει διαθέσιμη ανά πάσα στιγμή.\n\nΝα ενεργοποιηθεί;",
+                      "“Smart layout” is experimental.\n\n"
+                      "It tries to work out by itself where each value should be written if the ELSTAT form changes "
+                      "slightly. It can get things wrong, so always check the form before submitting it. The default "
+                      "method stays available at any time.\n\nTurn it on?"), default='no'):
+                self.pv['pdf_mode'].set('overlay')
+                self._pref_changed()
+                return
+            self.prefs['smart_ack'] = True
+        self._pref_changed()
+        if self.prefs['pdf_mode'] == 'smart' and load_layout_reference() is None:
+            self._offer_reference(T("Έξυπνη διάταξη", "Smart layout"))
+
+    def _save_reference(self, template, title):
+        try:
+            save_layout_reference(template)
+        except PermissionError:
+            messagebox.showerror(title, T("Δεν μπορώ να γράψω στον φάκελο δεδομένων. Ελέγξτε ότι δεν είναι μόνο για ανάγνωση.",
+                                          "I can't write to the data folder. Check that it is not read-only."))
+            return False
+        except Exception as e:
+            messagebox.showerror(title, T(f"Δεν ήταν δυνατή η αποθήκευση:\n{e}", f"Could not save:\n{e}"))
+            return False
+        self._update_layout_note()
+        self._status(T("✓ Το template αποθηκεύτηκε ως διάταξη αναφοράς.", "✓ The template was saved as the reference layout."))
+        return True
+
+    def _offer_reference(self, title):
+        """There is no reference layout yet: explain and offer to save the current template as one."""
+        template = self._template_or_error(title)
+        if not template:
+            return False
+        if messagebox.askyesno(
+                title,
+                T("Η έξυπνη διάταξη χρειάζεται ένα σημείο σύγκρισης: το template όπως είναι όταν το δελτίο "
+                  "συμπληρώνεται σωστά.\n\nΝα αποθηκευτεί το τρέχον template ως σημείο σύγκρισης;\n"
+                  "(Πατήστε «Ναι» μόνο αν με την προεπιλεγμένη μέθοδο το δελτίο βγαίνει σωστό.)",
+                  "Smart layout needs a point of comparison: the template as it is when the form fills in "
+                  "correctly.\n\nSave the current template as the point of comparison?\n"
+                  "(Press “Yes” only if the form comes out right with the default method.)"), default='no'):
+            return self._save_reference(template, title)
+        return False
+
+    def layout_check(self):
+        title = T("Έλεγχος template", "Check template")
+        template = self._template_or_error(title)
+        if not template:
+            return
+        if load_layout_reference() is None:
+            self._offer_reference(title)
+            return
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            _layout, report = analyze_template(template)
+        except Exception as e:
+            messagebox.showerror(title, T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
+            return
+        finally:
+            self.config(cursor='')
+        (messagebox.showinfo if report['ok'] else messagebox.showwarning)(title, describe_report(report))
+
+    def layout_save_reference(self):
+        title = T("Αποθήκευση ως αναφορά", "Save as reference")
+        template = self._template_or_error(title)
+        if not template:
+            return
+        if not messagebox.askyesno(
+                title,
+                T("Να χρησιμοποιηθεί το τρέχον template ως διάταξη αναφοράς;\n\n"
+                  "Κάντε το μόνο αν το δελτίο συμπληρώνεται σωστά με την προεπιλεγμένη μέθοδο πάνω σε αυτό το template. "
+                  "Η έξυπνη διάταξη θα μετράει τις αλλαγές των επόμενων templates σε σχέση με αυτό.",
+                  "Use the current template as the reference layout?\n\n"
+                  "Only do this if the form is filled in correctly with the default method on this template. "
+                  "Smart layout will measure the changes of later templates against it."), default='no'):
+            return
+        self._save_reference(template, title)
+
+    def layout_test_form(self):
+        title = T("Δοκιμαστικό δελτίο", "Test form")
+        template = self._template_or_error(title)
+        if not template:
+            return
+        if self.pv['pdf_mode'].get() == 'smart' and load_layout_reference() is None:
+            if not self._offer_reference(title):
+                return
+        sample = {'type': 'TEST', 'name': 'TEST HOTEL', 'category': '5*', 'email': 'test@example.com',
+                  'phone': '2310000000', 'afm': '123456789', 'company': 'TEST COMPANY'}
+        today = datetime.date.today()
+        last = calendar.monthrange(today.year, today.month)[1]
+        mon = dict(year=str(today.year), month=str(today.month), date_to=f"{last:02d}/{today.month:02d}/{today.year}",
+                   days_of_month=str(last), employees='25', sign_date=today.strftime('%d/%m/%Y'))
+        rows = [(name, 11, 22) for name in sorted(MAPPED_TARGETS)]
+        path = os.path.join(tempfile.gettempdir(), "ELSTAT_test_form.pdf")
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            result = process_elstat_report(None, template, path, sample, mon, rows_override=rows,
+                                           save_history=False, pdf_mode=self.pv['pdf_mode'].get())
+        except PermissionError:
+            messagebox.showerror(title, T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
+                                          "I can't write the PDF. Close it if it is open and try again."))
+            return
+        except Exception as e:
+            messagebox.showerror(title, T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
+            return
+        finally:
+            self.config(cursor='')
+        if result.get('layout_warning'):
+            messagebox.showwarning(title, result['layout_warning'])
+        open_file(path)
 
     # ---- settings: reading / saving
     def _save_prefs(self):
@@ -2968,6 +5727,7 @@ class ElstatApp(TkBase):
         p['output_mode'] = pv['output_mode'].get()
         p['output_dir'] = pv['output_dir'].get().strip()
         p['excel_dir'] = pv['excel_dir'].get().strip()
+        p['pdf_mode'] = pv['pdf_mode'].get()
         pattern = pv['filename_pattern'].get().strip()
         if pattern_error(pattern) is None:
             p['filename_pattern'] = pattern
@@ -3000,6 +5760,116 @@ class ElstatApp(TkBase):
             self.guide.show(section)
         self.guide.refresh_back()
 
+    def help_context(self):
+        """Live values for the [[name]] placeholders of the guide."""
+        hist = self._hist or {}
+        last = max(((y, m) for y, ms in hist.items() for m in ms), default=None)
+        modes = {'overlay': T("Πάνω στο template", "On top of the template"),
+                 'smart': T("Έξυπνη διάταξη (πειραματική)", "Smart layout (experimental)"),
+                 'manual': T("Χειροκίνητη τοποθέτηση", "Set manually")}
+        themes = {'light': T("Φωτεινή", "Light"), 'dark': T("Σκούρα", "Dark"), 'auto': T("Όπως το σύστημα", "Match system")}
+        return dict(
+            data_dir=DATA_DIR,
+            next_pdf=self.out_var.get().strip() or self._suggest_output(),
+            pdf_mode_name=modes.get(self.prefs.get('pdf_mode'), ''),
+            language_name=LANGUAGES.get(LANG, LANG),
+            theme_name=themes.get(self.prefs.get('theme'), ''),
+            months_count=sum(len(ms) for ms in hist.values()),
+            last_month=f"{month_name(last[1])} {last[0]}" if last else T("κανένας ακόμη", "none yet"),
+            custom_count=len(CUSTOM_COUNTRY_MAPPING),
+            template_name=os.path.basename(self._template_path_now()),
+        )
+
+    def _unknown_country_count(self):
+        """How many countries of the loaded Excel are not known to the program."""
+        excel = self.excel_var.get().strip()
+        if not (excel and os.path.isfile(excel)):
+            return 0
+        try:
+            return sum('bad' in self.preview_tree.item(i, 'tags') for i in self.preview_tree.get_children())
+        except tk.TclError:
+            return 0
+
+    def help_status(self):
+        """[(state, label, detail, target)] - what the 'Live status' page of the guide shows."""
+        s = {k: v.get().strip() for k, v in self.set_vars.items()}
+        hist = self._hist or {}
+        out = []
+        errs = validate_hotel(s)
+        out.append(('bad' if errs else 'ok', T("Στοιχεία ξενοδοχείου", "Hotel details"),
+                    T(f"{len(errs)} πεδία θέλουν διόρθωση", f"{len(errs)} field(s) need fixing") if errs
+                    else T("συμπληρωμένα", "complete"), 'tab:hotel'))
+        tpl = self._template_path_now()
+        tpl_ok = os.path.isfile(tpl)
+        out.append(('ok' if tpl_ok else 'bad', T("Άδειο PDF (template)", "Blank PDF (template)"),
+                    os.path.basename(tpl) if tpl_ok else T("δεν βρέθηκε", "not found"), 'tab:hotel'))
+        months = sum(len(ms) for ms in hist.values())
+        out.append(('ok' if months else 'warn', T("Ιστορικό", "History"),
+                    T(f"{months} μήνες καταχωρημένοι", f"{months} months recorded") if months
+                    else T("κανένας μήνας ακόμη", "no month yet"), 'tab:history'))
+        rem = missing_month_reminder(hist)
+        if rem:
+            out.append(('warn', T("Εκκρεμές δελτίο", "Pending form"),
+                        T(f"λείπει ο {month_name(rem[1])} {rem[0]}", f"{month_name(rem[1])} {rem[0]} is missing"), 'tab:report'))
+        excel = self.excel_var.get().strip()
+        excel_ok = bool(excel) and os.path.isfile(excel)
+        out.append(('ok' if excel_ok else 'warn', T("Excel του μήνα", "Month's Excel"),
+                    os.path.basename(excel) if excel_ok else T("δεν έχει επιλεγεί ακόμη", "not chosen yet"), 'tab:report'))
+        bad = self._unknown_country_count()
+        if bad:
+            out.append(('bad', T("Άγνωστες χώρες", "Unknown countries"),
+                        T(f"{bad} δεν θα μπουν στο PDF", f"{bad} will not be in the PDF"), 'sec:countries'))
+        mode = self.prefs.get('pdf_mode')
+        if mode == 'manual':
+            saved = manual_layout_saved()
+            out.append(('ok' if saved else 'warn', T("Χειροκίνητη διάταξη", "Manual layout"),
+                        T("αποθηκευμένη", "saved") if saved
+                        else T("δεν έχει αποθηκευτεί - ισχύουν οι προεπιλεγμένες θέσεις", "not saved - default positions apply"),
+                        'sec:editor'))
+        elif mode == 'smart':
+            ref = load_layout_reference() is not None
+            out.append(('ok' if ref else 'warn', T("Έξυπνη διάταξη", "Smart layout"),
+                        T("υπάρχει διάταξη αναφοράς", "reference layout exists") if ref
+                        else T("λείπει η διάταξη αναφοράς", "no reference layout yet"), 'tab:settings'))
+        out.append(('ok' if DND_AVAILABLE else 'warn', 'Drag & drop',
+                    T("ενεργό", "active") if DND_AVAILABLE else T("μη διαθέσιμο (pip install tkinterdnd2)", "not available (pip install tkinterdnd2)"),
+                    'sec:dnd'))
+        return out
+
+    def help_next(self):
+        """(text, target) - the one thing the person most likely wants to do next."""
+        s = {k: v.get().strip() for k, v in self.set_vars.items()}
+        if validate_hotel(s):
+            return T("Συμπληρώστε τα στοιχεία του ξενοδοχείου", "Fill in the hotel details"), 'tab:hotel'
+        if not os.path.isfile(self._template_path_now()):
+            return T("Βρείτε το άδειο PDF (template)", "Find the blank PDF (template)"), 'tab:hotel'
+        excel = self.excel_var.get().strip()
+        if not (excel and os.path.isfile(excel)):
+            rem = missing_month_reminder(self._hist or {})
+            if rem:
+                return (T(f"Φτιάξτε το δελτίο {month_name(rem[1])} {rem[0]}: διαλέξτε το Excel του",
+                          f"Make the form for {month_name(rem[1])} {rem[0]}: choose its Excel"), 'tab:report')
+            return T("Διαλέξτε το Excel του μήνα", "Choose the month's Excel"), 'tab:report'
+        if self._unknown_country_count():
+            return T("Αντιστοιχίστε τις άγνωστες χώρες", "Map the unknown countries"), 'sec:countries'
+        if not self.mon_vars['employees'].get().strip():
+            return T("Πληκτρολογήστε το σύνολο εργαζομένων", "Type the total employees"), 'tab:report'
+        return T("Όλα έτοιμα - δημιουργήστε το PDF", "Everything is ready - create the PDF"), 'tab:report'
+
+    def help_action(self, key):
+        if key == 'open_data':
+            open_file(DATA_DIR)
+        elif key == 'choose_excel':
+            self.goto_tab('report')
+            self.browse_excel()
+        elif key == 'open_editor':
+            self.goto_tab('settings')
+            self.open_layout_editor()
+        elif key == 'backup':
+            self.backup_data()
+        elif key == 'theme':
+            self._toggle_theme()
+
     def _help_find(self, _event=None):
         """Ctrl+F: jump to the search box of the guide when the guide is open."""
         try:
@@ -3020,6 +5890,7 @@ class ElstatApp(TkBase):
             if self._last_tab and self._last_tab != cur:
                 self._help_prev = self._last_tab
             self.guide.refresh_back()
+            self.guide.refresh_live()
         else:
             self._last_tab = cur
 
@@ -3113,6 +5984,7 @@ class ElstatApp(TkBase):
                                 "In Step 3 of the form the suggestion is: ") + self._suggest_output() +
                               T("  (μπορείτε πάντα να το αλλάξετε εκεί)", "  (you can always change it there)"))
         self.update_reminder()
+        self._update_smart_panel()
 
     def _update_name_note(self, *_):
         if self._rebuilding:
@@ -4274,7 +7146,8 @@ class ElstatApp(TkBase):
         self.config(cursor='watch')
         self.update_idletasks()
         try:
-            process_elstat_report(None, template, path, s, mon, rows_override=rows, save_history=False)
+            process_elstat_report(None, template, path, s, mon, rows_override=rows, save_history=False,
+                                  pdf_mode=self.prefs.get('pdf_mode', 'overlay'))
             save_month_record(year, month, employees, mon['days_of_month'], mon['date_to'])
         except PermissionError:
             messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
@@ -4438,7 +7311,7 @@ class ElstatApp(TkBase):
         self._set_busy(True)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-            result = process_elstat_report(excel, template, out, s, m)
+            result = process_elstat_report(excel, template, out, s, m, pdf_mode=self.prefs.get('pdf_mode', 'overlay'))
         except PermissionError:
             messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε άλλο "
                                              "πρόγραμμα και δοκιμάστε ξανά.",
@@ -4462,13 +7335,17 @@ class ElstatApp(TkBase):
                                   f"The PDF grand total {result['computed_total']} differs from the Excel "
                                   f"total {result['excel_total']}. Check it before submitting!"))
 
+        if result.get('layout_warning'):
+            warnings_txt.append(result['layout_warning'])
+
+        extra = ("  ·  " + result['layout_info']) if result.get('layout_info') else ""
         try:
             gy, gm = int(m['year']), int(m['month'])
             if self.prefs['keep_archive']:
                 archive_copy(gy, gm, out)
             save_month_record(gy, gm, m['employees'], m['days_of_month'], m['date_to'])
             self._status(T(f"✓ Το δελτίο {month_name(gm)} {gy} δημιουργήθηκε και αρχειοθετήθηκε.",
-                           f"✓ The form for {month_name(gm)} {gy} was created and archived."))
+                           f"✓ The form for {month_name(gm)} {gy} was created and archived.") + extra)
         except Exception:
             pass
         self.refresh_history()
@@ -4483,7 +7360,11 @@ class ElstatApp(TkBase):
                 print_status = print_file(out)
         if self.prefs['open_after'] and not print_after:
             open_file(out)
-        ResultDialog(self, result, out, warnings_txt, print_status)
+        show_result = lambda: ResultDialog(self, result, out, warnings_txt, print_status)
+        if self.prefs.get('preview_before_result', False):
+            PDFPreviewDialog(self, out, show_result)
+        else:
+            show_result()
 
 
 if __name__ == "__main__":
