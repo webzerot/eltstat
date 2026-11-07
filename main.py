@@ -6,6 +6,7 @@ import warnings
 import datetime
 import calendar
 import unicodedata
+import re
 import subprocess
 import shutil
 import math
@@ -18,7 +19,112 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# Optional native file drag-and-drop support. Install with: pip install tkinterdnd2
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except Exception as _dnd_err:          # ImportError, or the tkdnd binaries failing to load
+    DND_FILES = None
+    TkinterDnD = None
+    DND_AVAILABLE = False
+    DND_ERROR = repr(_dnd_err)
+else:
+    DND_ERROR = ""
+
+TkBase = TkinterDnD.Tk if DND_AVAILABLE else tk.Tk
+
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+
+# ---------------------------------------------------------------- language
+# The interface is Greek by default; English can be chosen in the "Settings" tab.
+# Every text the user sees is written as T("greek", "english") and is looked up at the moment
+# it is needed, so switching language only requires building the screen again.
+LANGUAGES = {'el': "Ελληνικά", 'en': "English"}
+LANG = 'el'
+
+
+def set_language(code):
+    global LANG
+    LANG = code if code in LANGUAGES else 'el'
+
+
+def T(el, en):
+    """The text in the current language."""
+    return en if LANG == 'en' else el
+
+
+def install_edit_shortcuts(root):
+    """Add familiar clipboard shortcuts and a right-click menu to text inputs."""
+    def editable_widget(widget):
+        return isinstance(widget, (tk.Entry, ttk.Entry, tk.Text))
+
+    def is_readonly(widget):
+        try:
+            return str(widget.cget('state')) in ('disabled', 'readonly')
+        except (tk.TclError, TypeError):
+            return False
+
+    def select_all(widget):
+        if isinstance(widget, tk.Text):
+            widget.tag_add('sel', '1.0', 'end-1c')
+            widget.mark_set('insert', 'end-1c')
+            widget.see('insert')
+        else:
+            widget.selection_range(0, 'end')
+            widget.icursor('end')
+        return 'break'
+
+    def clipboard_action(widget, virtual_event):
+        if not editable_widget(widget):
+            return None
+        if virtual_event in ('<<Paste>>', '<<Cut>>') and is_readonly(widget):
+            return 'break'
+        try:
+            widget.event_generate(virtual_event)
+        except tk.TclError:
+            pass
+        return 'break'
+
+    def on_shortcut(event, action):
+        widget = event.widget
+        if not editable_widget(widget):
+            return None
+        if action == 'select_all':
+            return select_all(widget)
+        return clipboard_action(widget, {'copy': '<<Copy>>', 'cut': '<<Cut>>', 'paste': '<<Paste>>'}[action])
+
+    def popup(event):
+        widget = event.widget
+        if not editable_widget(widget):
+            return None
+        menu = tk.Menu(root, tearoff=False)
+        try:
+            has_selection = bool(widget.tag_ranges('sel')) if isinstance(widget, tk.Text) else bool(widget.selection_present())
+        except tk.TclError:
+            has_selection = False
+        menu.add_command(label=T('Αντιγραφή', 'Copy'), command=lambda: clipboard_action(widget, '<<Copy>>'),
+                         state='normal' if has_selection else 'disabled')
+        menu.add_command(label=T('Αποκοπή', 'Cut'), command=lambda: clipboard_action(widget, '<<Cut>>'),
+                         state='normal' if has_selection and not is_readonly(widget) else 'disabled')
+        menu.add_command(label=T('Επικόλληση', 'Paste'), command=lambda: clipboard_action(widget, '<<Paste>>'),
+                         state='normal' if not is_readonly(widget) else 'disabled')
+        menu.add_separator()
+        menu.add_command(label=T('Επιλογή όλων', 'Select all'), command=lambda: select_all(widget))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    for sequence, action in (('<Control-c>', 'copy'), ('<Control-C>', 'copy'),
+                             ('<Control-x>', 'cut'), ('<Control-X>', 'cut'),
+                             ('<Control-v>', 'paste'), ('<Control-V>', 'paste'),
+                             ('<Control-a>', 'select_all'), ('<Control-A>', 'select_all')):
+        root.bind_all(sequence, lambda event, a=action: on_shortcut(event, a), add='+')
+    root.bind_all('<Button-3>', popup, add='+')
+    # Some Linux desktop environments use the middle button for the context menu.
+    root.bind_all('<Button-2>', popup, add='+')
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,20 +135,21 @@ CONFIG_FILE = os.path.join(BASE_DIR, "elstat_config.json")
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "ELSTAT_Data")
 DEFAULT_TEMPLATE = os.path.join(BASE_DIR, "template_elstat_report.pdf")
 ARCHIVE_NAME = "ELSTAT_Archive"
-DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json")
+DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json", "elstat_country_mappings.json")
 
-DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = ""
+DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = COUNTRY_MAPPINGS_FILE = ""
 
 
 def set_data_dir(path):
     """Points every data path of the program at `path`."""
-    global DATA_DIR, SETTINGS_CSV, HISTORY_CSV, MONTHS_CSV, PREFS_JSON, ARCHIVE_DIR
+    global DATA_DIR, SETTINGS_CSV, HISTORY_CSV, MONTHS_CSV, PREFS_JSON, ARCHIVE_DIR, COUNTRY_MAPPINGS_FILE
     DATA_DIR = os.path.abspath(path)
     SETTINGS_CSV = os.path.join(DATA_DIR, "hotel_settings.csv")
     HISTORY_CSV = os.path.join(DATA_DIR, "elstat_history.csv")
     MONTHS_CSV = os.path.join(DATA_DIR, "elstat_months.csv")
     PREFS_JSON = os.path.join(DATA_DIR, "elstat_preferences.json")
     ARCHIVE_DIR = os.path.join(DATA_DIR, ARCHIVE_NAME)
+    COUNTRY_MAPPINGS_FILE = os.path.join(DATA_DIR, "elstat_country_mappings.json")
 
 
 set_data_dir(DEFAULT_DATA_DIR)
@@ -107,8 +214,11 @@ def init_storage():
         os.makedirs(path, exist_ok=True)
     except OSError:
         if wanted:
-            notices.append(f"Ο φάκελος δεδομένων\n{wanted}\nδεν είναι διαθέσιμος αυτή τη στιγμή (π.χ. "
-                           "αποσυνδεδεμένος δίσκος). Χρησιμοποιείται προσωρινά ο προεπιλεγμένος φάκελος.")
+            notices.append((
+                f"Ο φάκελος δεδομένων\n{wanted}\nδεν είναι διαθέσιμος αυτή τη στιγμή (π.χ. "
+                "αποσυνδεδεμένος δίσκος). Χρησιμοποιείται προσωρινά ο προεπιλεγμένος φάκελος.",
+                f"The data folder\n{wanted}\nis not available right now (e.g. a disconnected "
+                "drive). The default folder is being used temporarily."))
         path = DEFAULT_DATA_DIR
         try:
             os.makedirs(path, exist_ok=True)
@@ -119,10 +229,15 @@ def init_storage():
     if _same_path(path, DEFAULT_DATA_DIR) and not data_exists(path) and data_exists(BASE_DIR):
         try:
             copy_data_files(BASE_DIR, path)
-            notices.append("Τα δεδομένα του προγράμματος (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) "
-                           f"αντιγράφηκαν στον φάκελο:\n{path}\n\nΤα παλιά αρχεία έμειναν στη θέση τους ως "
-                           "αντίγραφο ασφαλείας - μπορείτε να τα σβήσετε όταν βεβαιωθείτε ότι όλα λειτουργούν.\n"
-                           "Τον φάκελο δεδομένων τον αλλάζετε από την καρτέλα «Ρυθμίσεις».")
+            notices.append((
+                "Τα δεδομένα του προγράμματος (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) "
+                f"αντιγράφηκαν στον φάκελο:\n{path}\n\nΤα παλιά αρχεία έμειναν στη θέση τους ως "
+                "αντίγραφο ασφαλείας - μπορείτε να τα σβήσετε όταν βεβαιωθείτε ότι όλα λειτουργούν.\n"
+                "Τον φάκελο δεδομένων τον αλλάζετε από την καρτέλα «Ρυθμίσεις».",
+                "The program's data (hotel details, history, PDF archive) "
+                f"was copied to the folder:\n{path}\n\nThe old files were left where they were as a "
+                "backup - you can delete them once you are sure everything works.\n"
+                "You can change the data folder in the “Settings” tab."))
         except Exception:
             pass
     return notices
@@ -131,6 +246,8 @@ def init_storage():
 # ------------------------------------------------------------- preferences
 BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees')
 DEFAULT_PREFS = {
+    'language': 'el',                          # 'el' | 'en'  (interface language)
+    'theme': 'light',                          # 'light' | 'dark' | 'auto'  (follow the system)
     'output_mode': 'program',                  # 'program' | 'excel' | 'custom'
     'output_dir': '',                          # used when output_mode == 'custom'
     'filename_pattern': 'ELSTAT_{year}_{month}',
@@ -147,14 +264,17 @@ DEFAULT_PREFS = {
 def pattern_error(pattern):
     """None if the file-name pattern is fine, else a Greek explanation."""
     if not pattern.strip():
-        return "Το όνομα δεν μπορεί να είναι κενό."
+        return T("Το όνομα δεν μπορεί να είναι κενό.", "The name cannot be empty.")
     try:
         pattern.format(year=2026, month="01")
     except Exception:
-        return "Μη έγκυρο όνομα. Χρησιμοποιήστε μόνο τα {year} και {month} μέσα σε άγκιστρα."
+        return T("Μη έγκυρο όνομα. Χρησιμοποιήστε μόνο τα {year} και {month} μέσα σε άγκιστρα.",
+                 "Invalid name. Use only {year} and {month} inside curly braces.")
     if '{year}' not in pattern or '{month}' not in pattern:
-        return ("Πρέπει να περιέχει και το {year} και το {month}, αλλιώς κάθε μήνας θα γράφει "
-                "πάνω στον προηγούμενο.")
+        return (T("Πρέπει να περιέχει και το {year} και το {month}, αλλιώς κάθε μήνας θα γράφει "
+                  "πάνω στον προηγούμενο.",
+                  "It must contain both {year} and {month}, otherwise each month will "
+                  "overwrite the previous one."))
     return None
 
 
@@ -184,6 +304,10 @@ def load_prefs():
         pass
     if prefs['output_mode'] not in ('program', 'excel', 'custom'):
         prefs['output_mode'] = 'program'
+    if prefs['language'] not in LANGUAGES:
+        prefs['language'] = DEFAULT_PREFS['language']
+    if prefs['theme'] not in ('light', 'dark', 'auto'):
+        prefs['theme'] = DEFAULT_PREFS['theme']
     if pattern_error(prefs['filename_pattern']):
         prefs['filename_pattern'] = DEFAULT_PREFS['filename_pattern']
     return prefs
@@ -306,11 +430,14 @@ def print_file(path):
                 raise OSError("no print command")
             subprocess.run([cmd, path], check=True, timeout=30,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True, "✓ Το δελτίο στάλθηκε στον προεπιλεγμένο εκτυπωτή."
+        return True, T("✓ Το δελτίο στάλθηκε στον προεπιλεγμένο εκτυπωτή.",
+                       "✓ The form was sent to the default printer.")
     except Exception:
         open_file(path)
-        return False, ("Δεν ήταν δυνατή η αυτόματη εκτύπωση. Άνοιξα το PDF - πατήστε Ctrl+P "
-                       "μέσα στο πρόγραμμα του PDF για να το εκτυπώσετε.")
+        return False, (T("Δεν ήταν δυνατή η αυτόματη εκτύπωση. Άνοιξα το PDF - πατήστε Ctrl+P "
+                         "μέσα στο πρόγραμμα του PDF για να το εκτυπώσετε.",
+                         "Automatic printing was not possible. I opened the PDF - press Ctrl+P "
+                         "in the PDF program to print it."))
 
 def validate_afm(afm):
     """AFM must be exactly 9 digits (0-9)."""
@@ -320,11 +447,13 @@ def validate_afm(afm):
 def validate_hotel(settings):
     errors = []
     if not validate_afm(settings.get('afm', '')):
-        errors.append("Το Α.Φ.Μ. πρέπει να έχει ακριβώς 9 ψηφία (μόνο αριθμοί).")
-    for key, label in [('type', 'Είδος Καταλύματος'), ('name', 'Τίτλος Καταλύματος'),
-                       ('category', 'Κατηγορία'), ('company', 'Επωνυμία Επιχείρησης')]:
+        errors.append(T("Το Α.Φ.Μ. πρέπει να έχει ακριβώς 9 ψηφία (μόνο αριθμοί).",
+                        "The Tax ID (AFM) must have exactly 9 digits (numbers only)."))
+    for key, label in [('type', T('Είδος Καταλύματος', 'Property type')), ('name', T('Τίτλος Καταλύματος', 'Property name')),
+                       ('category', T('Κατηγορία', 'Category')), ('company', T('Επωνυμία Επιχείρησης', 'Business name'))]:
         if not settings.get(key, '').strip():
-            errors.append(f"Συμπληρώστε το πεδίο «{label}» (στην καρτέλα «Στοιχεία ξενοδοχείου»).")
+            errors.append(T(f"Συμπληρώστε το πεδίο «{label}» (στην καρτέλα «Στοιχεία ξενοδοχείου»).",
+                            f"Fill in the “{label}” field (in the “Hotel details” tab)."))
     return errors
 
 def validate_month(monthly):
@@ -333,38 +462,53 @@ def validate_month(monthly):
     y_ok = year.isascii() and year.isdigit() and len(year) == 4
     m_ok = month.isascii() and month.isdigit() and 1 <= int(month) <= 12
     if not y_ok:
-        errors.append("Το Έτος πρέπει να έχει 4 ψηφία (π.χ. 2026).")
+        errors.append(T("Το Έτος πρέπει να έχει 4 ψηφία (π.χ. 2026).",
+                        "The Year must have 4 digits (e.g. 2026)."))
     if not m_ok:
-        errors.append("Ο Μήνας πρέπει να είναι αριθμός από 1 έως 12.")
+        errors.append(T("Ο Μήνας πρέπει να είναι αριθμός από 1 έως 12.",
+                        "The Month must be a number from 1 to 12."))
 
     try:
         d_to = datetime.datetime.strptime(monthly.get('date_to', ''), "%d/%m/%Y")
         if y_ok and m_ok and (d_to.year != int(year) or d_to.month != int(month)):
-            errors.append("Η ημερομηνία «Έως» δεν ταιριάζει με το Έτος/Μήνα.")
+            errors.append(T("Η ημερομηνία «Έως» δεν ταιριάζει με το Έτος/Μήνα.",
+                            "The “To” date does not match the Year/Month."))
     except ValueError:
-        errors.append("Η ημερομηνία «Έως» πρέπει να είναι της μορφής ΗΗ/ΜΜ/ΕΕΕΕ και υπαρκτή.")
+        errors.append(T("Η ημερομηνία «Έως» πρέπει να είναι της μορφής ΗΗ/ΜΜ/ΕΕΕΕ και υπαρκτή.",
+                        "The “To” date must be in the format DD/MM/YYYY and must exist."))
 
     days = monthly.get('days_of_month', '')
     if not (days.isascii() and days.isdigit() and 1 <= int(days) <= 31):
-        errors.append("Οι Ημέρες Λειτουργίας πρέπει να είναι αριθμός από 1 έως 31.")
+        errors.append(T("Οι Ημέρες Λειτουργίας πρέπει να είναι αριθμός από 1 έως 31.",
+                        "Operating days must be a number from 1 to 31."))
     elif y_ok and m_ok and int(days) > calendar.monthrange(int(year), int(month))[1]:
-        errors.append("Οι Ημέρες Λειτουργίας είναι περισσότερες από τις ημέρες του μήνα.")
+        errors.append(T("Οι Ημέρες Λειτουργίας είναι περισσότερες από τις ημέρες του μήνα.",
+                        "Operating days exceed the number of days in the month."))
+
+    if 'sign_date' in monthly:
+        try:
+            datetime.datetime.strptime(monthly['sign_date'], "%d/%m/%Y")
+        except ValueError:
+            errors.append(T("Η ημερομηνία υπογραφής πρέπει να είναι της μορφής ΗΗ/ΜΜ/ΕΕΕΕ και υπαρκτή.",
+                            "The signing date must be in the format DD/MM/YYYY and must exist."))
 
     emp = monthly.get('employees', '')
     if not emp:
-        errors.append("Πληκτρολογήστε το Σύνολο Εργαζομένων (δεν υπάρχει στο Excel).")
+        errors.append(T("Πληκτρολογήστε το Σύνολο Εργαζομένων (δεν υπάρχει στο Excel).",
+                        "Enter the Total employees (it is not in the Excel)."))
     elif not (emp.isascii() and emp.isdigit() and len(emp) <= 3):
-        errors.append("Το Σύνολο Εργαζομένων πρέπει να είναι αριθμός (0-999).")
+        errors.append(T("Το Σύνολο Εργαζομένων πρέπει να είναι αριθμός (0-999).",
+                        "Total employees must be a number (0-999)."))
     return errors
 
 def validate_inputs(settings, monthly, excel, template, out):
     errors = validate_hotel(settings) + validate_month(monthly)
     if not excel or not os.path.isfile(excel):
-        errors.append("Επιλέξτε υπαρκτό αρχείο Excel.")
+        errors.append(T("Επιλέξτε υπαρκτό αρχείο Excel.", "Choose an existing Excel file."))
     if not template or not os.path.isfile(template):
-        errors.append("Το άδειο PDF (template) δεν βρέθηκε.")
+        errors.append(T("Το άδειο PDF (template) δεν βρέθηκε.", "The blank PDF (template) was not found."))
     if not out:
-        errors.append("Επιλέξτε πού θα αποθηκευτεί το PDF.")
+        errors.append(T("Επιλέξτε πού θα αποθηκευτεί το PDF.", "Choose where the PDF will be saved."))
     return errors
 
 COUNTRY_MAPPING = {
@@ -405,6 +549,57 @@ COUNTRY_MAPPING.update({
     'SOUTH AFRICA': 'ΝΟΤΙΑ ΑΦΡΙΚΗ',
 })
 COUNTRY_MAPPING_NORM = {norm(k): norm(v) for k, v in COUNTRY_MAPPING.items()}
+
+# User-added mappings are stored in the data folder and survive program updates.
+CUSTOM_COUNTRY_MAPPING = {}
+CUSTOM_COUNTRY_MAPPING_NORM = {}
+COUNTRY_EXTRA_DESTINATIONS = (
+    'ΛΟΙΠΕΣ ΧΩΡΕΣ ΕΥΡΩΠΗΣ', 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΜΕΡΙΚΗΣ',
+    'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΣΙΑΣ', 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΦΡΙΚΗΣ',
+    'ΝΕΑ ΖΗΛΑΝΔΙΑ ΚΑΙ ΛΟΙΠΕΣ ΠΕΡΙΟΧΕΣ', 'Δεν δήλωσαν χώρα'
+)
+
+def country_mapping_destinations():
+    """All valid destinations on the ELSTAT form, including regional 'other' rows."""
+    values = (set(COUNTRY_MAPPING.values()) | set(COUNTRY_EXTRA_DESTINATIONS)) - {'Δεν δήλωσαν χώρα'}
+    return sorted(values, key=lambda value: norm(value))
+
+def load_custom_country_mappings():
+    global CUSTOM_COUNTRY_MAPPING, CUSTOM_COUNTRY_MAPPING_NORM
+    try:
+        with open(COUNTRY_MAPPINGS_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError, TypeError):
+        data = {}
+    allowed = {norm(v) for v in country_mapping_destinations()}
+    clean = {}
+    for country, destination in data.items():
+        key, value = norm(str(country)), norm(str(destination))
+        if key and value in allowed:
+            clean[str(country).strip()] = str(destination).strip()
+    CUSTOM_COUNTRY_MAPPING = clean
+    CUSTOM_COUNTRY_MAPPING_NORM = {norm(k): norm(v) for k, v in clean.items()}
+
+def save_custom_country_mapping(country, destination):
+    """Save one user-approved country-to-form-row mapping."""
+    key, value = str(country).strip(), str(destination).strip()
+    allowed = {norm(v) for v in country_mapping_destinations()}
+    if not norm(key) or norm(value) not in allowed:
+        raise ValueError(T("Μη έγκυρη αντιστοίχιση χώρας.", "Invalid country mapping."))
+    updated = dict(CUSTOM_COUNTRY_MAPPING)
+    # Replace spelling variants of the same source country rather than duplicating them.
+    for old in list(updated):
+        if norm(old) == norm(key):
+            del updated[old]
+    updated[key] = value
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = COUNTRY_MAPPINGS_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(updated, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, COUNTRY_MAPPINGS_FILE)
+    load_custom_country_mappings()
 
 
 def fix_greek(text):
@@ -485,9 +680,10 @@ def pretty_country(name):
 
 
 def resolve_country(name):
-    """Row of the form a country belongs to. Accepts the Protel (English) name or the form's Greek name."""
+    """Row of the form a country belongs to, including user-added country mappings."""
     k = norm(name)
-    return COUNTRY_MAPPING_NORM.get(k) or (k if k in MAPPED_TARGETS else None)
+    return (CUSTOM_COUNTRY_MAPPING_NORM.get(k) or COUNTRY_MAPPING_NORM.get(k)
+            or (k if k in MAPPED_TARGETS else None))
 
 
 # (ARCHIVE_DIR / MONTHS_CSV are set by set_data_dir() at the top of the file)
@@ -567,6 +763,41 @@ def year_stats(hist, year):
     return dict(clients=cl, nights=ni, avg=(ni / cl if cl else 0), months=present, gaps=gaps, cmp=cmp_)
 
 
+def filter_hist(hist, country):
+    """History reduced to one country (months stay, with empty row lists, so gaps are still right)."""
+    if not country:
+        return hist
+    k = norm(country)
+    return {y: {m: [r for r in rows if norm(r[0]) == k] for m, rows in months.items()}
+            for y, months in hist.items()}
+
+
+def export_history_excel(hist, path):
+    """Writes the whole history to .xlsx (sheet 1: one row per month, sheet 2: one row per country)."""
+    greece = norm('ΕΛΛΑΔΑ')
+    months_rows, country_rows = [], []
+    for y in sorted(hist):
+        for m in sorted(hist[y]):
+            rows = hist[y][m]
+            cl, ni = sum(r[1] for r in rows), sum(r[2] for r in rows)
+            gr = sum(r[1] for r in rows if norm(r[0]) == greece)
+            months_rows.append({T("Έτος", "Year"): y, T("Μήνας", "Month"): m,
+                                T("Πελάτες", "Guests"): cl, T("Διανυκτερεύσεις", "Overnight stays"): ni,
+                                T("Μέση διαμονή", "Average stay"): round(ni / cl, 2) if cl else None,
+                                T("Ελλάδα", "Greece"): gr, T("Αλλοδαποί", "Foreign"): cl - gr})
+            for country, c, n in sorted(rows, key=lambda r: -r[1]):
+                country_rows.append({T("Έτος", "Year"): y, T("Μήνας", "Month"): m,
+                                     T("Χώρα", "Country"): country, T("Πελάτες", "Guests"): c,
+                                     T("Διανυκτερεύσεις", "Overnight stays"): n})
+    with pd.ExcelWriter(path, engine='openpyxl') as xw:
+        pd.DataFrame(months_rows).to_excel(xw, sheet_name=T("Μήνες", "Months"), index=False)
+        pd.DataFrame(country_rows).to_excel(xw, sheet_name=T("Χώρες", "Countries"), index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = max(12, min(30, max(len(str(c.value or '')) for c in col) + 3))
+            ws.freeze_panes = 'A2'
+
+
 def missing_month_reminder(hist, today=None):
     """(year, month) of last month if its form is missing although the hotel was working until recently."""
     if not hist:
@@ -599,11 +830,18 @@ def greek_fonts():
 
 
 def fmt_int(n):
-    return f"{int(n):,}".replace(",", ".")
+    s = f"{int(n):,}"
+    return s if LANG == 'en' else s.replace(",", ".")
+
+
+def fmt_dec(x, signed=False):
+    """One decimal digit with the decimal mark of the current language."""
+    s = f"{x:+.1f}" if signed else f"{x:.1f}"
+    return s if LANG == 'en' else s.replace(".", ",")
 
 
 def fmt_avg(nights, clients):
-    return f"{nights / clients:.1f}".replace(".", ",") if clients else "-"
+    return fmt_dec(nights / clients) if clients else "-"
 
 
 def make_year_summary_pdf(year, hist, hotel, out_path):
@@ -612,21 +850,21 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
     from reportlab.lib.pagesizes import A4
     months = hist.get(year, {})
     if not months:
-        raise ValueError("Δεν υπάρχουν δεδομένα για αυτό το έτος.")
+        raise ValueError(T("Δεν υπάρχουν δεδομένα για αυτό το έτος.", "There is no data for this year."))
     reg, bold = greek_fonts()
     W, H = A4
     L, R = 40, W - 40
-    navy, text_c, band = colors.HexColor(NAVY), colors.HexColor(TEXT), colors.HexColor('#e8f0fe')
+    navy, text_c, band = colors.HexColor('#14304f'), colors.HexColor('#1e293b'), colors.HexColor('#e8f0fe')
     c = canvas.Canvas(out_path, pagesize=A4)
 
     c.setFillColor(navy)
     c.rect(0, H - 92, W, 92, stroke=0, fill=1)
     c.setFillColor(colors.white)
     c.setFont(bold, 19)
-    c.drawString(L, H - 46, f"Σύνοψη κίνησης έτους {year}")
+    c.drawString(L, H - 46, T(f"Σύνοψη κίνησης έτους {year}", f"Year {year} movement summary"))
     c.setFont(reg, 10.5)
     who = " · ".join(x for x in (hotel.get('type'), hotel.get('name'), hotel.get('category')) if x)
-    c.drawString(L, H - 68, who or "Τουριστικό κατάλυμα")
+    c.drawString(L, H - 68, who or T("Τουριστικό κατάλυμα", "Tourist accommodation"))
 
     def header(y, first, cols):
         c.setFillColor(navy)
@@ -638,9 +876,10 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
             c.drawRightString(x - 6, y, t)
 
     greece = norm('ΕΛΛΑΔΑ')
-    cols = [(220, "Πελάτες"), (320, "Διανυκτερεύσεις"), (410, "Μέση διαμονή"), (480, "Ελλάδα"), (R, "Αλλοδαποί")]
+    cols = [(220, T("Πελάτες", "Guests")), (320, T("Διανυκτερεύσεις", "Overnight stays")), (410, T("Μέση διαμονή", "Average stay")), (480, T("Ελλάδα", "Greece")), (R, T("Αλλοδαποί",
+                                                                                                      "Foreign"))]
     y = H - 130
-    header(y, "Μήνας", cols)
+    header(y, T("Μήνας", "Month"), cols)
     y -= 24
     tcl = tni = tgr = 0
     for i, month in enumerate(sorted(months)):
@@ -653,7 +892,7 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
             c.rect(L, y - 6, R - L, 20, stroke=0, fill=1)
         c.setFillColor(text_c)
         c.setFont(reg, 10)
-        c.drawString(L + 8, y, GREEK_MONTHS[month - 1] if 1 <= month <= 12 else str(month))
+        c.drawString(L + 8, y, month_name(month) if 1 <= month <= 12 else str(month))
         for (x, _), v in zip(cols, (fmt_int(cl), fmt_int(ni), fmt_avg(ni, cl), fmt_int(gr), fmt_int(cl - gr))):
             c.drawRightString(x - 6, y, v)
         y -= 20
@@ -661,7 +900,7 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
     c.rect(L, y - 6, R - L, 22, stroke=0, fill=1)
     c.setFillColor(navy)
     c.setFont(bold, 10.5)
-    c.drawString(L + 8, y, f"ΣΥΝΟΛΟ {year}")
+    c.drawString(L + 8, y, T(f"ΣΥΝΟΛΟ {year}", f"TOTAL {year}"))
     for (x, _), v in zip(cols, (fmt_int(tcl), fmt_int(tni), fmt_avg(tni, tcl), fmt_int(tgr), fmt_int(tcl - tgr))):
         c.drawRightString(x - 6, y, v)
 
@@ -675,10 +914,10 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
     y -= 48
     c.setFillColor(navy)
     c.setFont(bold, 12)
-    c.drawString(L, y, "Κορυφαίες χώρες προέλευσης")
+    c.drawString(L, y, T("Κορυφαίες χώρες προέλευσης", "Top countries of origin"))
     y -= 26
-    cols2 = [(300, "Πελάτες"), (410, "Διανυκτερεύσεις"), (R, "% των πελατών")]
-    header(y, "Χώρα", cols2)
+    cols2 = [(300, T("Πελάτες", "Guests")), (410, T("Διανυκτερεύσεις", "Overnight stays")), (R, T("% των πελατών", "% of guests"))]
+    header(y, T("Χώρα", "Country"), cols2)
     y -= 24
     for i, (country, (cl, ni)) in enumerate(top):
         if i % 2 == 0:
@@ -687,14 +926,15 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
         c.setFillColor(text_c)
         c.setFont(reg, 10)
         c.drawString(L + 8, y, country)
-        pct = f"{cl / tcl * 100:.1f}%".replace(".", ",") if tcl else "-"
+        pct = f"{fmt_dec(cl / tcl * 100)}%" if tcl else "-"
         for (x, _), v in zip(cols2, (fmt_int(cl), fmt_int(ni), pct)):
             c.drawRightString(x - 6, y, v)
         y -= 20
 
-    c.setFillColor(colors.HexColor(MUTED))
+    c.setFillColor(colors.HexColor('#64748b'))
     c.setFont(reg, 8.5)
-    c.drawString(L, 30, f"Δημιουργήθηκε στις {datetime.date.today().strftime('%d/%m/%Y')} από το πρόγραμμα ΕΛΣΤΑΤ")
+    c.drawString(L, 30, T(f"Δημιουργήθηκε στις {datetime.date.today().strftime('%d/%m/%Y')} από το πρόγραμμα ΕΛΣΤΑΤ",
+                          f"Created on {datetime.date.today().strftime('%d/%m/%Y')} by the ELSTAT program"))
     c.save()
 
 
@@ -776,7 +1016,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
 
     reader = pypdf.PdfReader(template_pdf)
     if len(reader.pages) < 2:
-        raise ValueError("Το template PDF πρέπει να έχει 2 σελίδες.")
+        raise ValueError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
     coord_map = {0: {}, 1: {}}
     for i in range(2):
         page = reader.pages[i]
@@ -866,7 +1106,10 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
                     can.drawString(265, fixed_y[key], str(totals_dict[key]['clients']))
                     can.drawString(335, fixed_y[key], str(totals_dict[key]['nights']))
                     
-            today = datetime.date.today()
+            try:
+                today = datetime.datetime.strptime(monthly_data.get('sign_date', ''), "%d/%m/%Y").date()
+            except ValueError:
+                today = datetime.date.today()
             year_suffix = str(today.year)[-2:] if str(today.year).startswith("20") else str(today.year)
             today_str = f"{today.strftime('%d')}      {today.strftime('%m')}          {year_suffix}"
             can.drawString(454, 206, today_str)
@@ -918,37 +1161,91 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     computed = (totals['9']['clients'], totals['9']['nights'])
     gr = pdf_data.get(norm('ΕΛΛΑΔΑ'), {'clients': 0, 'nights': 0})
     summary = [
-        ("1.  Ελλάδα", gr['clients'], gr['nights'], False),
-        ("2.1  Χώρες Ευρωπαϊκής Ένωσης", totals['2.1']['clients'], totals['2.1']['nights'], False),
-        ("2.2  Χώρες Ε.Ζ.Ε.Σ. (EFTA)", totals['2.2']['clients'], totals['2.2']['nights'], False),
-        ("2.3  Λοιπές χώρες Ευρώπης", totals['2.3']['clients'], totals['2.3']['nights'], False),
-        ("2.  Σύνολο Ευρώπης (εκτός Ελλάδας)", totals['2']['clients'], totals['2']['nights'], True),
-        ("3.  Σύνολο Αμερικής", totals['3']['clients'], totals['3']['nights'], True),
-        ("4.  Σύνολο Ασίας", totals['4']['clients'], totals['4']['nights'], True),
-        ("5.  Σύνολο Αφρικής", totals['5']['clients'], totals['5']['nights'], True),
-        ("6.  Σύνολο Ωκεανίας", totals['6']['clients'], totals['6']['nights'], True),
-        ("7.  Δεν δήλωσαν χώρα", totals['7']['clients'], totals['7']['nights'], False),
-        ("8.  Σύνολο αλλοδαπών", totals['8']['clients'], totals['8']['nights'], True),
-        ("9.  ΓΕΝΙΚΟ ΣΥΝΟΛΟ", totals['9']['clients'], totals['9']['nights'], True),
+        (T("1.  Ελλάδα", "1.  Greece"), gr['clients'], gr['nights'], False),
+        (T("2.1  Χώρες Ευρωπαϊκής Ένωσης", "2.1  European Union countries"), totals['2.1']['clients'], totals['2.1']['nights'], False),
+        (T("2.2  Χώρες Ε.Ζ.Ε.Σ. (EFTA)", "2.2  EFTA countries"), totals['2.2']['clients'], totals['2.2']['nights'], False),
+        (T("2.3  Λοιπές χώρες Ευρώπης", "2.3  Other European countries"), totals['2.3']['clients'], totals['2.3']['nights'], False),
+        (T("2.  Σύνολο Ευρώπης (εκτός Ελλάδας)", "2.  Total Europe (excluding Greece)"), totals['2']['clients'], totals['2']['nights'], True),
+        (T("3.  Σύνολο Αμερικής", "3.  Total America"), totals['3']['clients'], totals['3']['nights'], True),
+        (T("4.  Σύνολο Ασίας", "4.  Total Asia"), totals['4']['clients'], totals['4']['nights'], True),
+        (T("5.  Σύνολο Αφρικής", "5.  Total Africa"), totals['5']['clients'], totals['5']['nights'], True),
+        (T("6.  Σύνολο Ωκεανίας", "6.  Total Oceania"), totals['6']['clients'], totals['6']['nights'], True),
+        (T("7.  Δεν δήλωσαν χώρα", "7.  Country not declared"), totals['7']['clients'], totals['7']['nights'], False),
+        (T("8.  Σύνολο αλλοδαπών", "8.  Total foreign"), totals['8']['clients'], totals['8']['nights'], True),
+        (T("9.  ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "9.  GRAND TOTAL"), totals['9']['clients'], totals['9']['nights'], True),
     ]
     return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary}
 
 
 # ----------------------------------------------------------------- look & feel
-BG = "#eef2f7"
-CARD = "#ffffff"
-NAVY = "#14304f"
-ACCENT = "#2563eb"
-ACCENT_DARK = "#1d4ed8"
-TEAL = "#0f766e"
-TEAL_DARK = "#115e59"
-BORDER = "#d3dce8"
-TEXT = "#1e293b"
-MUTED = "#64748b"
-GOOD, BAD, WARN = "#15803d", "#b91c1c", "#b45309"
+PALETTES = {
+    'light': dict(
+        BG="#f3f6fb", CARD="#ffffff", NAVY="#172b4d", TEXT="#243247", MUTED="#718096", BORDER="#e2e8f0",
+        HEADER_BG="#172b4d", HEADER_FG="#ffffff", HEADER_MUTED="#c4d0e2",
+        ACCENT="#4263eb", ACCENT_DARK="#3451d1", ACCENT_SOFT="#edf1ff", TEAL="#0f8b83", TEAL_DARK="#08766f",
+        GOOD="#16845b", BAD="#c2414b", WARN="#a86b12",
+        FIELD="#ffffff", BTN="#edf1f7", BTN_HOVER="#e1e8f2", TAB_BG="#e9eef6", TAB_HOVER="#dfe7f2",
+        OFF_BG="#cbd5e1", OFF_FG="#f8fafc", SCROLL="#cbd5e1",
+        GOOD_BG="#dcfce7", GOOD_FG="#166534", BAD_BG="#fee2e2", BAD_FG="#991b1b", BAD_LINE="#f87171",
+        WARN_BG="#fef3c7", WARN_FG="#92400e", WARN_LINE="#f5d68a",
+        DANGER_HOVER="#fecaca", DANGER_LINE="#fca5a5",
+        ZONE_IDLE_BG="#f8fafc", ZONE_IDLE_LINE="#b6c2d3", ZONE_HOVER_BG="#eff6ff", ZONE_DRAG_BG="#dbeafe",
+        ZONE_DONE_BG="#f0fdf4", ZONE_DONE_LINE="#86efac",
+        SEL="#e5ebff", HEAD_BG="#edf1f7", HEAD_HOVER="#e3eaf4",
+        ROW_BOLD="#edf1ff", ROW_YEAR="#e3eaff", ROW_MONTH="#f2f5fc", ROW_HL="#fff5dc",
+        GRID="#e7ecf3", TRACK="#f2f5fa", TICK="#cbd5e1", TIP_BG="#172b4d", TIP_FG="#ffffff",
+    ),
+    'dark': dict(
+        BG="#101827", CARD="#192538", NAVY="#edf3ff", TEXT="#dce6f5", MUTED="#91a2ba", BORDER="#2b3a50",
+        HEADER_BG="#0c1422", HEADER_FG="#f5f8ff", HEADER_MUTED="#9aacc5",
+        ACCENT="#6d8cff", ACCENT_DARK="#5575ed", ACCENT_SOFT="#24365d", TEAL="#22a69b", TEAL_DARK="#16877e",
+        GOOD="#55d6a2", BAD="#ff7b86", WARN="#f2c36b",
+        FIELD="#111d2d", BTN="#26364d", BTN_HOVER="#31445e", TAB_BG="#1d2b40", TAB_HOVER="#293b55",
+        OFF_BG="#33445b", OFF_FG="#8798b0", SCROLL="#40536d",
+        GOOD_BG="#12301f", GOOD_FG="#86efac", BAD_BG="#3b1618", BAD_FG="#fca5a5", BAD_LINE="#ef4444",
+        WARN_BG="#3a2c0f", WARN_FG="#fcd34d", WARN_LINE="#5c4514",
+        DANGER_HOVER="#4d1d20", DANGER_LINE="#7f1d1d",
+        ZONE_IDLE_BG="#131c27", ZONE_IDLE_LINE="#3a4a5f", ZONE_HOVER_BG="#152a45", ZONE_DRAG_BG="#16304f",
+        ZONE_DONE_BG="#11291d", ZONE_DONE_LINE="#2f7a4d",
+        SEL="#2b4169", HEAD_BG="#22334a", HEAD_HOVER="#2b405b",
+        ROW_BOLD="#243650", ROW_YEAR="#263c5b", ROW_MONTH="#1e3048", ROW_HL="#493a20",
+        GRID="#2b3b52", TRACK="#1b2a3e", TICK="#526783", TIP_BG="#edf3ff", TIP_FG="#101827",
+    ),
+}
+THEME = 'light'
+
+
+def system_theme():
+    """'dark' or 'light' according to the operating system (light if it cannot be found out)."""
+    try:
+        if sys.platform.startswith('win'):
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return 'light' if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else 'dark'
+        if sys.platform == 'darwin':
+            r = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'],
+                               capture_output=True, text=True, timeout=2)
+            return 'dark' if 'dark' in r.stdout.lower() else 'light'
+    except Exception:
+        pass
+    return 'light'
+
+
+def set_theme(pref):
+    """pref: 'light' | 'dark' | 'auto'. Points every colour name (BG, CARD, ...) at the chosen palette.
+    The screen has to be built again afterwards."""
+    global THEME
+    THEME = pref if pref in ('light', 'dark') else system_theme()
+    globals().update(PALETTES[THEME])
+
+
+set_theme('light')
 FONT = "Segoe UI" if sys.platform.startswith("win") else "Arial"
 GREEK_MONTHS = ["Ιανουάριος", "Φεβρουάριος", "Μάρτιος", "Απρίλιος", "Μάιος", "Ιούνιος",
                 "Ιούλιος", "Αύγουστος", "Σεπτέμβριος", "Οκτώβριος", "Νοέμβριος", "Δεκέμβριος"]
+ENGLISH_MONTHS = ["January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November", "December"]
 
 
 def autowrap(label, container, margin=40, minimum=160):
@@ -961,25 +1258,97 @@ def autowrap(label, container, margin=40, minimum=160):
 
 
 class Card(tk.Frame):
-    """White 'card' with a thin border, an optional numbered badge and a title.
-    Put your widgets into `card.body`."""
+    """White 'card' with a thin border, an optional numbered step badge and a title.
+    The badge turns into a green tick when set_done(True) is called. Put widgets into `card.body`."""
 
     def __init__(self, parent, number=None, title=""):
         super().__init__(parent, bg=BORDER)
         inner = tk.Frame(self, bg=CARD)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         head = tk.Frame(inner, bg=CARD)
-        head.pack(fill="x", padx=16, pady=(14, 2))
+        head.pack(fill="x", padx=18, pady=(16, 2))
+        self.number = number
+        self.badge = None
+        self._done = None
         if number is not None:
-            tk.Label(head, text=str(number), bg=ACCENT, fg="white", width=2,
-                     font=(FONT, 10, 'bold')).pack(side="left")
+            self.badge = tk.Canvas(head, width=26, height=26, bg=CARD, highlightthickness=0)
+            self.badge.pack(side="left")
+            self.set_done(False)
         tk.Label(head, text=title, bg=CARD, fg=NAVY,
-                 font=(FONT, 12, 'bold')).pack(side="left", padx=(10 if number is not None else 0, 0))
-        self.body = ttk.Frame(inner, style='Card.TFrame', padding=(16, 6, 16, 16))
+                 font=(FONT, 13, 'bold')).pack(side="left", padx=(10 if number is not None else 0, 0))
+        self.body = ttk.Frame(inner, style='Card.TFrame', padding=(20, 10, 20, 20))
         self.body.pack(fill="x")
+
+    def set_done(self, done):
+        if self.badge is None or done == self._done:
+            return
+        self._done = done
+        colour = GOOD if done else ACCENT
+        self.badge.delete('all')
+        self.badge.create_oval(1, 1, 25, 25, fill=colour, outline=colour)
+        self.badge.create_text(13, 13, text="\u2713" if done else str(self.number), fill="white",
+                               font=(FONT, 10, 'bold'))
+
+
+class DropZone(tk.Canvas):
+    """Large dashed 'drop your file here' area. Clicking it calls `command` (the file chooser)."""
+
+    def __init__(self, parent, command, height=96):
+        super().__init__(parent, height=height, bg=CARD, highlightthickness=0, cursor='hand2')
+        self._command = command
+        self._title = self._sub = ""
+        self._done = self._hover = self._drag = False
+        self.bind('<Configure>', lambda e: self._draw())
+        self.bind('<Button-1>', lambda e: self._command())
+        self.bind('<Enter>', lambda e: self._set('_hover', True))
+        self.bind('<Leave>', lambda e: self._set('_hover', False))
+
+    def _set(self, attr, value):
+        setattr(self, attr, value)
+        self._draw()
+
+    def set_drag(self, on):
+        self._set('_drag', bool(on))
+
+    def set_text(self, title, sub, done=False):
+        self._title, self._sub, self._done = title, sub, done
+        self._draw()
+
+    def _draw(self):
+        try:
+            self.delete('all')
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 40 or h < 40:
+                return
+            if self._drag:
+                fill, line, fg = ZONE_DRAG_BG, ACCENT, ACCENT
+            elif self._done:
+                fill, line, fg = ZONE_DONE_BG, ZONE_DONE_LINE, GOOD
+            elif self._hover:
+                fill, line, fg = ZONE_HOVER_BG, ACCENT, ACCENT
+            else:
+                fill, line, fg = ZONE_IDLE_BG, ZONE_IDLE_LINE, NAVY
+            self.create_rectangle(2, 2, w - 3, h - 3, fill=fill, outline=line, width=2,
+                                  dash=None if self._done else (6, 4))
+            self.create_text(w // 2, h // 2 - 12, text=self._title, fill=fg, width=w - 40,
+                             font=(FONT, 12, 'bold'))
+            self.create_text(w // 2, h // 2 + 14, text=self._sub, fill=MUTED, width=w - 40,
+                             font=(FONT, 9))
+        except tk.TclError:
+            pass            # the widget was destroyed while the screen was being rebuilt
 
 
 GREEK_MONTHS_SHORT = ["Ιαν", "Φεβ", "Μαρ", "Απρ", "Μάι", "Ιουν", "Ιουλ", "Αυγ", "Σεπ", "Οκτ", "Νοε", "Δεκ"]
+ENGLISH_MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def month_name(month):
+    """Name of month 1-12 in the current language."""
+    return (ENGLISH_MONTHS if LANG == 'en' else GREEK_MONTHS)[month - 1]
+
+
+def month_short(month):
+    return (ENGLISH_MONTHS_SHORT if LANG == 'en' else GREEK_MONTHS_SHORT)[month - 1]
 
 
 class StatCard(tk.Frame):
@@ -997,25 +1366,31 @@ class StatCard(tk.Frame):
         self.sub.pack(fill="x", padx=14, pady=(0, 10))
         inner.bind('<Configure>', lambda e: self.sub.configure(wraplength=max(100, e.width - 28)))
 
-    def set(self, value, sub="", color=MUTED):
+    def set(self, value, sub="", color=None):
         self.value.configure(text=value)
-        self.sub.configure(text=sub, fg=color)
+        self.sub.configure(text=sub, fg=color or MUTED)
 
 
 class HistoryChart(tk.Canvas):
-    """Bar chart with one bar per month. Clicking a bar calls on_pick(month)."""
+    """Bar chart with one bar per month. Clicking a bar calls on_pick(month).
+    Optionally shows the previous year as small tick marks and a tooltip on hover."""
 
     def __init__(self, parent, on_pick=None, height=160):
         super().__init__(parent, height=height, bg=CARD, highlightthickness=1,
                          highlightbackground=BORDER, borderwidth=0)
         self.values, self.title, self.color, self.selected = [0] * 12, "", ACCENT, None
+        self.prev, self.prev_label, self.hover = None, "", None
         self.on_pick = on_pick
         self._slots = []
         self.bind('<Configure>', lambda e: self.draw())
         self.bind('<Button-1>', self._click)
+        self.bind('<Motion>', self._motion)
+        self.bind('<Leave>', self._leave)
 
-    def set_data(self, values, title, color=ACCENT, selected=None):
-        self.values, self.title, self.color, self.selected = list(values), title, color, selected
+    def set_data(self, values, title, color=None, selected=None, prev=None, prev_label=""):
+        self.values, self.title, self.color, self.selected = list(values), title, (color or ACCENT), selected
+        self.prev = list(prev) if prev and any(prev) else None
+        self.prev_label = prev_label
         self.draw()
 
     @staticmethod
@@ -1030,7 +1405,7 @@ class HistoryChart(tk.Canvas):
 
     @staticmethod
     def _fmt(v):
-        return f"{int(round(v)):,}".replace(",", ".")
+        return fmt_int(round(v))
 
     def draw(self):
         self.delete('all')
@@ -1040,14 +1415,22 @@ class HistoryChart(tk.Canvas):
             return
         left, right, top, bottom = 52, 14, 38, 26
         plot_h = h - top - bottom
-        top_val = self._nice(max(self.values))
+        top_val = self._nice(max(self.values + (self.prev or [0])))
         self.create_text(14, 14, text=self.title, anchor="w", fill=NAVY, font=(FONT, 10, 'bold'))
+        if self.prev:     # legend
+            self.create_line(w - right - 150, 14, w - right - 134, 14, fill='#f59e0b', width=3)
+            self.create_text(w - right - 128, 14, text=self.prev_label, anchor="w", fill=MUTED, font=(FONT, 8))
         for frac in (0, .5, 1):
             y = top + plot_h * (1 - frac)
-            self.create_line(left, y, w - right, y, fill='#e5eaf1')
+            self.create_line(left, y, w - right, y, fill=GRID)
             self.create_text(left - 8, y, text=self._fmt(top_val * frac), anchor="e", fill=MUTED, font=(FONT, 8))
         slot = (w - left - right) / 12
         bw = slot * 0.6
+        for i, v in enumerate(self.values):
+            cx = left + slot * (i + .5)
+            if self.hover == i + 1:
+                self.create_rectangle(cx - slot / 2 + 2, top - 6, cx + slot / 2 - 2, top + plot_h + 2,
+                                      fill=TRACK, outline='')
         for i, v in enumerate(self.values):
             cx = left + slot * (i + .5)
             if v > 0:
@@ -1055,17 +1438,60 @@ class HistoryChart(tk.Canvas):
                 fill = NAVY if self.selected == i + 1 else self.color
                 self.create_rectangle(cx - bw / 2, y0, cx + bw / 2, top + plot_h, fill=fill, outline='')
                 self.create_text(cx, y0 - 8, text=self._fmt(v), fill=TEXT, font=(FONT, 8))
-                self._slots.append((cx - slot / 2, cx + slot / 2, i + 1))
             else:
                 self.create_line(cx - bw / 2, top + plot_h - 1, cx + bw / 2, top + plot_h - 1,
-                                 fill='#cbd5e1', width=2)
-            self.create_text(cx, h - 12, text=GREEK_MONTHS_SHORT[i], fill=MUTED, font=(FONT, 8))
+                                 fill=TICK, width=2)
+            pv = self.prev[i] if self.prev else 0
+            if pv > 0:
+                yp = top + plot_h * (1 - pv / top_val)
+                self.create_line(cx - bw / 2 - 3, yp, cx + bw / 2 + 3, yp, fill='#f59e0b', width=3)
+            if v > 0 or pv > 0:
+                self._slots.append((cx - slot / 2, cx + slot / 2, i + 1))
+            self.create_text(cx, h - 12, text=month_short(i + 1), fill=MUTED, font=(FONT, 8))
+        if self.hover:
+            self._tooltip(self.hover, left, slot, top)
+
+    def _tooltip(self, month, left, slot, top):
+        v = self.values[month - 1]
+        lines = [f"{month_name(month)}: {self._fmt(v)}"]
+        if self.prev:
+            pv = self.prev[month - 1]
+            lines.append(f"{self.prev_label}: {self._fmt(pv)}")
+            if pv > 0:
+                lines.append(f"{fmt_dec((v - pv) / pv * 100, signed=True)}%")
+        cx = left + slot * (month - .5)
+        w = self.winfo_width()
+        tw = 150
+        x = cx + slot / 2 + 4
+        if x + tw > w - 4:
+            x = cx - slot / 2 - 4 - tw
+        y = top - 4
+        self.create_rectangle(x, y, x + tw, y + 14 * len(lines) + 10, fill=TIP_BG, outline='')
+        self.create_text(x + 8, y + 6, text="\n".join(lines), anchor="nw", fill=TIP_FG,
+                         font=(FONT, 9), justify="left")
+
+    def _month_at(self, x):
+        for x0, x1, month in self._slots:
+            if x0 <= x <= x1:
+                return month
+        return None
+
+    def _motion(self, event):
+        m = self._month_at(event.x)
+        if m != self.hover:
+            self.hover = m
+            self.configure(cursor='hand2' if m else '')
+            self.draw()
+
+    def _leave(self, _event=None):
+        if self.hover is not None:
+            self.hover = None
+            self.draw()
 
     def _click(self, event):
-        for x0, x1, month in self._slots:
-            if x0 <= event.x <= x1 and self.on_pick:
-                self.on_pick(month)
-                return
+        m = self._month_at(event.x)
+        if m and self.on_pick:
+            self.on_pick(m)
 
 
 class ScrollFrame(ttk.Frame):
@@ -1114,6 +1540,7 @@ def setup_styles(root):
     st = ttk.Style(root)
     st.theme_use('clam')
     st.configure('.', font=(FONT, 10), background=BG, foreground=TEXT)
+    st.configure('TNotebook', tabmargins=(4, 6, 4, 0))
     st.configure('TFrame', background=BG)
     st.configure('Card.TFrame', background=CARD)
     st.configure('TLabel', background=BG, foreground=TEXT)
@@ -1122,13 +1549,19 @@ def setup_styles(root):
     st.configure('TSeparator', background=BORDER)
     st.configure('Status.TLabel', background=CARD, foreground=MUTED, font=(FONT, 9), padding=(14, 6))
     st.configure('TRadiobutton', background=BG, focuscolor=BG)
+    st.configure('TRadiobutton', indicatorbackground=FIELD, indicatorforeground=TEXT)
+    st.map('TRadiobutton', indicatorbackground=[('pressed', BTN), ('disabled', BG)])
     for name in ('Card.TRadiobutton', 'Card.TCheckbutton'):
-        st.configure(name, background=CARD, focuscolor=CARD)
-        st.map(name, background=[('active', CARD)])
-    st.configure('TCombobox', fieldbackground='white', background='#e8edf4', bordercolor=BORDER,
-                 lightcolor=BORDER, darkcolor=BORDER, arrowcolor=TEXT, padding=4)
-    st.map('TCombobox', fieldbackground=[('readonly', 'white')], bordercolor=[('focus', ACCENT)])
+        st.configure(name, background=CARD, focuscolor=CARD, indicatorbackground=FIELD, indicatorforeground=TEXT)
+        st.map(name, background=[('active', CARD)], indicatorbackground=[('pressed', BTN), ('disabled', CARD)])
+    st.configure('TCombobox', fieldbackground=FIELD, background=BTN, bordercolor=BORDER,
+                 lightcolor=BORDER, darkcolor=BORDER, arrowcolor=TEXT, foreground=TEXT, padding=6)
+    st.map('TCombobox', fieldbackground=[('readonly', FIELD)], bordercolor=[('focus', ACCENT)])
     root.option_add('*TCombobox*Listbox.font', (FONT, 10))
+    root.option_add('*TCombobox*Listbox.background', FIELD)
+    root.option_add('*TCombobox*Listbox.foreground', TEXT)
+    root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
+    root.option_add('*TCombobox*Listbox.selectForeground', 'white')
 
     # coloured text styles, one set for the grey background and one for white cards
     for p, bg in (('', BG), ('Card', CARD)):
@@ -1140,15 +1573,15 @@ def setup_styles(root):
     st.configure('BadTitle.TLabel', foreground=WARN, font=(FONT, 15, 'bold'))
 
     # status "pills" shown above the main buttons
-    for name, bg, fg in (('StatusGood', '#dcfce7', '#166534'), ('StatusBad', '#fee2e2', '#991b1b'),
-                         ('StatusWarn', '#fef3c7', '#92400e')):
+    for name, bg, fg in (('StatusGood', GOOD_BG, GOOD_FG), ('StatusBad', BAD_BG, BAD_FG),
+                         ('StatusWarn', WARN_BG, WARN_FG)):
         st.configure(f'{name}.TLabel', background=bg, foreground=fg, padding=(12, 8))
 
     # tabs
     st.configure('TNotebook', background=BG, borderwidth=0, tabmargins=(2, 4, 2, 0))
-    st.configure('TNotebook.Tab', padding=(22, 9), font=(FONT, 10, 'bold'), background='#d9e1ec',
-                 foreground=MUTED, borderwidth=0, focuscolor='#d9e1ec')
-    st.map('TNotebook.Tab', background=[('selected', ACCENT), ('active', '#c8d4e4')],
+    st.configure('TNotebook.Tab', padding=(20, 11), font=(FONT, 10, 'bold'), background=TAB_BG,
+                 foreground=MUTED, borderwidth=0, focuscolor=TAB_BG)
+    st.map('TNotebook.Tab', background=[('selected', ACCENT), ('active', TAB_HOVER)],
            foreground=[('selected', 'white')], focuscolor=[('selected', ACCENT)])
 
     # buttons (flat, coloured)
@@ -1160,36 +1593,703 @@ def setup_styles(root):
             opts['font'] = font
         st.configure(name, **opts)
         st.map(name,
-               background=[('disabled', '#c7d0dc'), ('pressed', active), ('active', active)],
-               foreground=[('disabled', '#f8fafc')],
-               bordercolor=[('disabled', '#c7d0dc'), ('active', active)],
+               background=[('disabled', OFF_BG), ('pressed', active), ('active', active)],
+               foreground=[('disabled', OFF_FG)],
+               bordercolor=[('disabled', OFF_BG), ('active', active)],
                lightcolor=[('pressed', active), ('active', active)],
                darkcolor=[('pressed', active), ('active', active)])
-    button('TButton', '#e8edf4', TEXT, '#d6deea', border=BORDER)
-    button('Primary.TButton', ACCENT, 'white', ACCENT_DARK, font=(FONT, 12, 'bold'), padding=(14, 11))
-    button('Print.TButton', TEAL, 'white', TEAL_DARK, font=(FONT, 12, 'bold'), padding=(14, 11))
+    button('TButton', BTN, TEXT, BTN_HOVER, border=BORDER)
+    button('Primary.TButton', ACCENT, 'white', ACCENT_DARK, font=(FONT, 11, 'bold'), padding=(16, 13))
+    # the second action is an outlined button so the main one stands out
+    button('Print.TButton', CARD, ACCENT, ACCENT_SOFT, border=BORDER, font=(FONT, 11, 'bold'), padding=(16, 13))
     button('PrintSm.TButton', TEAL, 'white', TEAL_DARK, font=(FONT, 10, 'bold'), padding=(14, 7))
-    button('Danger.TButton', '#fee2e2', BAD, '#fecaca', border='#fca5a5', padding=(14, 7))
+    button('Danger.TButton', BAD_BG, BAD, DANGER_HOVER, border=DANGER_LINE, padding=(14, 7))
 
     # entries
-    st.configure('TEntry', fieldbackground='white', bordercolor=BORDER, lightcolor=BORDER,
-                 darkcolor=BORDER, padding=6)
+    st.configure('TEntry', fieldbackground=FIELD, foreground=TEXT, insertcolor=TEXT, bordercolor=BORDER, lightcolor=BORDER,
+                 darkcolor=BORDER, padding=8)
     st.map('TEntry', bordercolor=[('focus', ACCENT)], lightcolor=[('focus', ACCENT)],
            darkcolor=[('focus', ACCENT)])
-    st.configure('Bad.TEntry', fieldbackground='#fee2e2', bordercolor='#f87171',
-                 lightcolor='#f87171', darkcolor='#f87171', padding=6)
+    st.configure('Bad.TEntry', fieldbackground=BAD_BG, bordercolor=BAD_LINE,
+                 lightcolor=BAD_LINE, darkcolor=BAD_LINE, padding=8)
 
     # scrollbars
-    st.configure('Vertical.TScrollbar', background='#c5cfdd', troughcolor=BG, bordercolor=BG,
+    st.configure('Vertical.TScrollbar', background=SCROLL, troughcolor=BG, bordercolor=BG,
                  arrowcolor=MUTED, relief='flat')
 
     # result table
-    st.configure('Treeview', rowheight=28, font=(FONT, 10), background=CARD, fieldbackground=CARD,
+    st.configure('Treeview', rowheight=30, font=(FONT, 10), background=CARD, fieldbackground=CARD,
                  foreground=TEXT, bordercolor=BORDER, borderwidth=1)
-    st.configure('Treeview.Heading', font=(FONT, 10, 'bold'), background=NAVY, foreground='white',
-                 padding=(8, 7), relief='flat')
-    st.map('Treeview.Heading', background=[('active', NAVY)])
-    st.map('Treeview', background=[('selected', '#dbeafe')], foreground=[('selected', TEXT)])
+    st.configure('Treeview.Heading', font=(FONT, 10, 'bold'), background=HEAD_BG, foreground=NAVY,
+                 bordercolor=BORDER, padding=(8, 8), relief='flat')
+    st.map('Treeview.Heading', background=[('active', HEAD_HOVER)])
+    st.map('Treeview', background=[('selected', SEL)], foreground=[('selected', TEXT)])
+
+
+# ------------------------------------------------------------------ user guide
+# Every text is a (greek, english) pair. **bold** and `Key` are marked inline.
+# Block types: p paragraph, h sub-heading, li bullet, step numbered step, kb key + description,
+#              tip / warn callout, go link  ('tab:<name>' opens a tab, 'sec:<id>' another section).
+MANUAL = [
+    dict(id='start', title=("Γρήγορη εκκίνηση", "Quick start"), blocks=[
+        ('p', ("Το πρόγραμμα παίρνει το αρχείο Excel που βγάζει το Protel και συμπληρώνει αυτόματα το μηνιαίο "
+               "δελτίο της ΕΛΣΤΑΤ σε PDF. Ο μήνας ολοκληρώνεται σε πέντε βήματα:",
+               "The program takes the Excel file that Protel produces and fills in the monthly ELSTAT form as a PDF "
+               "automatically. A month takes five steps:")),
+        ('step', ("Την πρώτη φορά, ανοίξτε την καρτέλα **Στοιχεία ξενοδοχείου** και συμπληρώστε τα στοιχεία σας. "
+                  "Γίνεται μία φορά και το πρόγραμμα τα θυμάται.",
+                  "The first time, open the **Hotel details** tab and fill in your details. You do this once; "
+                  "the program remembers them.")),
+        ('step', ("Στην καρτέλα **Δελτίο μήνα**, σύρτε το Excel του μήνα μέσα στο πλαίσιο του Βήματος 1 ή πατήστε "
+                  "πάνω του για να το διαλέξετε.",
+                  "In the **Monthly form** tab, drop the month's Excel into the box in Step 1, or click it to choose the file.")),
+        ('step', ("Ελέγξτε τα **Στοιχεία του μήνα** (Βήμα 2). Τα περισσότερα συμπληρώνονται μόνα τους - εσείς "
+                  "πληκτρολογείτε μόνο το **Σύνολο εργαζομένων**.",
+                  "Check the **Month details** (Step 2). Most are filled in for you - you only type the **Total employees**.")),
+        ('step', ("Δείτε πού θα αποθηκευτεί το PDF (Βήμα 3) και πατήστε **Δημιουργία PDF** ή **Δημιουργία & Εκτύπωση**.",
+                  "See where the PDF will be saved (Step 3) and click **Create PDF** or **Create & Print**.")),
+        ('step', ("Στο παράθυρο αποτελέσματος ελέγξτε τα σύνολα και τις προειδοποιήσεις και μετά εκτυπώστε ή ανοίξτε το PDF.",
+                  "In the result window check the totals and any warnings, then print or open the PDF.")),
+        ('tip', ("Κάθε δελτίο αρχειοθετείται αυτόματα. Μπορείτε να το ξανανοίξετε ή να το εκτυπώσετε όποτε θέλετε από το **Ιστορικό**.",
+                 "Every form is archived automatically. You can reopen or print it whenever you like from **History**.")),
+        ('go', ("Ξεκινήστε από το Δελτίο μήνα", "Go to the Monthly form"), 'tab:report'),
+    ]),
+    dict(id='monthly', title=("Δελτίο μήνα", "Monthly form"), blocks=[
+        ('p', ("Η καρτέλα που θα χρησιμοποιείτε κάθε μήνα. Έχει τρία βήματα και, κάτω, τα κουμπιά δημιουργίας.",
+               "The tab you will use every month. It has three steps and, at the bottom, the create buttons.")),
+        ('h', ("Βήμα 1 - Αρχείο από το Protel", "Step 1 - File from Protel")),
+        ('p', ("Το αρχείο που χρειάζεται λέγεται «Nationalities Statistics» και βγαίνει από το Protel ως .xls ή .xlsx. "
+               "Μπορείτε να το διαλέξετε με όποιον τρόπο σας βολεύει:",
+               "The file you need is called “Nationalities Statistics” and comes from Protel as .xls or .xlsx. "
+               "Choose it whichever way suits you:")),
+        ('li', ("Σύρτε το πάνω στο διακεκομμένο πλαίσιο (ή πάνω σε ολόκληρη την κάρτα).",
+                "Drop it onto the dashed box (or anywhere on the card).")),
+        ('li', ("Πατήστε το πλαίσιο ή το κουμπί **Επιλογή Excel…** (`Ctrl+O`).",
+                "Click the box or the **Choose Excel…** button (`Ctrl+O`).")),
+        ('li', ("Πατήστε **Πιο πρόσφατο** για να διαλέξει το πρόγραμμα το νεότερο Excel από τον φάκελο που χρησιμοποιήσατε τελευταία.",
+                "Click **Latest** and the program picks the newest Excel in the folder you used last.")),
+        ('li', ("Ή γράψτε / επικολλήστε τη διαδρομή του αρχείου στο πεδίο.",
+                "Or type / paste the file path into the field.")),
+        ('p', ("Μόλις διαλέξετε αρχείο, το πρόγραμμα το διαβάζει: δείχνει την περίοδο που βρήκε και έναν πίνακα με τις χώρες. "
+               "Η στήλη **Στο δελτίο** λέει σε ποια γραμμή του δελτίου θα μπει κάθε χώρα. Οι κόκκινες γραμμές χρειάζονται προσοχή.",
+               "As soon as you choose a file the program reads it: it shows the period it found and a table of the countries. "
+               "The **On the form** column says which line of the form each country goes to. Red lines need your attention.")),
+        ('h', ("Βήμα 2 - Στοιχεία του μήνα", "Step 2 - Month details")),
+        ('p', ("Το Έτος, ο Μήνας, η Τελευταία ημέρα («Έως») και οι Ημέρες λειτουργίας συμπληρώνονται από το Excel. "
+               "Η Ημερομηνία υπογραφής παίρνει τη σημερινή - αλλάξτε την (ΗΗ/ΜΜ/ΕΕΕΕ) αν το δελτίο πρέπει να φαίνεται υπογεγραμμένο άλλη μέρα. "
+               "Ένα πεδίο που κοκκινίζει έχει λάθος τιμή.",
+               "The Year, Month, Last day (“To”) and Operating days are filled in from the Excel. "
+               "The Signing date is today's date - change it (DD/MM/YYYY) if the form should look signed on another day. "
+               "A field that turns red has a wrong value.")),
+        ('warn', ("Το **Σύνολο εργαζομένων** ΔΕΝ υπάρχει στο Excel. Πληκτρολογήστε το εσείς, στο τέλος του μήνα, μαζί με ιδιοκτήτες και οικογένεια. "
+                  "Στις Ρυθμίσεις μπορείτε να ζητήσετε να προσυμπληρώνεται με την τελευταία τιμή.",
+                  "The **Total employees** is NOT in the Excel. Type it yourself at the end of the month, including owners and family. "
+                  "In Settings you can ask for it to be pre-filled with the last value.")),
+        ('h', ("Βήμα 3 - Πού αποθηκεύεται το PDF", "Step 3 - Where the PDF is saved")),
+        ('p', ("Η θέση προτείνεται αυτόματα με βάση τις Ρυθμίσεις (φάκελος και όνομα αρχείου). Για άλλη θέση πατήστε **Αλλαγή…**.",
+               "The location is suggested automatically from the Settings (folder and file name). For another location click **Change…**.")),
+        ('h', ("Δημιουργία του δελτίου", "Creating the form")),
+        ('p', ("Πάνω από τα κουμπιά υπάρχει πάντα ένα μήνυμα ελέγχου. Αν κάτι λείπει ή είναι λάθος, το μήνυμα το απαριθμεί και τα κουμπιά "
+               "είναι γκρι. Όταν όλα είναι σωστά γράφει «Όλα είναι έτοιμα».",
+               "There is always a check message above the buttons. If something is missing or wrong it lists it and the buttons are grey. "
+               "When everything is right it says “Everything is ready”.")),
+        ('li', ("**Δημιουργία PDF** (`Ctrl+Enter`) φτιάχνει το δελτίο.",
+                "**Create PDF** (`Ctrl+Enter`) makes the form.")),
+        ('li', ("**Δημιουργία & Εκτύπωση** (`Ctrl+P`) το φτιάχνει και το στέλνει στον προεπιλεγμένο εκτυπωτή.",
+                "**Create & Print** (`Ctrl+P`) makes it and sends it to the default printer.")),
+        ('h', ("Τι ελέγχει το πρόγραμμα", "What the program checks")),
+        ('li', ("Αν η περίοδος του Excel διαφέρει από τον μήνα και το έτος της φόρμας, ρωτά αν θέλετε να συνεχίσετε.",
+                "If the Excel's period differs from the form's month and year, it asks whether to continue.")),
+        ('li', ("Αν το PDF υπάρχει ήδη, ρωτά πριν το αντικαταστήσει (η ερώτηση κλείνει από τις Ρυθμίσεις).",
+                "If the PDF already exists it asks before replacing it (this question can be turned off in Settings).")),
+        ('li', ("Μετά τη δημιουργία συγκρίνει το γενικό σύνολο του PDF με το σύνολο του Excel και σας προειδοποιεί αν διαφέρουν.",
+                "After creating it compares the PDF's grand total with the Excel's total and warns you if they differ.")),
+        ('li', ("Αν μια χώρα δεν είναι γνωστή στο πρόγραμμα, σας λέει ποια δεν μπήκε στο PDF.",
+                "If a country is unknown to the program it tells you which one was left out of the PDF.")),
+        ('warn', ("Όταν υπάρχουν προειδοποιήσεις, η αυτόματη εκτύπωση δεν γίνεται. Ελέγξτε το δελτίο και μετά πατήστε **Εκτύπωση** στο παράθυρο αποτελέσματος.",
+                  "When there are warnings, automatic printing does not happen. Check the form, then click **Print** in the result window.")),
+        ('h', ("Υπενθύμιση", "Reminder")),
+        ('p', ("Αν λείπει το δελτίο του προηγούμενου μήνα, εμφανίζεται κίτρινη υπενθύμιση στην κορυφή. Κλείνει με το **Κλείσιμο** "
+               "ή απενεργοποιείται από τις Ρυθμίσεις.",
+               "If last month's form is missing, a yellow reminder appears at the top. Close it with **Close** or turn it off in Settings.")),
+        ('go', ("Άνοιγμα της καρτέλας Δελτίο μήνα", "Open the Monthly form tab"), 'tab:report'),
+    ]),
+    dict(id='hotel', title=("Στοιχεία ξενοδοχείου", "Hotel details"), blocks=[
+        ('p', ("Τα στοιχεία που γράφονται σε κάθε δελτίο. Τα συμπληρώνετε μία φορά και το πρόγραμμα τα θυμάται.",
+               "The details written on every form. You fill them in once and the program remembers them.")),
+        ('li', ("**Είδος καταλύματος, Τίτλος, Κατηγορία**: όπως θέλετε να γραφτούν στο δελτίο.",
+                "**Property type, Name, Category**: as you want them written on the form.")),
+        ('li', ("**E-mail** και **Τηλέφωνο**.", "**E-mail** and **Phone**.")),
+        ('li', ("**Α.Φ.Μ.**: ακριβώς 9 ψηφία. Δέχεται μόνο αριθμούς και ο μετρητής δείχνει ✓ όταν είναι έγκυρο.",
+                "**Tax ID (AFM)**: exactly 9 digits. It accepts numbers only and the counter shows ✓ when it is valid.")),
+        ('li', ("**Επωνυμία επιχείρησης**.", "**Business name**.")),
+        ('tip', ("Αλλάξτε ό,τι θέλετε εδώ: τα στοιχεία αποθηκεύονται αυτόματα όταν δημιουργήσετε δελτίο. Ένα πεδίο που κοκκινίζει πρέπει να διορθωθεί.",
+                 "Change anything here: the details are saved automatically when you create a form. A field that turns red must be corrected.")),
+        ('h', ("Άδειο PDF της ΕΛΣΤΑΤ (template)", "Blank ELSTAT PDF (template)")),
+        ('p', ("Το κενό δελτίο πάνω στο οποίο γράφονται τα στοιχεία (`template_elstat_report.pdf`, δίπλα στο πρόγραμμα). "
+               "Συνήθως δεν χρειάζεται να το αλλάξετε. Αν η ΕΛΣΤΑΤ δώσει νέο έντυπο, διαλέξτε το με **Αναζήτηση…** ή σύρτε το πάνω στην κάρτα.",
+               "The blank form on which the details are written (`template_elstat_report.pdf`, next to the program). "
+               "You usually don't need to change it. If ELSTAT issues a new form, choose it with **Browse…** or drop it onto the card.")),
+        ('go', ("Άνοιγμα της καρτέλας Στοιχεία ξενοδοχείου", "Open the Hotel details tab"), 'tab:hotel'),
+    ]),
+    dict(id='history', title=("Ιστορικό", "History"), blocks=[
+        ('p', ("Κάθε δελτίο που δημιουργείτε καταχωρείται στο Ιστορικό. Εκεί βλέπετε στατιστικά, συγκρίσεις με το προηγούμενο έτος "
+               "και ξανανοίγετε παλιά δελτία.",
+               "Every form you create is recorded in History. There you see statistics, comparisons with the previous year, and reopen old forms.")),
+        ('h', ("Φίλτρα", "Filters")),
+        ('li', ("**Έτος** και **Χώρα** περιορίζουν τα στοιχεία που βλέπετε.", "**Year** and **Country** narrow down what you see.")),
+        ('li', ("**Διανυκτερεύσεις / Πελάτες** επιλέγει τι δείχνει το γράφημα.", "**Overnight stays / Guests** chooses what the chart shows.")),
+        ('h', ("Τι βλέπετε", "What you see")),
+        ('li', ("Τέσσερα πλακίδια: **Πελάτες, Διανυκτερεύσεις, Μέση διαμονή** (σε νύχτες) και **Αλλοδαποί**.",
+                "Four tiles: **Guests, Overnight stays, Average stay** (in nights) and **Foreign guests**.")),
+        ('li', ("Γράφημα με μία στήλη ανά μήνα. Αν υπάρχουν στοιχεία του προηγούμενου έτους, εμφανίζονται ως μικρές κίτρινες γραμμές. "
+                "Περάστε το ποντίκι για λεπτομέρειες και πατήστε μια στήλη για να επιλέξετε τον μήνα.",
+                "A chart with one bar per month. If the previous year has data it appears as small yellow ticks. "
+                "Hover for details and click a bar to select the month.")),
+        ('li', ("Πίνακας Έτος / Μήνας / Χώρα με πελάτες, διανυκτερεύσεις, μέση διαμονή, ποσοστό και στήλη PDF. "
+                "**Ανάπτυξη** και **Σύμπτυξη** ανοίγουν ή κλείνουν τα πάντα.",
+                "A Year / Month / Country table with guests, nights, average stay, share and a PDF column. "
+                "**Expand** and **Collapse** open or close everything.")),
+        ('li', ("Δεξιά βλέπετε τις κορυφαίες χώρες. Διπλό κλικ σε χώρα την κάνει φίλτρο - δεύτερο διπλό κλικ το καθαρίζει.",
+                "On the right are the top countries. Double-click a country to filter by it - double-click again to clear.")),
+        ('h', ("Ενέργειες", "Actions")),
+        ('li', ("Σε επιλεγμένο μήνα: **Άνοιγμα** (ή διπλό κλικ, ή `Enter`), **Αποθήκευση ως…** και **Εκτύπωση**.",
+                "On a selected month: **Open** (or double-click, or `Enter`), **Save as…** and **Print**.")),
+        ('li', ("**Σύνοψη έτους**: PDF μίας σελίδας για ολόκληρο το έτος - αποθήκευση ή εκτύπωση.",
+                "**Year summary**: a one-page PDF for the whole year - save or print.")),
+        ('li', ("**Διαγραφή μήνα** (`Delete`) τον αφαιρεί από το ιστορικό και σβήνει το αρχειοθετημένο PDF του. Το αρχείο που αποθηκεύσατε εσείς δεν πειράζεται.",
+                "**Delete month** (`Delete`) removes it from the history and deletes its archived PDF. The file you saved yourself is not touched.")),
+        ('li', ("Δεξί κλικ σε μήνα ανοίγει μενού με όλες τις ενέργειες.", "Right-click a month for a menu with all the actions.")),
+        ('li', ("**Εξαγωγή Excel…** αποθηκεύει όλο το ιστορικό σε αρχείο Excel και **Άνοιγμα CSV** ανοίγει το αρχείο του ιστορικού.",
+                "**Export Excel…** saves the whole history as an Excel file and **Open CSV** opens the history file.")),
+        ('tip', ("Αν ένας παλιός μήνας δεν έχει αρχειοθετημένο PDF, το πρόγραμμα ξαναφτιάχνει το δελτίο από τα δεδομένα του ιστορικού όταν το ζητήσετε. "
+                 "Χρειάζονται τα Στοιχεία ξενοδοχείου και το template.",
+                 "If an old month has no archived PDF, the program rebuilds the form from the history data when you ask for it. "
+                 "It needs the Hotel details and the template.")),
+        ('go', ("Άνοιγμα της καρτέλας Ιστορικό", "Open the History tab"), 'tab:history'),
+    ]),
+    dict(id='settings', title=("Ρυθμίσεις", "Settings"), blocks=[
+        ('p', ("Όλα όσα προσαρμόζουν το πρόγραμμα. Οι αλλαγές αποθηκεύονται αμέσως.",
+               "Everything that customises the program. Changes are saved immediately.")),
+        ('h', ("Γλώσσα και εμφάνιση", "Language and appearance")),
+        ('li', ("**Γλώσσα**: Ελληνικά ή English, αλλάζει αμέσως. Το επίσημο δελτίο (PDF) γράφεται πάντα στα ελληνικά.",
+                "**Language**: Ελληνικά or English, changes immediately. The official form (PDF) is always written in Greek.")),
+        ('li', ("**Εμφάνιση**: Φωτεινή, Σκούρα ή Όπως το σύστημα. Το κουμπί ☾ / ☀ πάνω δεξιά την αλλάζει γρήγορα.",
+                "**Appearance**: Light, Dark or Match system. The ☾ / ☀ button at the top right switches it quickly.")),
+        ('h', ("Πού αποθηκεύονται τα PDF", "Where PDFs are saved")),
+        ('p', ("Διαλέξτε τον φάκελο του προγράμματος, τον φάκελο του Excel ή έναν δικό σας φάκελο. "
+               "Το όνομα του αρχείου φτιάχνεται από ένα μοτίβο, π.χ. `ELSTAT_{year}_{month}` γίνεται ELSTAT_2026_03. "
+               "Πρέπει να περιέχει και το {year} και το {month}, αλλιώς κάθε μήνας θα γράφει πάνω στον προηγούμενο.",
+               "Choose the program folder, the Excel's folder or a folder of your own. "
+               "The file name is built from a pattern, e.g. `ELSTAT_{year}_{month}` becomes ELSTAT_2026_03. "
+               "It must contain both {year} and {month}, otherwise each month would overwrite the previous one.")),
+        ('h', ("Φάκελος δεδομένων", "Data folder")),
+        ('p', ("Εδώ αποθηκεύονται τα στοιχεία του ξενοδοχείου, το ιστορικό, τα αρχειοθετημένα PDF και οι ρυθμίσεις.",
+               "This is where the hotel details, history, archived PDFs and settings are stored.")),
+        ('li', ("**Αλλαγή…** διαλέγει άλλον φάκελο και προσφέρεται να αντιγράψει τα υπάρχοντα δεδομένα. **Άνοιγμα** τον ανοίγει στον Εξερευνητή.",
+                "**Change…** picks another folder and offers to copy the existing data. **Open** shows it in the file explorer.")),
+        ('li', ("**Προεπιλεγμένος φάκελος** επιστρέφει στη θέση δίπλα στο πρόγραμμα.",
+                "**Default folder** goes back to the location next to the program.")),
+        ('li', ("**Αντίγραφο ασφαλείας (.zip)…** αποθηκεύει όλα τα δεδομένα σε ένα αρχείο.",
+                "**Backup (.zip)…** saves all the data into one file.")),
+        ('tip', ("Διαλέξτε έναν φάκελο μέσα στο OneDrive ή σε άλλη υπηρεσία συγχρονισμού και θα έχετε αυτόματο αντίγραφο ασφαλείας.",
+                 "Pick a folder inside OneDrive or another sync service and you get an automatic backup.")),
+        ('h', ("Αρχεία Excel από το Protel", "Excel files from Protel")),
+        ('p', ("Από ποιον φάκελο ξεκινούν τα **Επιλογή Excel…** και **Πιο πρόσφατο**. Κενό σημαίνει ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
+               "The folder where **Choose Excel…** and **Latest** start. Empty means the folder of the last Excel you used.")),
+        ('h', ("Συμπεριφορά του προγράμματος", "Program behaviour")),
+        ('li', ("Άνοιγμα του PDF αμέσως μετά τη δημιουργία.", "Open the PDF right after it is created.")),
+        ('li', ("Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη.", "Ask before replacing a PDF that already exists.")),
+        ('li', ("Αρχειοθέτηση αντιγράφου κάθε δελτίου - επιτρέπει το ξανάνοιγμα και την εκτύπωση παλιών μηνών από το Ιστορικό.",
+                "Archive a copy of every form - lets you reopen and print old months from History.")),
+        ('li', ("Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα.", "Remind me when last month's form is missing.")),
+        ('li', ("Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή - ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
+                "Pre-fill “Total employees” with the last value - always check the number before creating the form.")),
+        ('p', ("**Επαναφορά ρυθμίσεων** γυρίζει τις ρυθμίσεις στις προεπιλογές. Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
+               "**Reset settings** returns the settings to their defaults. It does not delete the history or the hotel details.")),
+        ('go', ("Άνοιγμα της καρτέλας Ρυθμίσεις", "Open the Settings tab"), 'tab:settings'),
+    ]),
+    dict(id='dnd', title=("Μεταφορά αρχείων (drag & drop)", "Drag and drop"), blocks=[
+        ('p', ("Μπορείτε να σέρνετε αρχεία και φακέλους από τον Εξερευνητή μέσα στο πρόγραμμα. Ένα αρχείο κάθε φορά.",
+               "You can drag files and folders from the file explorer into the program. One file at a time.")),
+        ('li', ("**Excel** (.xls / .xlsx) → το πλαίσιο ή η κάρτα του Βήματος 1.",
+                "**Excel** (.xls / .xlsx) → the box or card in Step 1.")),
+        ('li', ("**PDF** → η κάρτα του template (Στοιχεία ξενοδοχείου) ή η κάρτα του Βήματος 3 (ορίζει αυτό το υπάρχον αρχείο ως έξοδο).",
+                "**PDF** → the template card (Hotel details) or the Step 3 card (sets that existing file as the output).")),
+        ('li', ("**Φάκελος** → τα πεδία φακέλων στις Ρυθμίσεις (φάκελος PDF, φάκελος Excel, φάκελος δεδομένων).",
+                "**Folder** → the folder fields in Settings (PDF folder, Excel folder, data folder).")),
+        ('warn', ("Αν δεν δουλεύει: χρειάζεται το πακέτο `tkinterdnd2` (εγκατάσταση: `pip install tkinterdnd2`) και το πρόγραμμα δεν πρέπει να τρέχει "
+                  "ως Διαχειριστής. Η γραμμή κατάστασης κάτω λέει αν η μεταφορά αρχείων είναι ενεργή. Σε κάθε περίπτωση, μπορείτε να πατήσετε στα κουμπιά επιλογής.",
+                  "If it doesn't work: it needs the `tkinterdnd2` package (install with `pip install tkinterdnd2`) and the program must not run "
+                  "as Administrator. The status bar at the bottom says whether drag and drop is active. You can always use the choose buttons instead.")),
+    ]),
+    dict(id='shortcuts', title=("Συντομεύσεις", "Shortcuts"), blocks=[
+        ('p', ("Γρήγοροι τρόποι για τα πιο συχνά βήματα.", "Quick ways to do the most common steps.")),
+        ('h', ("Παντού", "Everywhere")),
+        ('kb', ("Ctrl+O", ("Επιλογή αρχείου Excel", "Choose the Excel file"))),
+        ('kb', ("Ctrl+Enter", ("Δημιουργία PDF", "Create PDF"))),
+        ('kb', ("Ctrl+P", ("Δημιουργία & Εκτύπωση", "Create & Print"))),
+        ('kb', ("F1", ("Άνοιγμα του οδηγού στην ενότητα της τρέχουσας καρτέλας", "Open this guide at the section for the current tab"))),
+        ('kb', ("Ctrl+F", ("Αναζήτηση μέσα στον οδηγό", "Search inside the guide"))),
+        ('h', ("Στο Ιστορικό", "In History")),
+        ('kb', ("Enter", ("Άνοιγμα του επιλεγμένου μήνα", "Open the selected month"))),
+        ('kb', ("Delete", ("Διαγραφή του επιλεγμένου μήνα", "Delete the selected month"))),
+        ('kb', ("Διπλό κλικ", ("Σε μήνα: άνοιγμα. Σε χώρα: φίλτρο", "On a month: open. On a country: filter"))),
+        ('h', ("Στο παράθυρο αποτελέσματος", "In the result window")),
+        ('kb', ("Ctrl+P", ("Εκτύπωση", "Print"))),
+        ('kb', ("Esc", ("Κλείσιμο", "Close"))),
+    ]),
+    dict(id='data', title=("Δεδομένα και αντίγραφα ασφαλείας", "Data and backups"), blocks=[
+        ('p', ("Όλα τα δεδομένα του προγράμματος βρίσκονται σε έναν φάκελο (δείτε Ρυθμίσεις → Φάκελος δεδομένων):",
+               "All of the program's data lives in one folder (see Settings → Data folder):")),
+        ('li', ("`hotel_settings.csv` - τα στοιχεία του ξενοδοχείου.", "`hotel_settings.csv` - the hotel details.")),
+        ('li', ("`elstat_history.csv` και `elstat_months.csv` - το ιστορικό.", "`elstat_history.csv` and `elstat_months.csv` - the history.")),
+        ('li', ("`elstat_preferences.json` - οι ρυθμίσεις.", "`elstat_preferences.json` - the settings.")),
+        ('li', ("`ELSTAT_Archive` - τα αρχειοθετημένα PDF κάθε μήνα.", "`ELSTAT_Archive` - the archived PDF of every month.")),
+        ('p', ("Δίπλα στο πρόγραμμα υπάρχει και το `elstat_config.json`, που θυμάται μόνο **πού** είναι ο φάκελος δεδομένων.",
+               "Next to the program there is also `elstat_config.json`, which only remembers **where** the data folder is.")),
+        ('h', ("Αντίγραφα ασφαλείας", "Backups")),
+        ('li', ("Φτιάξτε αντίγραφο από Ρυθμίσεις → **Αντίγραφο ασφαλείας (.zip)…**, π.χ. μία φορά τον μήνα, και κρατήστε το σε άλλο δίσκο ή στο σύννεφο.",
+                "Make a copy from Settings → **Backup (.zip)…**, e.g. once a month, and keep it on another drive or in the cloud.")),
+        ('li', ("Για επαναφορά, αποσυμπιέστε το .zip σε έναν φάκελο και διαλέξτε τον ως **Φάκελο δεδομένων**. Το πρόγραμμα θα ρωτήσει αν θέλετε να χρησιμοποιήσει τα δεδομένα που υπάρχουν εκεί.",
+                "To restore, unzip the .zip into a folder and choose it as the **Data folder**. The program will ask whether to use the data that is already there.")),
+        ('tip', ("Αν ο φάκελος δεδομένων δεν είναι διαθέσιμος (π.χ. αποσυνδεδεμένος δίσκος), το πρόγραμμα χρησιμοποιεί προσωρινά τον προεπιλεγμένο και σας το λέει.",
+                 "If the data folder is not available (e.g. a disconnected drive), the program temporarily uses the default one and tells you.")),
+        ('go', ("Άνοιγμα των Ρυθμίσεων", "Open Settings"), 'tab:settings'),
+    ]),
+    dict(id='trouble', title=("Συχνά προβλήματα", "Troubleshooting"), blocks=[
+        ('h', ("Δεν μπορώ να γράψω το PDF", "I can't write the PDF")),
+        ('p', ("Το αρχείο είναι πιθανότατα ανοιχτό σε άλλο πρόγραμμα. Κλείστε το και δοκιμάστε ξανά.",
+               "The file is most likely open in another program. Close it and try again.")),
+        ('h', ("Το κουμπί «Δημιουργία PDF» είναι γκρι", "The “Create PDF” button is grey")),
+        ('p', ("Διαβάστε το μήνυμα ελέγχου ακριβώς από πάνω του: λέει τι πρέπει να διορθώσετε (π.χ. δεν έχετε διαλέξει Excel, ή λείπει ο Α.Φ.Μ.).",
+               "Read the check message right above it: it says what to fix (e.g. no Excel chosen, or the Tax ID is missing).")),
+        ('h', ("Μια χώρα δεν μπήκε στο PDF", "A country was left out of the PDF")),
+        ('p', ("Η χώρα δεν είναι γνωστή στο πρόγραμμα. Εμφανίζεται με κόκκινο στον πίνακα του Βήματος 1 και στο παράθυρο αποτελέσματος, "
+               "μαζί με τους πελάτες και τις διανυκτερεύσεις της. Επιλέξτε την κόκκινη χώρα στον πίνακα και πατήστε «Προσθήκη / αντιστοίχιση χώρας» για να τη συνδέσετε με τη σωστή γραμμή της ΕΛΣΤΑΤ. Η επιλογή αποθηκεύεται για τους επόμενους μήνες. Ελέγξτε τα σύνολα πριν υποβάλετε το δελτίο.",
+               "The country is unknown to the program. It shows in red in the Step 1 table and in the result window, with its guests and nights. "
+               "Select the red country in the table and click “Add / map country” to assign it to the correct ELSTAT row. The choice is saved for future months. Check the totals before submitting.")),
+        ('h', ("Τα σύνολα διαφέρουν", "The totals differ")),
+        ('p', ("Το γενικό σύνολο του PDF δεν ταιριάζει με το Excel - συνήθως επειδή κάτι δεν μπήκε (δείτε το προηγούμενο). Μην υποβάλετε το δελτίο πριν το ελέγξετε.",
+               "The PDF's grand total does not match the Excel - usually because something was left out (see the previous point). Don't submit the form before checking it.")),
+        ('h', ("Λάθος μήνας ή έτος", "Wrong month or year")),
+        ('p', ("Αν το πρόγραμμα ρωτήσει «Διαφορετική περίοδος», το Excel αφορά άλλον μήνα από αυτόν της φόρμας. Διαλέξτε το σωστό Excel ή διορθώστε το Έτος και τον Μήνα στο Βήμα 2.",
+               "If the program asks about a “Different period”, the Excel is for another month than the form. Choose the right Excel or correct the Year and Month in Step 2.")),
+        ('h', ("Η εκτύπωση δεν ξεκίνησε", "Printing did not start")),
+        ('p', ("Σε αυτό τον υπολογιστή δεν ήταν δυνατή η αυτόματη εκτύπωση, οπότε το πρόγραμμα άνοιξε το PDF. Πατήστε `Ctrl+P` μέσα στο πρόγραμμα του PDF.",
+               "Automatic printing was not possible on this PC, so the program opened the PDF. Press `Ctrl+P` in the PDF program.")),
+        ('h', ("Το drag & drop δεν δουλεύει", "Drag and drop doesn't work")),
+        ('go', ("Δείτε την ενότητα Μεταφορά αρχείων", "See the Drag and drop section"), 'sec:dnd'),
+    ]),
+]
+SECTION_BY_ID = {sec['id']: sec for sec in MANUAL}
+_INLINE = re.compile(r'(\*\*.+?\*\*|`.+?`)')
+
+
+def _tx(pair):
+    """The Greek or English half of a (greek, english) pair."""
+    return pair[1] if LANG == 'en' else pair[0]
+
+
+def _plain(text):
+    """Text without the **bold** / `key` markers."""
+    return text.replace('**', '').replace('`', '')
+
+
+def _fold(s):
+    """Upper-case without accents, for searching (keeps the length of normal text)."""
+    return ''.join(ch for ch in unicodedata.normalize('NFD', str(s).upper()) if unicodedata.category(ch) != 'Mn')
+
+
+class HelpPanel(ttk.Frame):
+    """The built-in user guide: section list with search on the left, the text on the right."""
+
+    def __init__(self, parent, app, start='start'):
+        super().__init__(parent)
+        self.app = app
+        self.current = None
+        self.nq = ''
+        self.items = {}
+        self.callouts = []
+        self._link_tags = []
+        self._resize_job = None
+        self._query_job = None
+        self._corpus_cache = {}
+        self._ph_on = False
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # ---- left: title, search, section list
+        side = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER, width=260)
+        side.grid(row=0, column=0, sticky="ns", padx=(12, 0), pady=12)
+        side.pack_propagate(False)
+        tk.Label(side, text=T("Οδηγός χρήσης", "User guide"), bg=CARD, fg=NAVY,
+                 font=(FONT, 14, 'bold'), anchor="w").pack(fill="x", padx=16, pady=(16, 2))
+        tk.Label(side, text=T("Όλα όσα χρειάζεστε, σε ενότητες.", "Everything you need, in sections."), bg=CARD, fg=MUTED,
+                 font=(FONT, 9), anchor="w").pack(fill="x", padx=16, pady=(0, 10))
+        srow = tk.Frame(side, bg=CARD)
+        srow.pack(fill="x", padx=14, pady=(0, 8))
+        self.q = tk.StringVar()
+        self.entry = ttk.Entry(srow, textvariable=self.q)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.clear_lbl = tk.Label(srow, text="\u2715", bg=CARD, fg=MUTED, font=(FONT, 10), cursor='hand2', padx=6)
+        self.clear_lbl.bind('<Button-1>', lambda e: self.clear_search())
+        self._ph = T("Αναζήτηση στον οδηγό…", "Search the guide…")
+        self.entry.bind('<FocusIn>', self._ph_hide)
+        self.entry.bind('<FocusOut>', self._ph_show)
+        self.entry.bind('<Escape>', lambda e: self.clear_search())
+        self._ph_show()
+        self.listbox = tk.Frame(side, bg=CARD)
+        self.listbox.pack(fill="both", expand=True, pady=(0, 10))
+        for sec in MANUAL:
+            self._make_item(sec)
+        # Search text is static until the language is rebuilt; prepare it once
+        # instead of normalizing every section on every key press.
+        self._corpus_cache = {sec['id']: self._corpus(sec) for sec in MANUAL}
+
+        # ---- right: breadcrumb + text
+        main = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        main.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
+        top = tk.Frame(main, bg=CARD)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=34, pady=(14, 0))
+        self.crumb = tk.Label(top, text="", bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w")
+        self.crumb.pack(side="left")
+        self.back_lbl = tk.Label(top, text="", bg=CARD, fg=ACCENT, font=(FONT, 9, 'underline'), cursor='hand2')
+        self.back_lbl.pack(side="right")
+        self.back_lbl.bind('<Button-1>', lambda e: self._go_back())
+        self.text = tk.Text(main, wrap="word", bg=CARD, fg=TEXT, relief="flat", borderwidth=0, highlightthickness=0,
+                            padx=34, pady=6, font=(FONT, 11), cursor="arrow", spacing2=4, state="disabled",
+                            insertwidth=0, selectbackground=SEL, selectforeground=TEXT, takefocus=0)
+        vbar = ttk.Scrollbar(main, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=vbar.set)
+        self.text.grid(row=1, column=0, sticky="nsew", pady=(0, 14))
+        vbar.grid(row=1, column=1, sticky="ns", pady=(0, 14))
+        self.text.bind('<Configure>', lambda e: self._schedule_resize())
+        self._configure_tags()
+
+        self.q.trace_add('write', self._on_query)
+        self.show(start if start in SECTION_BY_ID else 'start')
+        self.refresh_back()
+
+    # ------------------------------------------------------------ sidebar
+    def _make_item(self, sec):
+        frame = tk.Frame(self.listbox, bg=CARD, cursor='hand2')
+        bar = tk.Frame(frame, width=4, bg=CARD)
+        bar.pack(side="left", fill="y")
+        lbl = tk.Label(frame, text=_tx(sec['title']), bg=CARD, fg=TEXT, font=(FONT, 10), anchor="w",
+                       justify="left", padx=12, pady=8, wraplength=190)
+        lbl.pack(side="left", fill="x", expand=True)
+        badge = tk.Label(frame, text="", bg=CARD, fg=MUTED, font=(FONT, 9), padx=10)
+        badge.pack(side="right")
+        sid = sec['id']
+        for w in (frame, bar, lbl, badge):
+            w.bind('<Button-1>', lambda e, i=sid: self.show(i))
+            w.bind('<Enter>', lambda e, i=sid: self._hover(i, True))
+            w.bind('<Leave>', lambda e, i=sid: self._hover(i, False))
+        self.items[sid] = (frame, bar, lbl, badge)
+        frame.pack(fill="x")
+
+    def _hover(self, sid, on):
+        if sid == self.current:
+            return
+        frame, bar, lbl, badge = self.items[sid]
+        colour = BG if on else CARD
+        for w in (frame, bar, lbl, badge):
+            w.configure(bg=colour)
+
+    def _paint_items(self):
+        for sid, (frame, bar, lbl, badge) in self.items.items():
+            sel = sid == self.current
+            bg = ACCENT_SOFT if sel else CARD
+            frame.configure(bg=bg)
+            bar.configure(bg=ACCENT if sel else CARD)
+            lbl.configure(bg=bg, fg=ACCENT if sel else TEXT, font=(FONT, 10, 'bold' if sel else 'normal'))
+            badge.configure(bg=bg)
+
+    # ------------------------------------------------------------ search
+    def _ph_show(self, _e=None):
+        if not self.q.get():
+            self._ph_on = True
+            self.entry.configure(foreground=MUTED)
+            self.q.set(self._ph)
+
+    def _ph_hide(self, _e=None):
+        if self._ph_on:
+            self._ph_on = False
+            self.q.set('')
+            self.entry.configure(foreground=TEXT)
+
+    def focus_search(self):
+        self.entry.focus_set()
+        self.entry.select_range(0, 'end')
+
+    def clear_search(self):
+        self._ph_on = False
+        self.q.set('')
+        self.entry.configure(foreground=TEXT)
+        self.text.focus_set()
+
+    def _corpus(self, sec):
+        parts = [_tx(sec['title'])]
+        for blk in sec['blocks']:
+            if blk[0] == 'kb':
+                # Keyboard-help entries are stored as ('kb', (shortcut, (el, en))).
+                # Also accept the older three-field layout for compatibility.
+                if len(blk) == 2:
+                    shortcut, description = blk[1]
+                else:
+                    shortcut, description = blk[1], blk[2]
+                parts += [shortcut, _tx(description)]
+            elif blk[0] != 'go':
+                parts.append(_tx(blk[1]))
+        return _fold(_plain(' '.join(parts)))
+
+    def _on_query(self, *_):
+        # Debounce typing: repainting the guide's Text widget on every keystroke
+        # caused visible lag, especially on slower PCs.
+        if self._query_job is not None:
+            try:
+                self.after_cancel(self._query_job)
+            except tk.TclError:
+                pass
+        self._query_job = self.after(110, self._apply_query)
+
+    def _apply_query(self):
+        self._query_job = None
+        text = '' if self._ph_on else self.q.get().strip()
+        self.nq = _fold(text) if text else ''
+        if self.nq:
+            self.clear_lbl.pack(side="right")
+        else:
+            self.clear_lbl.pack_forget()
+        counts = {sid: (corpus.count(self.nq) if self.nq else 0)
+                  for sid, corpus in self._corpus_cache.items()}
+        visible = [sec['id'] for sec in MANUAL if not self.nq or counts[sec['id']] > 0]
+        for sid, (frame, _bar, _lbl, badge) in self.items.items():
+            frame.pack_forget()
+            badge.configure(text=str(counts[sid]) if self.nq else "")
+        for sid in visible:
+            self.items[sid][0].pack(fill="x")
+        if not visible:
+            self._show_empty()
+        elif self.current not in visible:
+            # Change section only when the current one is filtered out. Rebuilding
+            # the complete Text widget on every search update caused unnecessary lag.
+            self.show(visible[0])
+        # If the current section is still visible, leave its rendered content alone.
+
+    def _show_empty(self):
+        self.current = None
+        self._paint_items()
+        self._reset_text()
+        t = self.text
+        t.configure(state='normal')
+        t.insert('end', T("Δεν βρέθηκε τίποτα", "Nothing found") + "\n", ('title',))
+        t.insert('end', T(f"Δεν υπάρχει αποτέλεσμα για «{self.q.get().strip()}». Δοκιμάστε μια άλλη λέξη ή λιγότερα γράμματα.",
+                          f"No result for “{self.q.get().strip()}”. Try another word or fewer letters."), ('p',))
+        t.configure(state='disabled')
+        self.crumb.configure(text="")
+
+    # ------------------------------------------------------------ text
+    def _configure_tags(self):
+        t = self.text
+        t.tag_configure('title', font=(FONT, 22, 'bold'), foreground=NAVY, spacing1=4, spacing3=14)
+        t.tag_configure('h', font=(FONT, 13, 'bold'), foreground=NAVY, spacing1=22, spacing3=6)
+        t.tag_configure('p', spacing3=9)
+        t.tag_configure('li', lmargin1=8, lmargin2=28, spacing3=6, tabs=('28',))
+        t.tag_configure('step', lmargin1=2, lmargin2=34, spacing3=9, tabs=('34',))
+        t.tag_configure('kb', lmargin1=2, lmargin2=170, spacing3=8, tabs=('170',))
+        t.tag_configure('nav', spacing1=26)
+        t.tag_configure('bullet', foreground=ACCENT, font=(FONT, 11, 'bold'))
+        t.tag_configure('stepnum', foreground=ACCENT, font=(FONT, 12, 'bold'))
+        t.tag_configure('b', font=(FONT, 11, 'bold'))
+        t.tag_configure('kbd', font=(FONT, 10, 'bold'), background=BTN, foreground=NAVY)
+        t.tag_configure('hit', background=ROW_HL, foreground=TEXT)
+
+    def _reset_text(self):
+        t = self.text
+        for fr, _box, _lbl in self.callouts:
+            try:
+                fr.destroy()
+            except tk.TclError:
+                pass
+        self.callouts = []
+        for name in self._link_tags:
+            t.tag_delete(name)
+        self._link_tags = []
+        t.configure(state='normal')
+        t.delete('1.0', 'end')
+        t.configure(state='disabled')
+
+    def _ins(self, s, tags=()):
+        """Inserts text, marking search matches."""
+        t = self.text
+        q = self.nq
+        folded = _fold(s) if q else ''
+        if not q or len(folded) != len(s):
+            t.insert('end', s, tags)
+            return
+        i = 0
+        while True:
+            j = folded.find(q, i)
+            if j < 0:
+                break
+            if j > i:
+                t.insert('end', s[i:j], tags)
+            t.insert('end', s[j:j + len(q)], tuple(tags) + ('hit',))
+            i = j + len(q)
+        if i < len(s):
+            t.insert('end', s[i:], tags)
+
+    def _inline(self, s, base):
+        for part in _INLINE.split(s):
+            if not part:
+                continue
+            if part.startswith('**'):
+                self._ins(part[2:-2], base + ('b',))
+            elif part.startswith('`'):
+                self._ins('\u00a0' + part[1:-1] + '\u00a0', base + ('kbd',))
+            else:
+                self._ins(part, base)
+
+    def _link(self, label, action, base):
+        name = f"link{len(self._link_tags) + 1}"
+        t = self.text
+        t.tag_configure(name, foreground=ACCENT, underline=True)
+        t.tag_bind(name, '<Button-1>', lambda e: action())
+        t.tag_bind(name, '<Enter>', lambda e: t.configure(cursor='hand2'))
+        t.tag_bind(name, '<Leave>', lambda e: t.configure(cursor='arrow'))
+        t.insert('end', label, tuple(base) + (name,))
+        self._link_tags.append(name)
+
+    def _callout(self, kind, txt):
+        accent, bg = (ACCENT, ACCENT_SOFT) if kind == 'tip' else (WARN, WARN_BG)
+        title = T("Συμβουλή", "Tip") if kind == 'tip' else T("Προσοχή", "Important")
+        fr = tk.Frame(self.text, bg=bg)
+        tk.Frame(fr, bg=accent, width=4).pack(side="left", fill="y")
+        box = tk.Frame(fr, bg=bg)
+        box.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+        tk.Label(box, text=title, bg=bg, fg=accent, font=(FONT, 10, 'bold'), anchor="w").pack(anchor="w")
+        lbl = tk.Label(box, text=_plain(txt), bg=bg, fg=TEXT, font=(FONT, 10), justify="left", anchor="w")
+        lbl.pack(anchor="w", pady=(2, 0))
+        fr.pack_propagate(False)
+        fr.configure(width=400, height=80)
+        self.callouts.append((fr, box, lbl))
+        self.text.window_create('end', window=fr, pady=6)
+        self.text.insert('end', '\n')
+
+    def _schedule_resize(self):
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+        self._resize_job = self.after(60, self._resize_callouts)
+
+    def _resize_callouts(self):
+        self._resize_job = None
+        try:
+            avail = self.text.winfo_width() - 2 * 34 - 8
+            if avail < 160:
+                return
+            # One geometry pass for all embedded callouts, rather than one
+            # synchronous idle-task flush per callout during window resizing.
+            for _fr, _box, lbl in self.callouts:
+                lbl.configure(wraplength=max(120, avail - 52))
+            self.update_idletasks()
+            for fr, box, _lbl in self.callouts:
+                fr.configure(width=avail, height=box.winfo_reqheight() + 20)
+        except tk.TclError:
+            pass
+
+    def show(self, sid):
+        sec = SECTION_BY_ID.get(sid)
+        if sec is None:
+            return
+        self.current = sid
+        self.app._help_last = sid
+        self._paint_items()
+        self._reset_text()
+        t = self.text
+        t.configure(state='normal')
+        self._ins(_tx(sec['title']), ('title',))
+        t.insert('end', '\n', ('title',))
+        step_no = 0
+        prev = None
+        for blk in sec['blocks']:
+            kind = blk[0]
+            step_no = step_no + 1 if kind == 'step' else 0
+            if kind == 'p':
+                self._inline(_tx(blk[1]), ('p',))
+                t.insert('end', '\n', ('p',))
+            elif kind == 'h':
+                self._ins(_tx(blk[1]), ('h',))
+                t.insert('end', '\n', ('h',))
+            elif kind == 'li':
+                t.insert('end', '\u2022\t', ('li', 'bullet'))
+                self._inline(_tx(blk[1]), ('li',))
+                t.insert('end', '\n', ('li',))
+            elif kind == 'step':
+                t.insert('end', f"{step_no}\t", ('step', 'stepnum'))
+                self._inline(_tx(blk[1]), ('step',))
+                t.insert('end', '\n', ('step',))
+            elif kind == 'kb':
+                if len(blk) == 2:
+                    shortcut, description = blk[1]
+                else:
+                    shortcut, description = blk[1], blk[2]
+                self._ins('\u00a0' + shortcut + '\u00a0', ('kb', 'kbd'))
+                t.insert('end', '\t', ('kb',))
+                self._inline(_tx(description), ('kb',))
+                t.insert('end', '\n', ('kb',))
+            elif kind in ('tip', 'warn'):
+                self._callout(kind, _tx(blk[1]))
+            elif kind == 'go':
+                target = blk[2]
+                if target.startswith('tab:'):
+                    action = lambda n=target[4:]: self.app.goto_tab(n)
+                else:
+                    action = lambda i=target[4:]: self.show(i)
+                self._link(_tx(blk[1]) + '  \u2192', action, ('p',))
+                t.insert('end', '\n', ('p',))
+            prev = kind
+        # previous / next section
+        order = [s['id'] for s in MANUAL]
+        i = order.index(sid)
+        t.insert('end', '\n', ('nav',))
+        if i > 0:
+            self._link('\u2039  ' + _tx(MANUAL[i - 1]['title']), lambda s=order[i - 1]: self.show(s), ('nav',))
+        if i > 0 and i < len(order) - 1:
+            t.insert('end', '          ', ('nav',))
+        if i < len(order) - 1:
+            self._link(_tx(MANUAL[i + 1]['title']) + '  \u203a', lambda s=order[i + 1]: self.show(s), ('nav',))
+        t.tag_raise('hit')
+        t.configure(state='disabled')
+        t.yview_moveto(0)
+        self.crumb.configure(text=T(f"Ενότητα {i + 1} από {len(order)}", f"Section {i + 1} of {len(order)}"))
+        self._schedule_resize()
+
+    # ------------------------------------------------------------ back link
+    def refresh_back(self):
+        prev = getattr(self.app, '_help_prev', None)
+        try:
+            if prev and str(prev) in self.app.notebook.tabs() and str(prev) != str(self.app.tab_help):
+                name = self.app.notebook.tab(prev, 'text')
+                self.back_lbl.configure(text=T(f"\u2190  Πίσω στο «{name}»", f"\u2190  Back to “{name}”"))
+                return
+        except tk.TclError:
+            pass
+        self.back_lbl.configure(text="")
+
+    def _go_back(self):
+        prev = getattr(self.app, '_help_prev', None)
+        try:
+            if prev and str(prev) in self.app.notebook.tabs():
+                self.app.notebook.select(prev)
+        except tk.TclError:
+            pass
 
 
 class ResultDialog(tk.Toplevel):
@@ -1197,7 +2297,7 @@ class ResultDialog(tk.Toplevel):
 
     def __init__(self, parent, result, out_path, warnings_txt, print_status=None):
         super().__init__(parent)
-        self.title("Αποτέλεσμα")
+        self.title(T("Αποτέλεσμα", "Result"))
         self.configure(bg=BG)
         self.transient(parent)
         self.minsize(520, 480)
@@ -1214,12 +2314,14 @@ class ResultDialog(tk.Toplevel):
             return lbl
 
         if ok:
-            ttk.Label(body, text="✓ Το δελτίο δημιουργήθηκε επιτυχώς", style='GoodTitle.TLabel').pack(anchor="w")
+            ttk.Label(body, text=T("✓ Το δελτίο δημιουργήθηκε επιτυχώς", "✓ The form was created successfully"), style='GoodTitle.TLabel').pack(anchor="w")
             gc, gn = result['computed_total']
-            note(f"Τα σύνολα ταιριάζουν με το Excel του Protel ({gc} πελάτες / {gn} διανυκτερεύσεις).",
+            note(T(f"Τα σύνολα ταιριάζουν με το Excel του Protel ({gc} πελάτες / {gn} διανυκτερεύσεις).",
+                   f"The totals match the Protel Excel ({gc} guests / {gn} overnight stays)."),
                  'Good.TLabel', pady=(2, 12))
         else:
-            ttk.Label(body, text="⚠ Το δελτίο δημιουργήθηκε, αλλά θέλει έλεγχο",
+            ttk.Label(body, text=T("⚠ Το δελτίο δημιουργήθηκε, αλλά θέλει έλεγχο",
+                                   "⚠ The form was created, but needs checking"),
                       style='BadTitle.TLabel').pack(anchor="w")
             for w in warnings_txt:
                 note("• " + w, 'Bad.TLabel', pady=(4, 0))
@@ -1228,12 +2330,12 @@ class ResultDialog(tk.Toplevel):
         # buttons first (bottom) so they never get squeezed out when the window is small
         btns = ttk.Frame(body)
         btns.pack(side="bottom", fill="x", pady=(14, 0))
-        ttk.Button(btns, text="Εκτύπωση", style='Print.TButton',
+        ttk.Button(btns, text=T("Εκτύπωση", "Print"), style='Print.TButton',
                    command=self.print_now).pack(side="left")
-        ttk.Button(btns, text="Άνοιγμα PDF", command=lambda: open_file(out_path)).pack(side="left", padx=8)
-        ttk.Button(btns, text="Άνοιγμα φακέλου",
+        ttk.Button(btns, text=T("Άνοιγμα PDF", "Open PDF"), command=lambda: open_file(out_path)).pack(side="left", padx=8)
+        ttk.Button(btns, text=T("Άνοιγμα φακέλου", "Open folder"),
                    command=lambda: open_file(os.path.dirname(out_path) or ".")).pack(side="left")
-        ttk.Button(btns, text="Κλείσιμο", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text=T("Κλείσιμο", "Close"), command=self.destroy).pack(side="right")
 
         self.print_var = tk.StringVar()
         self.print_lbl = ttk.Label(body, textvariable=self.print_var, style='Hint.TLabel', justify="left")
@@ -1243,11 +2345,13 @@ class ResultDialog(tk.Toplevel):
             self._show_print(*print_status)
 
         steps = ttk.Label(body, justify="left",
-                          text="Επόμενα βήματα: εκτυπώστε το δελτίο, γράψτε το όνομα, βάλτε υπογραφή και σφραγίδα "
-                               "και υποβάλετε το στην ΕΛΣΤΑΤ.")
+                          text=T("Επόμενα βήματα: εκτυπώστε το δελτίο, γράψτε το όνομα, βάλτε υπογραφή και σφραγίδα "
+                                 "και υποβάλετε το στην ΕΛΣΤΑΤ.",
+                                 "Next steps: print the form, write your name, sign and stamp it, "
+                                 "and submit it to ELSTAT."))
         steps.pack(side="bottom", anchor="w", fill="x", pady=(10, 0))
         autowrap(steps, self, margin=50, minimum=260)
-        where = ttk.Label(body, text="Αποθηκεύτηκε στο:\n" + out_path, style='Hint.TLabel', justify="left")
+        where = ttk.Label(body, text=T("Αποθηκεύτηκε στο:\n", "Saved to:\n") + out_path, style='Hint.TLabel', justify="left")
         where.pack(side="bottom", anchor="w", fill="x", pady=(10, 0))
         autowrap(where, self, margin=50, minimum=260)
 
@@ -1255,13 +2359,13 @@ class ResultDialog(tk.Toplevel):
         tree_frame.pack(side="top", fill="both", expand=True)
         tree = ttk.Treeview(tree_frame, columns=('c', 'n'), show='tree headings',
                             height=min(len(result['summary']), 12))
-        tree.heading('#0', text='Κατηγορία (όπως στο δελτίο)', anchor='w')
-        tree.heading('c', text='Πελάτες')
-        tree.heading('n', text='Διανυκτερεύσεις')
+        tree.heading('#0', text=T('Κατηγορία (όπως στο δελτίο)', 'Category (as on the form)'), anchor='w')
+        tree.heading('c', text=T('Πελάτες', 'Guests'))
+        tree.heading('n', text=T('Διανυκτερεύσεις', 'Overnight stays'))
         tree.column('#0', width=270, minwidth=180, stretch=True)
         tree.column('c', width=90, minwidth=70, anchor='e', stretch=False)
         tree.column('n', width=130, minwidth=100, anchor='e', stretch=False)
-        tree.tag_configure('bold', font=(FONT, 10, 'bold'), background='#e8f0fe')
+        tree.tag_configure('bold', font=(FONT, 10, 'bold'), background=ROW_BOLD)
         tree.tag_configure('plain', background=CARD)
         for label, c, n, bold in result['summary']:
             tree.insert('', 'end', text=label, values=(c, n), tags=('bold' if bold else 'plain',))
@@ -1289,24 +2393,33 @@ class ResultDialog(tk.Toplevel):
         self._show_print(*print_file(self.out_path))
 
 
-class ElstatApp(tk.Tk):
+class ElstatApp(TkBase):
     def __init__(self):
         super().__init__()
-        self.title("ΕΛΣΤΑΤ – Μηνιαίο Δελτίο Κίνησης Καταλύματος")
         self.geometry("920x840")
         self.minsize(640, 560)
         self.configure(bg=BG)
 
         self._storage_notices = init_storage()
+        load_custom_country_mappings()
         self.prefs = load_prefs()
+        set_language(self.prefs['language'])
+        set_theme(self.prefs['theme'])
+        self.configure(bg=BG)
         self.current_settings = load_hotel_settings()
+        self._rebuilding = False
         self.output_custom = False      # True once the user picks the output file themselves
         self._busy = False
         self._loaded_excel = None
+        self._help_last = 'start'       # section of the user guide that was open last
+        self._help_prev = None          # tab to return to from the guide
+        self._last_tab = None
 
         setup_styles(self)
         self._init_vars()
         self._build_ui()
+        install_edit_shortcuts(self)
+        self._register_drag_drop_targets()
         self.pv['filename_pattern'].trace_add('write', self._update_name_note)
         self._after_prefs_change()
 
@@ -1322,12 +2435,21 @@ class ElstatApp(tk.Tk):
         self.bind_all('<Button-4>', self._on_wheel)
         self.bind_all('<Button-5>', self._on_wheel)
         self.bind('<Control-o>', lambda e: self.browse_excel())
+        self.bind('<F1>', lambda e: self.open_help())
+        self.bind('<Control-f>', self._help_find)
         self.bind('<Control-Return>', self._try_generate)
         self.bind('<Control-p>', lambda e: self._try_generate(print_after=True))
         self._center()
+        if not DND_AVAILABLE and DND_ERROR:
+            self._status("Drag & drop unavailable: " + DND_ERROR)
+        elif not DND_AVAILABLE:
+            self._status(T("Για μεταφορά αρχείων με drag & drop εγκαταστήστε: pip install tkinterdnd2",
+                           f"For drag-and-drop support run: \"{sys.executable}\" -m pip install tkinterdnd2"))
+        self.after(100, self._apply_titlebar)
         self.after(150, self.excel_btn.focus_set)
         if self._storage_notices:
-            self.after(400, lambda: messagebox.showinfo("Ρυθμίσεις", "\n\n".join(self._storage_notices),
+            self.after(400, lambda: messagebox.showinfo(T("Ρυθμίσεις", "Settings"),
+                                                        "\n\n".join(T(*n) for n in self._storage_notices),
                                                         parent=self))
 
     # ------------------------------------------------------------------ setup
@@ -1335,48 +2457,72 @@ class ElstatApp(tk.Tk):
         cs = self.current_settings
         self.set_vars = {k: tk.StringVar(value=cs.get(k, '')) for k in SETTING_KEYS}
         # month details start EMPTY: the Excel fills most of them, the rest are typed by hand
-        self.mon_vars = {k: tk.StringVar() for k in ('year', 'month', 'date_to', 'days_of_month', 'employees')}
+        self.mon_vars = {k: tk.StringVar() for k in ('year', 'month', 'date_to', 'days_of_month', 'employees', 'sign_date')}
+        self.mon_vars['sign_date'].set(datetime.date.today().strftime('%d/%m/%Y'))   # today unless changed
         self.excel_var = tk.StringVar()
         self.out_var = tk.StringVar(value=self._suggest_output())
         saved_tpl = self.prefs.get('template_pdf', '')
         self.pdf_var = tk.StringVar(value=saved_tpl if saved_tpl and os.path.isfile(saved_tpl) else DEFAULT_TEMPLATE)
         self.period_var = tk.StringVar()
+        self._period_msg = (lambda: T("Πατήστε «Επιλογή Excel…» και διαλέξτε το αρχείο «Nationalities Statistics» "
+                                      "που βγάζει το Protel (.xls ή .xlsx).",
+                                      "Click “Choose Excel…” and select the “Nationalities Statistics” file "
+                                      "produced by Protel (.xls or .xlsx)."), 'CardHint.TLabel')
         self.month_name_var = tk.StringVar()
         self.afm_counter_var = tk.StringVar()
         self.check_var = tk.StringVar()
         self.entries = {}
-        self.status_var = tk.StringVar(value="Έτοιμο.")
+        self.status_var = tk.StringVar(value=T("Έτοιμο.", "Ready."))
         self.hist_year_var = tk.StringVar()
         self.hist_metric_var = tk.StringVar(value='nights')
+        self.hist_country_var = tk.StringVar()
+        self.top_title_var = tk.StringVar()
+        self._countries = []
         self._hist = {}
         self._reminder_dismissed = False
         # settings-tab variables
         self.pv = {k: tk.StringVar(value=self.prefs[k])
-                   for k in ('output_mode', 'output_dir', 'filename_pattern', 'excel_dir')}
+                   for k in ('language', 'theme', 'output_mode', 'output_dir', 'filename_pattern', 'excel_dir')}
         self.pv.update({k: tk.BooleanVar(value=self.prefs[k]) for k in BOOL_PREFS})
         self.data_dir_var = tk.StringVar(value=DATA_DIR)
         self.name_note_var = tk.StringVar()
         self.out_note_var = tk.StringVar()
 
     def _build_ui(self):
-        header = tk.Frame(self, bg=NAVY)
+        self.title(T("ΕΛΣΤΑΤ – Μηνιαίο Δελτίο Κίνησης Καταλύματος",
+                     "ELSTAT – Monthly Accommodation Movement Report"))
+        header = tk.Frame(self, bg=HEADER_BG)
         header.pack(fill="x")
-        row = tk.Frame(header, bg=NAVY)
-        row.pack(fill="x", padx=22, pady=16)
-        tk.Label(row, text="ΕΛΣΤΑΤ", bg=ACCENT, fg="white", font=(FONT, 11, 'bold'),
-                 padx=12, pady=6).pack(side="left", anchor="n")
-        texts = tk.Frame(row, bg=NAVY)
-        texts.pack(side="left", fill="x", expand=True, padx=(16, 0))
-        title = tk.Label(texts, text="Μηνιαίο Δελτίο Κίνησης Τουριστικού Καταλύματος", bg=NAVY, fg="white",
+        row = tk.Frame(header, bg=HEADER_BG)
+        row.pack(fill="x", padx=26, pady=18)
+        tk.Label(row, text=T("ΕΛΣΤΑΤ", "ELSTAT"), bg=ACCENT, fg="white", font=(FONT, 10, 'bold'),
+                 padx=13, pady=8).pack(side="left", anchor="n")
+        self.theme_btn = tk.Label(row, text="\u2600" if THEME == 'dark' else "\u263e", bg=HEADER_BG, fg=HEADER_MUTED,
+                                  font=(FONT, 17), cursor='hand2', padx=9)
+        self.theme_btn.pack(side="right", anchor="n")
+        self.theme_btn.bind('<Button-1>', lambda e: self._toggle_theme())
+        self.theme_btn.bind('<Enter>', lambda e: self.theme_btn.configure(fg=HEADER_FG))
+        self.theme_btn.bind('<Leave>', lambda e: self.theme_btn.configure(fg=HEADER_MUTED))
+        self.help_btn = tk.Label(row, text="?", bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 15, 'bold'), cursor='hand2', padx=9)
+        self.help_btn.pack(side="right", anchor="n")
+        self.help_btn.bind('<Button-1>', lambda e: self.open_help())
+        self.help_btn.bind('<Enter>', lambda e: self.help_btn.configure(fg=HEADER_FG))
+        self.help_btn.bind('<Leave>', lambda e: self.help_btn.configure(fg=HEADER_MUTED))
+        texts = tk.Frame(row, bg=HEADER_BG)
+        texts.pack(side="left", fill="x", expand=True, padx=(14, 0))
+        title = tk.Label(texts, text=T("Μηνιαίο Δελτίο Κίνησης Τουριστικού Καταλύματος",
+                                       "Monthly Tourist Accommodation Movement Report"), bg=HEADER_BG, fg=HEADER_FG,
                          font=(FONT, 16, 'bold'), justify="left")
         title.pack(anchor="w")
-        sub = tk.Label(texts, text="Διαλέξτε το Excel από το Protel και το πρόγραμμα συμπληρώνει και "
-                                   "εκτυπώνει το δελτίο της ΕΛΣΤΑΤ.", bg=NAVY, fg="#b6c4d8",
+        sub = tk.Label(texts, text=T("Διαλέξτε το Excel από το Protel και το πρόγραμμα συμπληρώνει και "
+                                     "εκτυπώνει το δελτίο της ΕΛΣΤΑΤ.",
+                                     "Choose the Excel from Protel and the program fills in and "
+                                     "prints the ELSTAT form."), bg=HEADER_BG, fg=HEADER_MUTED,
                        font=(FONT, 10), justify="left")
         sub.pack(anchor="w", pady=(2, 0))
         autowrap(title, header, margin=150)
         autowrap(sub, header, margin=150)
-        tk.Frame(self, height=3, bg=ACCENT).pack(fill="x")      # accent stripe
+        tk.Frame(self, height=3, bg=ACCENT).pack(fill="x")      # subtle accent under the branded header
 
         bar = ttk.Frame(self, style='Card.TFrame')
         bar.pack(side="bottom", fill="x")
@@ -1384,19 +2530,24 @@ class ElstatApp(tk.Tk):
         ttk.Label(bar, textvariable=self.status_var, style='Status.TLabel').pack(fill="x")
 
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(expand=True, fill="both", padx=12, pady=(10, 0))
+        self.notebook.pack(expand=True, fill="both", padx=18, pady=(14, 0))
         self.tab_report = ttk.Frame(self.notebook)
         self.tab_hotel = ttk.Frame(self.notebook)
         self.tab_history = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_report, text="Δελτίο μήνα")
-        self.notebook.add(self.tab_hotel, text="Στοιχεία ξενοδοχείου")
-        self.notebook.add(self.tab_history, text="Ιστορικό")
-        self.notebook.add(self.tab_settings, text="Ρυθμίσεις")
+        self.tab_help = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_report, text=T("Δελτίο μήνα", "Monthly form"))
+        self.notebook.add(self.tab_hotel, text=T("Στοιχεία ξενοδοχείου", "Hotel details"))
+        self.notebook.add(self.tab_history, text=T("Ιστορικό", "History"))
+        self.notebook.add(self.tab_settings, text=T("Ρυθμίσεις", "Settings"))
+        self.notebook.add(self.tab_help, text=T("Οδηγός", "Guide"))
+        self.notebook.bind('<<NotebookTabChanged>>', self._tab_changed)
         self._build_report_tab()
         self._build_hotel_tab()
         self._build_history_tab()
         self._build_settings_tab()
+        self.guide = HelpPanel(self.tab_help, self, self._help_last)
+        self.guide.pack(fill="both", expand=True)
         self.refresh_history()
 
     def _build_report_tab(self):
@@ -1409,72 +2560,97 @@ class ElstatApp(tk.Tk):
         body.columnconfigure(0, weight=1)
 
         # ---- reminder banner (only shown when last month's form is missing)
-        self.reminder_frame = tk.Frame(body, bg='#fef3c7', highlightthickness=1, highlightbackground='#f5d68a')
+        self.reminder_frame = tk.Frame(body, bg=WARN_BG, highlightthickness=1, highlightbackground=WARN_LINE)
         self.reminder_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(12, 0))
-        self.reminder_label = tk.Label(self.reminder_frame, text="", bg='#fef3c7', fg='#92400e',
+        self.reminder_label = tk.Label(self.reminder_frame, text="", bg=WARN_BG, fg=WARN_FG,
                                        font=(FONT, 10), justify="left", anchor="w")
         self.reminder_label.pack(side="left", fill="x", expand=True, padx=12, pady=9)
-        ttk.Button(self.reminder_frame, text="Κλείσιμο", command=self._dismiss_reminder).pack(side="right", padx=8)
+        ttk.Button(self.reminder_frame, text=T("Κλείσιμο", "Close"), command=self._dismiss_reminder).pack(side="right", padx=8)
         autowrap(self.reminder_label, body, margin=190)
         self.reminder_frame.grid_remove()
 
         # ---- Step 1
-        f1 = Card(body, 1, "Αρχείο από το Protel")
+        f1 = self.excel_card = Card(body, 1, T("Αρχείο από το Protel", "File from Protel"))
         f1.grid(row=1, column=0, sticky="ew", padx=4, pady=(12, 6))
         c1 = f1.body
         c1.columnconfigure(0, weight=1)
+        self.excel_zone = DropZone(c1, self.browse_excel)
+        self.excel_zone.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(2, 12))
         ent = ttk.Entry(c1, textvariable=self.excel_var)
-        ent.grid(row=0, column=0, sticky="ew")
+        self.excel_path_entry = ent
+        ent.grid(row=1, column=0, sticky="ew")
         ent.bind('<FocusOut>', self._excel_typed)
         ent.bind('<Return>', self._excel_typed)
-        self.excel_btn = ttk.Button(c1, text="Επιλογή Excel…", command=self.browse_excel)
-        self.excel_btn.grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(c1, text="Πιο πρόσφατο", command=self.use_recent_excel).grid(row=0, column=2, padx=(6, 0))
+        self.excel_btn = ttk.Button(c1, text=T("Επιλογή Excel…", "Choose Excel…"), command=self.browse_excel)
+        self.excel_btn.grid(row=1, column=1, padx=(8, 0))
+        ttk.Button(c1, text=T("Πιο πρόσφατο", "Latest"), command=self.use_recent_excel).grid(row=1, column=2, padx=(6, 0))
         self.period_label = ttk.Label(c1, textvariable=self.period_var, style='CardHint.TLabel', justify="left")
-        self.period_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.period_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
         autowrap(self.period_label, body, margin=110)
 
         # live preview of what the Excel contains (appears after a file is chosen)
         self.preview_frame = ttk.Frame(c1, style='Card.TFrame')
-        self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.preview_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         self.preview_frame.columnconfigure(0, weight=1)
         self.preview_summary = ttk.Label(self.preview_frame, text="", style='CardBold.TLabel', justify="left")
         self.preview_summary.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         autowrap(self.preview_summary, body, margin=110)
         self.preview_tree = ttk.Treeview(self.preview_frame, columns=('p', 'n', 's'), show='tree headings', height=6)
-        self.preview_tree.heading('#0', text='Χώρα (όπως στο Excel)', anchor='w')
-        self.preview_tree.heading('p', text='Πελάτες')
-        self.preview_tree.heading('n', text='Διανυκτ.')
-        self.preview_tree.heading('s', text='Στο δελτίο', anchor='w')
+        self.preview_tree.heading('#0', text=T('Χώρα (όπως στο Excel)', 'Country (as in the Excel)'), anchor='w')
+        self.preview_tree.heading('p', text=T('Πελάτες', 'Guests'))
+        self.preview_tree.heading('n', text=T('Διανυκτ.', 'Nights'))
+        self.preview_tree.heading('s', text=T('Στο δελτίο', 'On the form'), anchor='w')
         self.preview_tree.column('#0', width=220, minwidth=140, stretch=True)
         self.preview_tree.column('p', width=80, minwidth=60, anchor='e', stretch=False)
         self.preview_tree.column('n', width=80, minwidth=60, anchor='e', stretch=False)
         self.preview_tree.column('s', width=190, minwidth=120, stretch=False)
-        self.preview_tree.tag_configure('bad', foreground=BAD, background='#fee2e2')
+        self.preview_tree.tag_configure('bad', foreground=BAD, background=BAD_BG)
         self.preview_tree.tag_configure('ok', background=CARD)
         psb = ttk.Scrollbar(self.preview_frame, orient="vertical", command=self.preview_tree.yview)
         self.preview_tree.configure(yscrollcommand=psb.set)
         self.preview_tree.grid(row=1, column=0, sticky="ew")
         psb.grid(row=1, column=1, sticky="ns")
+        self.preview_tree.bind('<Double-1>', self._map_selected_country)
+        self.map_country_btn = ttk.Button(
+            self.preview_frame,
+            text=T("Προσθήκη / αντιστοίχιση επιλεγμένης χώρας…", "Add / map selected country…"),
+            command=self._map_selected_country)
+        self.map_country_btn.grid(row=2, column=0, sticky="w", pady=(8, 2))
+        self.preview_hint = ttk.Label(
+            self.preview_frame,
+            text=T("Επιλέξτε την κόκκινη χώρα και πατήστε εδώ για να τη βάλετε στη σωστή γραμμή του δελτίου.",
+                   "Select a red country and click here to assign it to the correct form row."),
+            style='CardHint.TLabel', wraplength=620, justify='left')
+        self.preview_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.preview_frame.grid_remove()
-        self.period_var.set("Πατήστε «Επιλογή Excel…» και διαλέξτε το αρχείο «Nationalities Statistics» "
-                            "που βγάζει το Protel (.xls ή .xlsx).")
+        self._render_period()
 
         # ---- Step 2
-        f2 = Card(body, 2, "Στοιχεία του μήνα")
+        f2 = self.month_card = Card(body, 2, T("Στοιχεία του μήνα", "Month details"))
         f2.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
         c2 = f2.body
         c2.columnconfigure(2, weight=1)
+        c2.columnconfigure(3, minsize=24)
+        self.month_field_status = {}
         fields = [
-            ("Έτος", 'year', 8, "αυτόματα από το Excel"),
-            ("Μήνας (αριθμός)", 'month', 8, None),
-            ("Τελευταία ημέρα («Έως»)", 'date_to', 14, "αυτόματα από το Excel (ΗΗ/ΜΜ/ΕΕΕΕ)"),
-            ("Ημέρες λειτουργίας", 'days_of_month', 8, "αυτόματα από το Excel"),
-            ("Σύνολο εργαζομένων", 'employees', 8,
-             "✎ ΔΕΝ υπάρχει στο Excel - πληκτρολογήστε το εσείς (στο τέλος του μήνα, "
-             "μαζί με ιδιοκτήτες/οικογένεια)" +
-             (f"  ·  τελευταία φορά: {self.current_settings['last_employees']}"
+            (T("Έτος", "Year"), 'year', 8, T("αυτόματα από το Excel", "filled in from the Excel")),
+            (T("Μήνας (αριθμός)", "Month (number)"), 'month', 8, None),
+            (T("Τελευταία ημέρα («Έως»)", "Last day (“To”)"), 'date_to', 14, T("αυτόματα από το Excel (ΗΗ/ΜΜ/ΕΕΕΕ)",
+                                                         "filled in from the Excel (DD/MM/YYYY)")),
+            (T("Ημέρες λειτουργίας", "Operating days"), 'days_of_month', 8, T("αυτόματα από το Excel", "filled in from the Excel")),
+            (T("Σύνολο εργαζομένων", "Total employees"), 'employees', 8,
+             T("✎ ΔΕΝ υπάρχει στο Excel - πληκτρολογήστε το εσείς (στο τέλος του μήνα, "
+               "μαζί με ιδιοκτήτες/οικογένεια)",
+               "✎ NOT in the Excel - type it yourself (at the end of the month, "
+               "including owners/family)") +
+             (T(f"  ·  τελευταία φορά: {self.current_settings['last_employees']}",
+                f"  ·  last time: {self.current_settings['last_employees']}")
               if self.current_settings.get('last_employees') else "")),
+            (T("Ημερομηνία υπογραφής", "Signing date"), 'sign_date', 14,
+             T("συμπληρώνεται αυτόματα με τη σημερινή - αλλάξτε την (ΗΗ/ΜΜ/ΕΕΕΕ) αν το δελτίο "
+               "πρέπει να φαίνεται υπογεγραμμένο άλλη μέρα",
+               "filled in automatically with today's date - change it (DD/MM/YYYY) if the form "
+               "should look signed on another day")),
         ]
         for i, (lbl, key, width, hint) in enumerate(fields):
             ttk.Label(c2, text=lbl + ":", style='Card.TLabel').grid(row=i, column=0, sticky="e",
@@ -1486,18 +2662,35 @@ class ElstatApp(tk.Tk):
                 ttk.Label(c2, textvariable=self.month_name_var, style='CardGood.TLabel',
                           font=(FONT, 10, 'bold')).grid(row=i, column=2, sticky="w", padx=12)
             else:
-                h = ttk.Label(c2, text=hint, style='CardHint.TLabel', justify="left")
+                h = ttk.Label(c2, text=hint, style='CardWarn.TLabel' if key == 'employees' else 'CardHint.TLabel',
+                              justify="left")
                 h.grid(row=i, column=2, sticky="w", padx=12)
                 autowrap(h, body, margin=430, minimum=140)
+            # Small completion marker at the end of each row; it follows the app's
+            # existing card styling and updates whenever the field changes.
+            marker = ttk.Label(c2, text="○", style='CardHint.TLabel',
+                               font=(FONT, 12, 'bold'), anchor='center', width=2)
+            marker.grid(row=i, column=3, sticky='e', padx=(8, 0), pady=5)
+            self.month_field_status[key] = marker
+            self.mon_vars[key].trace_add('write', self._update_month_field_status)
+
+        self.month_status_legend = ttk.Label(
+            c2, text=T("● Συμπληρωμένο     ○ Εκκρεμεί", "● Complete     ○ Pending"),
+            style='CardHint.TLabel', font=(FONT, 8))
+        self.month_status_legend.grid(row=len(fields), column=1, columnspan=3,
+                                      sticky='w', padx=(0, 8), pady=(5, 0))
+        self._update_month_field_status()
 
         # ---- Step 3
-        f3 = Card(body, 3, "Πού να αποθηκευτεί το PDF")
+        f3 = self.output_card = Card(body, 3, T("Πού να αποθηκευτεί το PDF", "Where to save the PDF"))
         f3.grid(row=3, column=0, sticky="ew", padx=4, pady=(6, 14))
         c3 = f3.body
         c3.columnconfigure(0, weight=1)
-        ttk.Entry(c3, textvariable=self.out_var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(c3, text="Αλλαγή…", command=self.browse_output).grid(row=0, column=1, padx=(8, 0))
-        h3 = ttk.Label(c3, text="Προτείνεται αυτόματα με βάση την καρτέλα «Ρυθμίσεις» (φάκελος και όνομα αρχείου).",
+        self.output_path_entry = ttk.Entry(c3, textvariable=self.out_var)
+        self.output_path_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(c3, text=T("Αλλαγή…", "Change…"), command=self.browse_output).grid(row=0, column=1, padx=(8, 0))
+        h3 = ttk.Label(c3, text=T("Προτείνεται αυτόματα με βάση την καρτέλα «Ρυθμίσεις» (φάκελος και όνομα αρχείου).",
+                                  "Suggested automatically based on the “Settings” tab (folder and file name)."),
                        style='CardHint.TLabel', justify="left")
         h3.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         autowrap(h3, body, margin=110)
@@ -1515,14 +2708,16 @@ class ElstatApp(tk.Tk):
         btnrow.pack(fill="x", padx=14, pady=(4, 2))
         btnrow.columnconfigure(0, weight=1, uniform='b')
         btnrow.columnconfigure(1, weight=1, uniform='b')
-        self.run_btn = ttk.Button(btnrow, text="Δημιουργία PDF", style='Primary.TButton',
+        self.run_btn = ttk.Button(btnrow, text=T("Δημιουργία PDF", "Create PDF"), style='Primary.TButton',
                                   command=self.generate)
         self.run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.print_btn = ttk.Button(btnrow, text="Δημιουργία & Εκτύπωση", style='Print.TButton',
+        self.print_btn = ttk.Button(btnrow, text=T("Δημιουργία & Εκτύπωση", "Create & Print"), style='Print.TButton',
                                     command=lambda: self.generate(print_after=True))
         self.print_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        ttk.Label(bottom, text="Συντομεύσεις:  Ctrl+O = επιλογή Excel  ·  Ctrl+Enter = δημιουργία  ·  "
-                               "Ctrl+P = δημιουργία & εκτύπωση",
+        ttk.Label(bottom, text=T("Συντομεύσεις:  Ctrl+O = επιλογή Excel  ·  Ctrl+Enter = δημιουργία  ·  "
+                                 "Ctrl+P = δημιουργία & εκτύπωση  ·  F1 = οδηγός",
+                                 "Shortcuts:  Ctrl+O = choose Excel  ·  Ctrl+Enter = create  ·  "
+                                 "Ctrl+P = create & print  ·  F1 = guide"),
                   style='CardHint.TLabel').pack(anchor="e", padx=16, pady=(4, 10))
 
     def _build_hotel_tab(self):
@@ -1531,18 +2726,21 @@ class ElstatApp(tk.Tk):
         body = sf.body
         body.columnconfigure(0, weight=1)
 
-        card = Card(body, None, "Στοιχεία ξενοδοχείου (αλλάζουν σπάνια)")
+        card = Card(body, None, T("Στοιχεία ξενοδοχείου (αλλάζουν σπάνια)", "Hotel details (rarely change)"))
         card.grid(row=0, column=0, sticky="ew", padx=4, pady=(12, 6))
         f = card.body
         f.columnconfigure(1, weight=1)          # entries stretch with the window
         fields = [
-            ("Είδος καταλύματος", 'type', "όπως θέλετε να γραφτεί στο δελτίο"),
-            ("Τίτλος καταλύματος", 'name', "το όνομα όπως θα εμφανιστεί στο δελτίο"),
-            ("Κατηγορία", 'category', "όπως θέλετε να γραφτεί στο δελτίο"),
+            (T("Είδος καταλύματος", "Property type"), 'type', T("όπως θέλετε να γραφτεί στο δελτίο",
+                                            "as you want it written on the form")),
+            (T("Τίτλος καταλύματος", "Property name"), 'name', T("το όνομα όπως θα εμφανιστεί στο δελτίο",
+                                             "the name as it will appear on the form")),
+            (T("Κατηγορία", "Category"), 'category', T("όπως θέλετε να γραφτεί στο δελτίο",
+                                        "as you want it written on the form")),
             ("E-mail", 'email', None),
-            ("Τηλέφωνο", 'phone', None),
-            ("Α.Φ.Μ.", 'afm', "ακριβώς 9 ψηφία"),
-            ("Επωνυμία επιχείρησης", 'company', None),
+            (T("Τηλέφωνο", "Phone"), 'phone', None),
+            (T("Α.Φ.Μ.", "Tax ID (AFM)"), 'afm', T("ακριβώς 9 ψηφία", "exactly 9 digits")),
+            (T("Επωνυμία επιχείρησης", "Business name"), 'company', None),
         ]
         r = 0
         for lbl, key, hint in fields:
@@ -1563,23 +2761,31 @@ class ElstatApp(tk.Tk):
             r += 2
 
         if os.path.exists(SETTINGS_CSV):
-            note = ("Τα στοιχεία διαβάστηκαν από το αρχείο hotel_settings.csv. Αν τα αλλάξετε, αποθηκεύονται "
-                    "αυτόματα όταν δημιουργήσετε δελτίο.")
+            note = (T("Τα στοιχεία διαβάστηκαν από το αρχείο hotel_settings.csv. Αν τα αλλάξετε, αποθηκεύονται "
+                      "αυτόματα όταν δημιουργήσετε δελτίο.",
+                      "The details were read from the file hotel_settings.csv. If you change them, "
+                      "they are saved automatically when you create a form."))
         else:
-            note = ("Δεν βρέθηκε το αρχείο hotel_settings.csv. Συμπληρώστε τα στοιχεία εδώ - θα αποθηκευτούν "
-                    "αυτόματα την πρώτη φορά που θα δημιουργήσετε δελτίο και δεν θα τα ξαναγράψετε.")
+            note = (T("Δεν βρέθηκε το αρχείο hotel_settings.csv. Συμπληρώστε τα στοιχεία εδώ - θα αποθηκευτούν "
+                      "αυτόματα την πρώτη φορά που θα δημιουργήσετε δελτίο και δεν θα τα ξαναγράψετε.",
+                      "The file hotel_settings.csv was not found. Fill in the details here - they will "
+                      "be saved automatically the first time you create a form, and you won't have to "
+                      "type them again."))
         nl = ttk.Label(body, text=note, style='Hint.TLabel', justify="left")
         nl.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
         autowrap(nl, body, margin=50)
 
-        card2 = Card(body, None, "Άδειο PDF της ΕΛΣΤΑΤ (template)")
+        card2 = self.template_card = Card(body, None, T("Άδειο PDF της ΕΛΣΤΑΤ (template)", "Blank ELSTAT PDF (template)"))
         card2.grid(row=2, column=0, sticky="ew", padx=4, pady=(6, 14))
         f2 = card2.body
         f2.columnconfigure(0, weight=1)
-        ttk.Entry(f2, textvariable=self.pdf_var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(f2, text="Αναζήτηση…", command=self.browse_pdf).grid(row=0, column=1, padx=(8, 0))
-        h2 = ttk.Label(f2, text="Το κενό δελτίο πάνω στο οποίο γράφονται τα στοιχεία. "
-                                "Συνήθως δεν χρειάζεται να το αλλάξετε.", style='CardHint.TLabel', justify="left")
+        self.template_path_entry = ttk.Entry(f2, textvariable=self.pdf_var)
+        self.template_path_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(f2, text=T("Αναζήτηση…", "Browse…"), command=self.browse_pdf).grid(row=0, column=1, padx=(8, 0))
+        h2 = ttk.Label(f2, text=T("Το κενό δελτίο πάνω στο οποίο γράφονται τα στοιχεία. "
+                                  "Συνήθως δεν χρειάζεται να το αλλάξετε.",
+                                  "The blank form on which the details are written. "
+                                  "You usually don't need to change it."), style='CardHint.TLabel', justify="left")
         h2.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         autowrap(h2, body, margin=110)
 
@@ -1591,6 +2797,19 @@ class ElstatApp(tk.Tk):
         body.columnconfigure(0, weight=1)
         pv = self.pv
 
+        # Give the Settings page a little more breathing room without changing
+        # its controls, wording, colours, or behaviour.
+        def polish_settings_card(card):
+            card.configure(highlightthickness=1, highlightbackground=BORDER)
+            children = card.winfo_children()
+            if children:
+                inner = children[0]
+                inner_children = inner.winfo_children()
+                if inner_children:
+                    head = inner_children[0]
+                    head.pack_configure(pady=(18, 5))
+                card.body.configure(padding=(22, 11, 22, 21))
+
         def hint(parent, text, row, columnspan=1, pady=(8, 0), margin=110, padx=0):
             lbl = ttk.Label(parent, text=text, style='CardHint.TLabel', justify="left")
             lbl.grid(row=row, column=0, columnspan=columnspan, sticky="w", pady=pady, padx=padx)
@@ -1601,24 +2820,51 @@ class ElstatApp(tk.Tk):
             entry.bind('<FocusOut>', self._pref_changed)
             entry.bind('<Return>', self._pref_changed)
 
+        # ---- 0. interface language
+        c0 = Card(body, None, T("Γλώσσα και εμφάνιση / Language and appearance", "Language and appearance"))
+        c0.grid(row=0, column=0, sticky="ew", padx=4, pady=(12, 6))
+        polish_settings_card(c0)
+        f0 = c0.body
+        f0.columnconfigure(0, weight=1)
+        lang_row = ttk.Frame(f0, style='Card.TFrame')
+        lang_row.grid(row=0, column=0, sticky="w")
+        for code, label in LANGUAGES.items():       # the names stay in their own language on purpose
+            ttk.Radiobutton(lang_row, text=label, value=code, variable=pv['language'],
+                            style='Card.TRadiobutton',
+                            command=self._language_clicked).pack(side="left", padx=(0, 24))
+        hint(f0, T("Αφορά μόνο το περιβάλλον του προγράμματος και αλλάζει αμέσως. Το επίσημο δελτίο της "
+                   "ΕΛΣΤΑΤ (PDF) συμπληρώνεται πάντα στα ελληνικά.",
+                   "Applies to the program's interface only and changes immediately. The official ELSTAT "
+                   "form (PDF) is always filled in Greek."), 1)
+        theme_row = ttk.Frame(f0, style='Card.TFrame')
+        theme_row.grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(theme_row, text=T("Εμφάνιση:", "Appearance:"), style='CardBold.TLabel').pack(side="left", padx=(0, 16))
+        for code, label in (('light', T("Φωτεινή", "Light")), ('dark', T("Σκούρα", "Dark")),
+                            ('auto', T("Όπως το σύστημα", "Match system"))):
+            ttk.Radiobutton(theme_row, text=label, value=code, variable=pv['theme'],
+                            style='Card.TRadiobutton',
+                            command=self._theme_clicked).pack(side="left", padx=(0, 24))
+
         # ---- 1. where the PDFs go
-        c1 = Card(body, None, "Πού αποθηκεύονται τα PDF")
-        c1.grid(row=0, column=0, sticky="ew", padx=4, pady=(12, 6))
+        c1 = Card(body, None, T("Πού αποθηκεύονται τα PDF", "Where PDFs are saved"))
+        c1.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
+        polish_settings_card(c1)
         f = c1.body
         f.columnconfigure(0, weight=1)
-        for r, (text, value) in enumerate((("Στον φάκελο του προγράμματος", 'program'),
-                                           ("Στον φάκελο του αρχείου Excel (από το Protel)", 'excel'),
-                                           ("Σε συγκεκριμένο φάκελο:", 'custom'))):
+        for r, (text, value) in enumerate(((T("Στον φάκελο του προγράμματος", "In the program folder"), 'program'),
+                                           (T("Στον φάκελο του αρχείου Excel (από το Protel)",
+                                              "In the folder of the Excel file (from Protel)"), 'excel'),
+                                           (T("Σε συγκεκριμένο φάκελο:", "In a specific folder:"), 'custom'))):
             ttk.Radiobutton(f, text=text, value=value, variable=pv['output_mode'], style='Card.TRadiobutton',
                             command=self._pref_changed).grid(row=r, column=0, columnspan=2, sticky="w",
                                                              pady=(0 if r == 0 else 6, 0))
         self.out_dir_entry = ttk.Entry(f, textvariable=pv['output_dir'])
         self.out_dir_entry.grid(row=3, column=0, sticky="ew", padx=(24, 0), pady=(4, 0))
         commit_on(self.out_dir_entry)
-        self.out_dir_btn = ttk.Button(f, text="Αναζήτηση…", command=self.browse_output_dir)
+        self.out_dir_btn = ttk.Button(f, text=T("Αναζήτηση…", "Browse…"), command=self.browse_output_dir)
         self.out_dir_btn.grid(row=3, column=1, padx=(8, 0), pady=(4, 0))
         ttk.Separator(f, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=14)
-        ttk.Label(f, text="Όνομα αρχείου PDF:", style='CardBold.TLabel').grid(row=5, column=0, columnspan=2,
+        ttk.Label(f, text=T("Όνομα αρχείου PDF:", "PDF file name:"), style='CardBold.TLabel').grid(row=5, column=0, columnspan=2,
                                                                               sticky="w")
         name_entry = ttk.Entry(f, textvariable=pv['filename_pattern'])
         name_entry.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -1629,50 +2875,69 @@ class ElstatApp(tk.Tk):
         self.out_note.configure(textvariable=self.out_note_var)
 
         # ---- 2. data folder
-        c2 = Card(body, None, "Φάκελος δεδομένων")
-        c2.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
+        c2 = Card(body, None, T("Φάκελος δεδομένων", "Data folder"))
+        c2.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
+        polish_settings_card(c2)
         f2 = c2.body
         f2.columnconfigure(0, weight=1)
-        ttk.Entry(f2, textvariable=self.data_dir_var, state='readonly').grid(row=0, column=0, sticky="ew")
-        ttk.Button(f2, text="Αλλαγή…", command=self.change_data_dir).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(f2, text="Άνοιγμα", command=lambda: open_file(DATA_DIR)).grid(row=0, column=2, padx=(6, 0))
-        hint(f2, "Εδώ αποθηκεύονται τα στοιχεία του ξενοδοχείου, το ιστορικό, τα αρχειοθετημένα PDF και οι "
-                 "ρυθμίσεις. Μπορείτε να διαλέξετε π.χ. φάκελο μέσα στο OneDrive ώστε να υπάρχει αυτόματο "
-                 "αντίγραφο. Η θέση του φακέλου θυμάται το αρχείο elstat_config.json δίπλα στο πρόγραμμα.",
+        self.data_dir_entry = ttk.Entry(f2, textvariable=self.data_dir_var, state='readonly')
+        self.data_dir_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(f2, text=T("Αλλαγή…", "Change…"), command=self.change_data_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(f2, text=T("Άνοιγμα", "Open"), command=lambda: open_file(DATA_DIR)).grid(row=0, column=2, padx=(6, 0))
+        hint(f2, T("Εδώ αποθηκεύονται τα στοιχεία του ξενοδοχείου, το ιστορικό, τα αρχειοθετημένα PDF και οι "
+                   "ρυθμίσεις. Μπορείτε να διαλέξετε π.χ. φάκελο μέσα στο OneDrive ώστε να υπάρχει αυτόματο "
+                   "αντίγραφο. Η θέση του φακέλου θυμάται το αρχείο elstat_config.json δίπλα στο πρόγραμμα.",
+                   "This is where the hotel details, history, archived PDFs and settings are saved. "
+                   "You can choose, for example, a folder inside OneDrive so that an automatic copy "
+                   "exists. The folder location is remembered in the file elstat_config.json next to "
+                   "the program."),
              1, columnspan=3)
         row2 = ttk.Frame(f2, style='Card.TFrame')
         row2.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Button(row2, text="Προεπιλεγμένος φάκελος",
+        ttk.Button(row2, text=T("Προεπιλεγμένος φάκελος", "Default folder"),
                    command=lambda: self._switch_data_dir(DEFAULT_DATA_DIR)).pack(side="left")
-        ttk.Button(row2, text="Αντίγραφο ασφαλείας (.zip)…", command=self.backup_data).pack(side="left", padx=8)
+        ttk.Button(row2, text=T("Αντίγραφο ασφαλείας (.zip)…", "Backup (.zip)…"), command=self.backup_data).pack(side="left", padx=8)
 
         # ---- 3. Excel folder
-        c3 = Card(body, None, "Αρχεία Excel από το Protel")
-        c3.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
+        c3 = Card(body, None, T("Αρχεία Excel από το Protel", "Excel files from Protel"))
+        c3.grid(row=3, column=0, sticky="ew", padx=4, pady=6)
+        polish_settings_card(c3)
         f3 = c3.body
         f3.columnconfigure(0, weight=1)
         ex_entry = ttk.Entry(f3, textvariable=pv['excel_dir'])
+        self.excel_dir_entry = ex_entry
         ex_entry.grid(row=0, column=0, sticky="ew")
         commit_on(ex_entry)
-        ttk.Button(f3, text="Αναζήτηση…", command=self.browse_excel_dir).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(f3, text="Καθαρισμός", command=self.clear_excel_dir).grid(row=0, column=2, padx=(6, 0))
-        hint(f3, "Από ποιον φάκελο ξεκινούν τα «Επιλογή Excel…» και «Πιο πρόσφατο». "
-                 "Κενό = ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.", 1, columnspan=3)
+        ttk.Button(f3, text=T("Αναζήτηση…", "Browse…"), command=self.browse_excel_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(f3, text=T("Καθαρισμός", "Clear"), command=self.clear_excel_dir).grid(row=0, column=2, padx=(6, 0))
+        hint(f3, T("Από ποιον φάκελο ξεκινούν τα «Επιλογή Excel…» και «Πιο πρόσφατο». "
+                   "Κενό = ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
+                   "The folder where “Choose Excel…” and “Latest” start. "
+                   "Empty = the folder of the last Excel you used."), 1, columnspan=3)
 
         # ---- 4. behaviour
-        c4 = Card(body, None, "Συμπεριφορά του προγράμματος")
-        c4.grid(row=3, column=0, sticky="ew", padx=4, pady=6)
+        c4 = Card(body, None, T("Συμπεριφορά του προγράμματος", "Program behaviour"))
+        c4.grid(row=4, column=0, sticky="ew", padx=4, pady=6)
+        polish_settings_card(c4)
         f4 = c4.body
         f4.columnconfigure(0, weight=1)
         behaviours = [
-            ('open_after', "Άνοιγμα του PDF αμέσως μετά τη δημιουργία", None),
-            ('confirm_overwrite', "Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη", None),
-            ('keep_archive', "Αρχειοθέτηση αντιγράφου κάθε δελτίου στον φάκελο δεδομένων",
-             "Επιτρέπει να ξανανοίξετε ή να εκτυπώσετε παλιούς μήνες από το Ιστορικό. Αν το κλείσετε, το "
-             "δελτίο ξαναφτιάχνεται από τα δεδομένα του ιστορικού όταν το ζητήσετε."),
-            ('show_reminder', "Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα", None),
-            ('prefill_employees', "Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή",
-             "Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο."),
+            ('open_after', T("Άνοιγμα του PDF αμέσως μετά τη δημιουργία",
+                             "Open the PDF right after it is created"), None),
+            ('confirm_overwrite', T("Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη",
+                                    "Ask before replacing a PDF that already exists"), None),
+            ('keep_archive', T("Αρχειοθέτηση αντιγράφου κάθε δελτίου στον φάκελο δεδομένων",
+                               "Archive a copy of every form in the data folder"),
+             T("Επιτρέπει να ξανανοίξετε ή να εκτυπώσετε παλιούς μήνες από το Ιστορικό. Αν το κλείσετε, το "
+               "δελτίο ξαναφτιάχνεται από τα δεδομένα του ιστορικού όταν το ζητήσετε.",
+               "Lets you reopen or print old months from History. If you turn it off, the "
+               "form is rebuilt from the history data when you ask for it.")),
+            ('show_reminder', T("Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα",
+                                "Remind me when last month's form is missing"), None),
+            ('prefill_employees', T("Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή",
+                                    "Pre-fill “Total employees” with the last value"),
+             T("Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
+               "Always check the number before creating the form.")),
         ]
         for r, (key, text, note) in enumerate(behaviours):
             ttk.Checkbutton(f4, text=text, variable=pv[key], style='Card.TCheckbutton',
@@ -1683,10 +2948,11 @@ class ElstatApp(tk.Tk):
 
         # ---- reset
         bottom = ttk.Frame(body)
-        bottom.grid(row=4, column=0, sticky="ew", padx=4, pady=(6, 16))
-        ttk.Button(bottom, text="Επαναφορά ρυθμίσεων", style='Danger.TButton',
+        bottom.grid(row=5, column=0, sticky="ew", padx=4, pady=(6, 16))
+        ttk.Button(bottom, text=T("Επαναφορά ρυθμίσεων", "Reset settings"), style='Danger.TButton',
                    command=self.reset_prefs).pack(side="left")
-        ttk.Label(bottom, text="Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
+        ttk.Label(bottom, text=T("Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
+                                 "Does not delete history or hotel details."),
                   style='Hint.TLabel').pack(side="left", padx=10)
 
     # ---- settings: reading / saving
@@ -1694,7 +2960,8 @@ class ElstatApp(tk.Tk):
         try:
             save_prefs(self.prefs)
         except OSError as e:
-            self._status(f"⚠ Δεν ήταν δυνατή η αποθήκευση των ρυθμίσεων: {e}")
+            self._status(T(f"⚠ Δεν ήταν δυνατή η αποθήκευση των ρυθμίσεων: {e}",
+                           f"⚠ Could not save the settings: {e}"))
 
     def _pref_changed(self, *_):
         p, pv = self.prefs, self.pv
@@ -1709,6 +2976,129 @@ class ElstatApp(tk.Tk):
         self._save_prefs()
         self._after_prefs_change()
 
+    # ---- user guide
+    def goto_tab(self, name):
+        """Opens one of the tabs by name: report, hotel, history, settings."""
+        try:
+            self.notebook.select(getattr(self, 'tab_' + name))
+        except (tk.TclError, AttributeError):
+            pass
+
+    def open_help(self, section=None):
+        """Opens the guide - by default at the section that belongs to the tab you are on."""
+        try:
+            cur = self.notebook.select()
+        except tk.TclError:
+            return
+        if section is None and cur != str(self.tab_help):
+            section = {str(self.tab_report): 'monthly', str(self.tab_hotel): 'hotel',
+                       str(self.tab_history): 'history', str(self.tab_settings): 'settings'}.get(cur)
+        if cur != str(self.tab_help):
+            self._help_prev = cur
+        self.notebook.select(self.tab_help)
+        if section:
+            self.guide.show(section)
+        self.guide.refresh_back()
+
+    def _help_find(self, _event=None):
+        """Ctrl+F: jump to the search box of the guide when the guide is open."""
+        try:
+            if self.notebook.select() == str(self.tab_help):
+                self.guide.focus_search()
+                return 'break'
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _tab_changed(self, _event=None):
+        if not hasattr(self, 'guide'):
+            return
+        try:
+            cur = self.notebook.select()
+        except tk.TclError:
+            return
+        if cur == str(self.tab_help):
+            if self._last_tab and self._last_tab != cur:
+                self._help_prev = self._last_tab
+            self.guide.refresh_back()
+        else:
+            self._last_tab = cur
+
+    def _rebuild_screen(self):
+        """Builds the whole screen again (language / theme change). Typed-in values are kept."""
+        self._rebuilding = True                     # the field-change traces must not touch half-built widgets
+        try:
+            try:
+                tab = self.notebook.index(self.notebook.select())
+            except tk.TclError:
+                tab = 0
+            for w in self.winfo_children():
+                w.destroy()
+            self.entries = {}
+            self._build_ui()
+            self._register_drag_drop_targets()
+            self.notebook.select(tab)
+        finally:
+            self._rebuilding = False
+        self._after_prefs_change()
+        self.refresh_validation()
+        self._render_period()
+        if self._loaded_excel and os.path.isfile(self._loaded_excel):
+            self.load_preview(self._loaded_excel)
+
+    def _theme_clicked(self):
+        code = self.pv['theme'].get()
+        if code == self.prefs['theme']:
+            return
+        self.prefs['theme'] = code
+        self._save_prefs()
+        self.after_idle(self._apply_theme)
+
+    def _toggle_theme(self):
+        """The sun / moon button in the header: switches between light and dark."""
+        self.prefs['theme'] = 'light' if THEME == 'dark' else 'dark'
+        self._save_prefs()
+        self.after_idle(self._apply_theme)
+
+    def _apply_theme(self):
+        set_theme(self.prefs['theme'])
+        self.pv['theme'].set(self.prefs['theme'])
+        setup_styles(self)
+        self.configure(bg=BG)
+        self._rebuild_screen()
+        self._apply_titlebar()
+        self._status(T("Η εμφάνιση άλλαξε σε σκούρα." if THEME == 'dark' else "Η εμφάνιση άλλαξε σε φωτεινή.",
+                       "Switched to the dark appearance." if THEME == 'dark' else "Switched to the light appearance."))
+
+    def _apply_titlebar(self):
+        """Windows only: dark title bar when the dark theme is on."""
+        if not sys.platform.startswith('win'):
+            return
+        try:
+            import ctypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            val = ctypes.c_int(1 if THEME == 'dark' else 0)
+            for attr in (20, 19):          # 20 = Windows 11 / newer 10, 19 = older Windows 10
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                    break
+        except Exception:
+            pass
+
+    def _language_clicked(self):
+        code = self.pv['language'].get()
+        if code == LANG:
+            return
+        self.prefs['language'] = code
+        self._save_prefs()
+        self.after_idle(self._apply_language)       # not inside the click that is about to be destroyed
+
+    def _apply_language(self):
+        """Switches the interface language: the screen is built again, all typed-in values are kept."""
+        set_language(self.prefs['language'])
+        self.pv['language'].set(self.prefs['language'])
+        self._rebuild_screen()
+        self._status(T("Η γλώσσα άλλαξε σε Ελληνικά.", "Language changed to English."))
+
     def _sync_pref_vars(self):
         for k, var in self.pv.items():
             var.set(self.prefs[k])
@@ -1719,20 +3109,25 @@ class ElstatApp(tk.Tk):
             w.state(['!disabled' if custom else 'disabled'])
         self._update_name_note()
         self._refresh_output_suggestion()
-        self.out_note_var.set("Στο Βήμα 3 του δελτίου προτείνεται: " + self._suggest_output() +
-                              "  (μπορείτε πάντα να το αλλάξετε εκεί)")
+        self.out_note_var.set(T("Στο Βήμα 3 του δελτίου προτείνεται: ",
+                                "In Step 3 of the form the suggestion is: ") + self._suggest_output() +
+                              T("  (μπορείτε πάντα να το αλλάξετε εκεί)", "  (you can always change it there)"))
         self.update_reminder()
 
     def _update_name_note(self, *_):
+        if self._rebuilding:
+            return
         pattern = self.pv['filename_pattern'].get().strip()
         err = pattern_error(pattern)
         if err:
-            self.name_note_var.set("⚠ " + err + " (δεν αποθηκεύτηκε)")
+            self.name_note_var.set("⚠ " + err + T(" (δεν αποθηκεύτηκε)", " (not saved)"))
             self.name_note.configure(style='CardBad.TLabel')
         else:
             today = datetime.date.today()
-            self.name_note_var.set(f"Παράδειγμα: {build_pdf_name(pattern, today.year, today.month)}   ·   " +
-                                   "{year} = έτος, {month} = μήνας (2 ψηφία)")
+            self.name_note_var.set(T(f"Παράδειγμα: {build_pdf_name(pattern, today.year, today.month)}   ·   ",
+                                     f"Example: {build_pdf_name(pattern, today.year, today.month)}   ·   ") +
+                                   T("{year} = έτος, {month} = μήνας (2 ψηφία)",
+                                     "{year} = year, {month} = month (2 digits)"))
             self.name_note.configure(style='CardHint.TLabel')
 
     # ---- settings: where PDFs / Excel files go
@@ -1774,14 +3169,14 @@ class ElstatApp(tk.Tk):
                                        else BASE_DIR)
 
     def browse_output_dir(self):
-        d = self._pick_folder("Διαλέξτε φάκελο για τα PDF", self.pv['output_dir'].get().strip())
+        d = self._pick_folder(T("Διαλέξτε φάκελο για τα PDF", "Choose a folder for the PDFs"), self.pv['output_dir'].get().strip())
         if d:
             self.pv['output_dir'].set(os.path.normpath(d))
             self.pv['output_mode'].set('custom')
             self._pref_changed()
 
     def browse_excel_dir(self):
-        d = self._pick_folder("Διαλέξτε φάκελο των Excel", self.pv['excel_dir'].get().strip())
+        d = self._pick_folder(T("Διαλέξτε φάκελο των Excel", "Choose the folder of the Excel files"), self.pv['excel_dir'].get().strip())
         if d:
             self.pv['excel_dir'].set(os.path.normpath(d))
             self._pref_changed()
@@ -1796,7 +3191,7 @@ class ElstatApp(tk.Tk):
 
     # ---- settings: data folder
     def change_data_dir(self):
-        d = self._pick_folder("Διαλέξτε τον φάκελο δεδομένων", DATA_DIR)
+        d = self._pick_folder(T("Διαλέξτε τον φάκελο δεδομένων", "Choose the data folder"), DATA_DIR)
         if d:
             self._switch_data_dir(os.path.normpath(d))
 
@@ -1805,21 +3200,27 @@ class ElstatApp(tk.Tk):
         if _same_path(new, old):
             return
         if _is_inside(new, os.path.join(old, ARCHIVE_NAME)):
-            messagebox.showerror("Φάκελος δεδομένων", "Δεν μπορείτε να διαλέξετε φάκελο μέσα στο αρχείο PDF.")
+            messagebox.showerror(T("Φάκελος δεδομένων", "Data folder"), T("Δεν μπορείτε να διαλέξετε φάκελο μέσα στο αρχείο PDF.",
+                                                        "You cannot choose a folder inside the PDF archive."))
             return
         copy = False
         if data_exists(new):
             if not messagebox.askyesno(
-                    "Φάκελος δεδομένων",
-                    f"Ο φάκελος\n{new}\nπεριέχει ήδη δεδομένα του προγράμματος.\n\n"
-                    "Να χρησιμοποιηθούν αυτά; (Τα τωρινά δεδομένα δεν διαγράφονται.)", default='yes'):
+                    T("Φάκελος δεδομένων", "Data folder"),
+                    T(f"Ο φάκελος\n{new}\nπεριέχει ήδη δεδομένα του προγράμματος.\n\n"
+                      "Να χρησιμοποιηθούν αυτά; (Τα τωρινά δεδομένα δεν διαγράφονται.)",
+                      f"The folder\n{new}\nalready contains data from the program.\n\n"
+                      "Use it? (Your current data is not deleted.)"), default='yes'):
                 return
         elif data_exists(old):
             ans = messagebox.askyesnocancel(
-                "Φάκελος δεδομένων",
-                "Να αντιγραφούν τα υπάρχοντα δεδομένα (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) στον "
-                "νέο φάκελο;\n\nΝαι = αντιγραφή (τα παλιά αρχεία μένουν και στον παλιό φάκελο)\n"
-                "Όχι = ξεκίνημα από το μηδέν στον νέο φάκελο\nΑκύρωση = καμία αλλαγή", default='yes')
+                T("Φάκελος δεδομένων", "Data folder"),
+                T("Να αντιγραφούν τα υπάρχοντα δεδομένα (στοιχεία ξενοδοχείου, ιστορικό, αρχείο PDF) στον "
+                  "νέο φάκελο;\n\nΝαι = αντιγραφή (τα παλιά αρχεία μένουν και στον παλιό φάκελο)\n"
+                  "Όχι = ξεκίνημα από το μηδέν στον νέο φάκελο\nΑκύρωση = καμία αλλαγή",
+                  "Copy the existing data (hotel details, history, PDF archive) to the "
+                  "new folder?\n\nYes = copy (the old files also stay in the old folder)\n"
+                  "No = start from scratch in the new folder\nCancel = no change"), default='yes')
             if ans is None:
                 return
             copy = ans
@@ -1828,18 +3229,25 @@ class ElstatApp(tk.Tk):
             if copy:
                 copy_data_files(old, new)
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η αντιγραφή στον νέο φάκελο:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Δεν ήταν δυνατή η αντιγραφή στον νέο φάκελο:\n{e}",
+                                             f"Could not copy to the new folder:\n{e}"))
             return
         set_data_dir(new)
+        load_custom_country_mappings()
         if not save_app_config({'data_dir': '' if _same_path(new, DEFAULT_DATA_DIR) else new}):
             set_data_dir(old)
-            messagebox.showerror("Σφάλμα", "Δεν μπορώ να θυμηθώ τη νέα θέση, γιατί ο φάκελος του προγράμματος "
-                                           "δεν επιτρέπει εγγραφή. Η αλλαγή ακυρώθηκε.")
+            load_custom_country_mappings()
+            messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να θυμηθώ τη νέα θέση, γιατί ο φάκελος του προγράμματος "
+                                             "δεν επιτρέπει εγγραφή. Η αλλαγή ακυρώθηκε.",
+                                             "I can't remember the new location because the program folder "
+                                             "does not allow writing. The change was cancelled."))
             return
         # preferences live in the data folder: use the ones found there, or carry the current ones over
         if os.path.exists(PREFS_JSON):
             self.prefs = load_prefs()
             self._sync_pref_vars()
+            if self.prefs['language'] != LANG:
+                self._apply_language()
         else:
             self._save_prefs()
         if os.path.exists(SETTINGS_CSV):
@@ -1849,11 +3257,11 @@ class ElstatApp(tk.Tk):
         self.data_dir_var.set(DATA_DIR)
         self.refresh_history()
         self._after_prefs_change()
-        self._status(f"✓ Ο φάκελος δεδομένων είναι τώρα: {DATA_DIR}")
+        self._status(T(f"✓ Ο φάκελος δεδομένων είναι τώρα: {DATA_DIR}", f"✓ The data folder is now: {DATA_DIR}"))
 
     def backup_data(self):
         name = f"ELSTAT_backup_{datetime.date.today().strftime('%Y-%m-%d')}.zip"
-        fp = filedialog.asksaveasfilename(title="Αντίγραφο ασφαλείας", defaultextension=".zip",
+        fp = filedialog.asksaveasfilename(title=T("Αντίγραφο ασφαλείας", "Backup"), defaultextension=".zip",
                                           initialdir=self._start_dir(), initialfile=name,
                                           filetypes=[("ZIP", "*.zip")])
         if not fp:
@@ -1864,21 +3272,24 @@ class ElstatApp(tk.Tk):
                 z = shutil.make_archive(os.path.join(tmp, 'backup'), 'zip', DATA_DIR)
                 shutil.copy2(z, fp)
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η δημιουργία αντιγράφου:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Δεν ήταν δυνατή η δημιουργία αντιγράφου:\n{e}",
+                                             f"Could not create the backup:\n{e}"))
             return
-        self._status(f"✓ Αντίγραφο ασφαλείας: {fp}")
+        self._status(T(f"✓ Αντίγραφο ασφαλείας: {fp}", f"✓ Backup: {fp}"))
 
     def reset_prefs(self):
-        if not messagebox.askyesno("Επαναφορά ρυθμίσεων",
-                                   "Να γυρίσουν όλες οι ρυθμίσεις στις προεπιλογές;\n"
-                                   "(Δεν διαγράφονται δεδομένα ή ιστορικό.)", default='no'):
+        if not messagebox.askyesno(T("Επαναφορά ρυθμίσεων", "Reset settings"),
+                                   T("Να γυρίσουν όλες οι ρυθμίσεις στις προεπιλογές;\n"
+                                     "(Δεν διαγράφονται δεδομένα ή ιστορικό.)",
+                                     "Reset all settings to their defaults?\n"
+                                     "(No data or history is deleted.)"), default='no'):
             return
         keep_template = self.prefs.get('template_pdf', '')
-        self.prefs = dict(DEFAULT_PREFS, template_pdf=keep_template)
+        self.prefs = dict(DEFAULT_PREFS, template_pdf=keep_template, language=self.prefs['language'])
         self._sync_pref_vars()
         self._save_prefs()
         self._after_prefs_change()
-        self._status("Οι ρυθμίσεις επανήλθαν στις προεπιλογές.")
+        self._status(T("Οι ρυθμίσεις επανήλθαν στις προεπιλογές.", "Settings were reset to their defaults."))
 
     # ---------------------------------------------------- window behaviour
     def _center(self):
@@ -1892,25 +3303,42 @@ class ElstatApp(tk.Tk):
             pass
 
     def _on_wheel(self, event):
-        """Mouse wheel scrolls whichever scrolling area is under the pointer."""
+        """Scroll the area under the pointer, including embedded Help callouts."""
         try:
             w = self.winfo_containing(event.x_root, event.y_root)
         except Exception:
             return
         if isinstance(w, ttk.Treeview):
             return
+
+        # Windows reports +/-120 (or multiples); Linux uses Button-4/5.
+        num = getattr(event, 'num', None)
+        if num == 4:
+            units = -3
+        elif num == 5:
+            units = 3
+        else:
+            delta = getattr(event, 'delta', 0)
+            if not delta:
+                return
+            units = -max(1, int(abs(delta) / 120)) * (1 if delta > 0 else -1) * 3
+
+        # A Help callout is a child Frame/Label embedded inside a Text widget.
+        # Walk its master chain so the wheel still scrolls the Help text itself.
         while w is not None:
+            if isinstance(w, tk.Text):
+                try:
+                    first, last = w.yview()
+                    if last - first < 0.999:
+                        w.yview_scroll(units, 'units')
+                    return 'break'
+                except tk.TclError:
+                    return 'break'
+
             sf = getattr(w, '_sf', None)
             if sf is not None:
-                if getattr(event, 'num', None) == 4:
-                    units = -3
-                elif getattr(event, 'num', None) == 5:
-                    units = 3
-                else:
-                    units = -1 if event.delta > 0 else 1
-                    units *= 3
                 sf.scroll(units)
-                return
+                return 'break'
             w = getattr(w, 'master', None)
 
     def _try_generate(self, _event=None, print_after=False):
@@ -1939,10 +3367,33 @@ class ElstatApp(tk.Tk):
         st['days_of_month'] = d.isascii() and d.isdigit() and 1 <= int(d) <= 31
         e = m['employees']
         st['employees'] = e.isascii() and e.isdigit() and len(e) <= 3
+        try:
+            datetime.datetime.strptime(m['sign_date'], "%d/%m/%Y")
+            st['sign_date'] = True
+        except ValueError:
+            st['sign_date'] = False
         return st
 
+    def _update_dropzone(self):
+        zone = getattr(self, 'excel_zone', None)
+        if zone is None:
+            return
+        fp = self.excel_var.get().strip()
+        if fp and os.path.isfile(fp):
+            zone.set_text("\u2713  " + os.path.basename(fp),
+                          T("Πατήστε ή σύρετε εδώ άλλο αρχείο για να το αλλάξετε",
+                            "Click or drop another file here to change it"), done=True)
+        elif DND_AVAILABLE:
+            zone.set_text(T("Σύρετε εδώ το αρχείο Excel", "Drop the Excel file here"),
+                          T("ή πατήστε για να το διαλέξετε από τον υπολογιστή",
+                            "or click to choose it from your computer"))
+        else:
+            zone.set_text(T("Πατήστε για να διαλέξετε το αρχείο Excel", "Click to choose the Excel file"),
+                          T("το αρχείο «Nationalities Statistics» από το Protel (.xls ή .xlsx)",
+                            "the “Nationalities Statistics” file from Protel (.xls or .xlsx)"))
+
     def refresh_validation(self, *_):
-        if not hasattr(self, 'print_btn'):
+        if self._rebuilding or not hasattr(self, 'print_btn'):
             return
         s, m, excel, template, out = self._collect()
 
@@ -1953,11 +3404,18 @@ class ElstatApp(tk.Tk):
                 quiet = key in m and not m[key] and not excel_ok    # empty month fields before an Excel is chosen
                 self.entries[key].configure(style='TEntry' if (ok or quiet) else 'Bad.TEntry')
 
+        # drop zone text and the step badges (number -> green tick when that step is done)
+        self._update_dropzone()
+        states = self._field_states(s, m)
+        self.excel_card.set_done(excel_ok)
+        self.month_card.set_done(excel_ok and all(ok for k, ok in states.items() if k in m))
+        self.output_card.set_done(bool(out))
+
         # helpers next to the fields
         n = len(s['afm'])
-        self.afm_counter_var.set(f"{n}/9 ψηφία" + ("  ✓" if validate_afm(s['afm']) else ""))
+        self.afm_counter_var.set(T(f"{n}/9 ψηφία", f"{n}/9 digits") + ("  ✓" if validate_afm(s['afm']) else ""))
         if m['month'].isdigit() and 1 <= int(m['month']) <= 12 and m['year']:
-            self.month_name_var.set(f"= {GREEK_MONTHS[int(m['month']) - 1]} {m['year']}")
+            self.month_name_var.set(f"= {month_name(int(m['month']))} {m['year']}")
         else:
             self.month_name_var.set("")
 
@@ -1965,14 +3423,17 @@ class ElstatApp(tk.Tk):
         if excel_ok:
             errors = validate_inputs(s, m, excel, template, out)
         else:   # month fields cannot be judged before the Excel is chosen
-            errors = ["Επιλέξτε πρώτα το αρχείο Excel από το Protel (Βήμα 1)."] + validate_hotel(s)
+            errors = [T("Επιλέξτε πρώτα το αρχείο Excel από το Protel (Βήμα 1).",
+                        "First choose the Excel file from Protel (Step 1).")] + validate_hotel(s)
         if errors:
             shown = errors[:5]
-            more = f"\n… και {len(errors) - 5} ακόμη" if len(errors) > 5 else ""
-            self.check_var.set("Για να δημιουργηθεί το δελτίο, διορθώστε:\n" + "\n".join("• " + e for e in shown) + more)
+            more = T(f"\n… και {len(errors) - 5} ακόμη", f"\n… and {len(errors) - 5} more") if len(errors) > 5 else ""
+            self.check_var.set(T("Για να δημιουργηθεί το δελτίο, διορθώστε:\n",
+                                 "To create the form, please fix:\n") + "\n".join("• " + e for e in shown) + more)
             self.check_label.configure(style='StatusWarn.TLabel' if not excel_ok else 'StatusBad.TLabel')
         else:
-            self.check_var.set("✓ Όλα είναι έτοιμα. Πατήστε «Δημιουργία PDF» ή «Δημιουργία & Εκτύπωση».")
+            self.check_var.set(T("✓ Όλα είναι έτοιμα. Πατήστε «Δημιουργία PDF» ή «Δημιουργία & Εκτύπωση».",
+                                 "✓ Everything is ready. Click “Create PDF” or “Create & Print”."))
             self.check_label.configure(style='StatusGood.TLabel')
 
         for btn in (self.run_btn, self.print_btn):
@@ -1984,10 +3445,135 @@ class ElstatApp(tk.Tk):
     def _set_busy(self, busy):
         self._busy = busy
         self.config(cursor='watch' if busy else '')
-        self.run_btn.configure(text="Παρακαλώ περιμένετε…" if busy else "Δημιουργία PDF")
-        self.print_btn.configure(text="Παρακαλώ περιμένετε…" if busy else "Δημιουργία & Εκτύπωση")
+        self.run_btn.configure(text=T("Παρακαλώ περιμένετε…", "Please wait…") if busy else T("Δημιουργία PDF", "Create PDF"))
+        self.print_btn.configure(text=T("Παρακαλώ περιμένετε…", "Please wait…") if busy else T("Δημιουργία & Εκτύπωση",
+                                                                            "Create & Print"))
         self.refresh_validation()
         self.update_idletasks()
+
+    # ----------------------------------------------------------- drag and drop
+    def _register_drag_drop_targets(self):
+        """Enable OS file/folder drops on the matching path fields when tkinterdnd2 is installed."""
+        if not DND_AVAILABLE:
+            return
+        targets = (
+            (getattr(self, 'excel_zone', None), self._drop_excel),
+            (getattr(self, 'excel_card', None), self._drop_excel),
+            (getattr(self, 'excel_path_entry', None), self._drop_excel),
+            (getattr(self, 'template_card', None), self._drop_template),
+            (getattr(self, 'output_card', None), self._drop_output),
+            (getattr(self, 'template_path_entry', None), self._drop_template),
+            (getattr(self, 'output_path_entry', None), self._drop_output),
+            (getattr(self, 'out_dir_entry', None), self._drop_output_folder),
+            (getattr(self, 'excel_dir_entry', None), self._drop_excel_folder),
+            (getattr(self, 'data_dir_entry', None), self._drop_data_folder),
+        )
+        failed = []
+        for widget, callback in targets:
+            if widget is None:
+                continue
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind('<<Drop>>', callback)
+            except Exception as e:
+                # A failed target registration must not affect the rest of the interface.
+                failed.append(repr(e))
+        zone = getattr(self, 'excel_zone', None)
+        if zone is not None:
+            try:
+                zone.dnd_bind('<<DropEnter>>', lambda e: (zone.set_drag(True), e.action)[1])
+                zone.dnd_bind('<<DropLeave>>', lambda e: (zone.set_drag(False), e.action)[1])
+            except Exception:
+                pass
+        if failed:
+            self._status("Drag & drop registration failed: " + failed[0])
+        else:
+            self._status(T("Drag & drop ενεργό: αφήστε αρχεία πάνω στα πεδία.",
+                           "Drag & drop is active: drop files onto the fields."))
+
+    def _dropped_paths(self, event):
+        """Parse Tk's drop payload correctly, including paths containing spaces."""
+        try:
+            return [os.path.normpath(p) for p in self.tk.splitlist(event.data) if p]
+        except (tk.TclError, AttributeError, TypeError):
+            raw = str(getattr(event, 'data', '')).strip()
+            return [raw.strip('{}')] if raw else []
+
+    def _drop_one(self, event, kind, extensions, callback):
+        paths = self._dropped_paths(event)
+        if len(paths) != 1:
+            messagebox.showwarning(
+                T("Μεταφορά αρχείου", "Drag and drop"),
+                T("Αφήστε ένα αρχείο κάθε φορά.", "Please drop one file at a time."),
+                parent=self)
+            return event.action
+        path = paths[0]
+        if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in extensions:
+            messagebox.showwarning(
+                T("Μη έγκυρο αρχείο", "Invalid file"),
+                T(f"Αφήστε ένα υπάρχον αρχείο {kind}.", f"Drop an existing {kind} file."),
+                parent=self)
+            return event.action
+        callback(path)
+        return event.action
+
+    def _drop_excel(self, event):
+        zone = getattr(self, 'excel_zone', None)
+        if zone is not None:
+            zone.set_drag(False)
+        return self._drop_one(event, "Excel (.xls/.xlsx)", {'.xls', '.xlsx'}, self._accept_dropped_excel)
+
+    def _accept_dropped_excel(self, path):
+        self.excel_var.set(path)
+        self.load_period(path)
+        self._status(T(f"✓ Επιλέχθηκε το Excel: {path}", f"✓ Excel selected: {path}"))
+
+    def _drop_template(self, event):
+        return self._drop_one(event, "PDF", {'.pdf'}, self._accept_dropped_template)
+
+    def _accept_dropped_template(self, path):
+        self.pdf_var.set(path)
+        self._remember_template(path)
+        self._status(T(f"✓ Επιλέχθηκε το template: {path}", f"✓ Template selected: {path}"))
+
+    def _drop_output(self, event):
+        return self._drop_one(event, "PDF", {'.pdf'}, self._accept_dropped_output)
+
+    def _accept_dropped_output(self, path):
+        self.out_var.set(path)
+        self.output_custom = True
+        self._status(T(f"✓ Ορίστηκε το αρχείο εξόδου: {path}", f"✓ Output file set: {path}"))
+
+    def _drop_folder(self, event, callback):
+        paths = self._dropped_paths(event)
+        if len(paths) != 1 or not os.path.isdir(paths[0]):
+            messagebox.showwarning(
+                T("Μη έγκυρος φάκελος", "Invalid folder"),
+                T("Αφήστε έναν υπάρχοντα φάκελο.", "Drop one existing folder."),
+                parent=self)
+            return event.action
+        callback(paths[0])
+        return event.action
+
+    def _drop_output_folder(self, event):
+        return self._drop_folder(event, self._accept_output_folder)
+
+    def _accept_output_folder(self, path):
+        self.pv['output_dir'].set(path)
+        self.pv['output_mode'].set('custom')
+        self._pref_changed()
+        self._status(T(f"✓ Φάκελος PDF: {path}", f"✓ PDF folder: {path}"))
+
+    def _drop_excel_folder(self, event):
+        return self._drop_folder(event, self._accept_excel_folder)
+
+    def _accept_excel_folder(self, path):
+        self.pv['excel_dir'].set(path)
+        self._pref_changed()
+        self._status(T(f"✓ Φάκελος Excel: {path}", f"✓ Excel folder: {path}"))
+
+    def _drop_data_folder(self, event):
+        return self._drop_folder(event, self._switch_data_dir)
 
     # ----------------------------------------------------------- file choices
     def _start_dir(self):
@@ -1995,11 +3581,11 @@ class ElstatApp(tk.Tk):
         return d if d and os.path.isdir(d) else BASE_DIR
 
     def browse_excel(self):
-        fp = filedialog.askopenfilename(title="Διαλέξτε το Excel από το Protel", initialdir=self._excel_start_dir(),
+        fp = filedialog.askopenfilename(title=T("Διαλέξτε το Excel από το Protel",
+                                                "Choose the Excel file from Protel"), initialdir=self._excel_start_dir(),
                                         filetypes=[("Excel Files", "*.xls *.xlsx")])
         if fp:
-            self.excel_var.set(fp)
-            self.load_period(fp)
+            self._accept_dropped_excel(fp)
 
     def _excel_typed(self, _event=None):
         fp = self.excel_var.get().strip()
@@ -2010,8 +3596,8 @@ class ElstatApp(tk.Tk):
         """Reads the month from the Excel header and fills in step 2 and the output name."""
         self._loaded_excel = fp
         if not os.path.isfile(fp):
-            self.period_var.set("⚠ Το αρχείο δεν βρέθηκε.")
-            self.period_label.configure(style='CardBad.TLabel')
+            self._show_period(lambda: T("⚠ Το αρχείο δεν βρέθηκε.", "⚠ The file was not found."),
+                              'CardBad.TLabel')
             return
         self.load_preview(fp)
         info = period_as_month(read_excel_period(fp))
@@ -2025,24 +3611,133 @@ class ElstatApp(tk.Tk):
             last_emp = self.current_settings.get('last_employees', '')
             if self.prefs['prefill_employees'] and last_emp and not self.mon_vars['employees'].get().strip():
                 self.mon_vars['employees'].set(last_emp)
-            self.period_var.set(f"✓ Το Excel αφορά τον μήνα {GREEK_MONTHS[month - 1]} {year}. "
-                                "Τα στοιχεία του μήνα συμπληρώθηκαν αυτόματα - πληκτρολογήστε μόνο τον αριθμό εργαζομένων.")
-            self.period_label.configure(style='CardGood.TLabel')
+            self._show_period(
+                lambda: T(f"✓ Το Excel αφορά τον μήνα {month_name(month)} {year}. "
+                          "Τα στοιχεία του μήνα συμπληρώθηκαν αυτόματα - πληκτρολογήστε μόνο τον αριθμό εργαζομένων.",
+                          f"✓ The Excel is for {month_name(month)} {year}. "
+                          "The month details were filled in automatically - just type the number of employees."),
+                'CardGood.TLabel')
         else:
-            self.period_var.set("⚠ Δεν βρέθηκε ολόκληρος μήνας στο Excel. Συμπληρώστε τα στοιχεία του Βήματος 2 "
-                                "με το χέρι.")
-            self.period_label.configure(style='CardWarn.TLabel')
+            self._show_period(
+                lambda: T("⚠ Δεν βρέθηκε ολόκληρος μήνας στο Excel. Συμπληρώστε τα στοιχεία του Βήματος 2 "
+                          "με το χέρι.",
+                          "⚠ No complete month was found in the Excel. Fill in the Step 2 details "
+                          "by hand."),
+                'CardWarn.TLabel')
+
+    def _show_period(self, make_text, style):
+        """Message under the Excel chooser. Kept as a function so it can be re-worded after a language change."""
+        self._period_msg = (make_text, style)
+        self._render_period()
+
+    def _update_month_field_status(self, *_):
+        """Refresh the compact completion marks in the Month details card."""
+        widgets = getattr(self, 'month_field_status', {})
+        for key, marker in widgets.items():
+            filled = bool(self.mon_vars.get(key) and self.mon_vars[key].get().strip())
+            marker.configure(text='✓' if filled else '○',
+                             style='CardGood.TLabel' if filled else 'CardHint.TLabel')
+
+    def _render_period(self):
+        make_text, style = self._period_msg
+        self.period_var.set(make_text())
+        self.period_label.configure(style=style)
 
     def use_recent_excel(self):
         """Picks the newest Excel in the folder used last time (or next to the program)."""
         fp = find_recent_excel(self._excel_start_dir())
         if not fp:
-            messagebox.showinfo("Δεν βρέθηκε αρχείο",
-                                f"Δεν υπάρχει αρχείο Excel στον φάκελο:\n{self._excel_start_dir()}\n\n"
-                                "Πατήστε «Επιλογή Excel…» για να το διαλέξετε.")
+            messagebox.showinfo(T("Δεν βρέθηκε αρχείο", "File not found"),
+                                T(f"Δεν υπάρχει αρχείο Excel στον φάκελο:\n{self._excel_start_dir()}\n\n"
+                                  "Πατήστε «Επιλογή Excel…» για να το διαλέξετε.",
+                                  f"There is no Excel file in the folder:\n{self._excel_start_dir()}\n\n"
+                                  "Click “Choose Excel…” to select one."))
             return
         self.excel_var.set(fp)
         self.load_period(fp)
+
+    def _map_selected_country(self, _event=None):
+        """Let the user map an unknown Excel country to the correct ELSTAT form row."""
+        if _event is not None and hasattr(_event, 'y'):
+            clicked = self.preview_tree.identify_row(_event.y)
+            if clicked:
+                self.preview_tree.selection_set(clicked)
+        selection = self.preview_tree.selection()
+        if not selection:
+            messagebox.showinfo(T("Επιλέξτε χώρα", "Select a country"),
+                                T("Επιλέξτε πρώτα μια κόκκινη χώρα από τον πίνακα.",
+                                  "First select a red country in the table."), parent=self)
+            return 'break'
+        country = self.preview_tree.item(selection[0], 'text')
+        existing_custom = CUSTOM_COUNTRY_MAPPING_NORM.get(norm(country))
+        if resolve_country(country) is not None and existing_custom is None:
+            messagebox.showinfo(T("Η χώρα είναι ήδη γνωστή", "Country already recognised"),
+                                T(f"Η χώρα «{country}» αναγνωρίζεται ήδη από το πρόγραμμα.",
+                                  f"“{country}” is already recognised by the program."), parent=self)
+            return 'break'
+
+        win = tk.Toplevel(self)
+        win.title(T("Αντιστοίχιση χώρας", "Map country"))
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        box = ttk.Frame(win, padding=18)
+        box.pack(fill='both', expand=True)
+        ttk.Label(box, text=T(f"Η χώρα «{country}» δεν είναι γνωστή.",
+                              f"The country “{country}” is not recognised."),
+                  style='CardBold.TLabel', wraplength=440).pack(anchor='w')
+        ttk.Label(box, text=T("Σε ποια γραμμή / κατηγορία του δελτίου της ΕΛΣΤΑΤ ανήκει;",
+                              "Which ELSTAT form row / category should it be assigned to?"),
+                  style='CardHint.TLabel', wraplength=440).pack(anchor='w', pady=(8, 10))
+        choices = country_mapping_destinations()
+        choice_var = tk.StringVar(value='')
+        combo = ttk.Combobox(box, textvariable=choice_var, values=choices,
+                             state='readonly', width=48)
+        combo.pack(fill='x', pady=(0, 12))
+        if existing_custom:
+            for i, option in enumerate(choices):
+                if norm(option) == existing_custom:
+                    combo.current(i)
+                    break
+        ttk.Label(box, text=T("Η επιλογή αποθηκεύεται και θα χρησιμοποιείται και στους επόμενους μήνες. "
+                              "Αν δεν είστε βέβαιοι, ελέγξτε πρώτα τη σωστή κατηγορία.",
+                              "Your choice is saved and will also be used in future months. "
+                              "If unsure, verify the correct category first."),
+                  style='CardHint.TLabel', wraplength=440).pack(anchor='w', pady=(0, 12))
+        buttons = ttk.Frame(box)
+        buttons.pack(fill='x')
+        def save_mapping():
+            destination = choice_var.get().strip()
+            if not destination:
+                messagebox.showwarning(T("Επιλέξτε κατηγορία", "Choose a category"),
+                                        T("Επιλέξτε πού ανήκει η χώρα.",
+                                          "Choose where the country belongs."), parent=win)
+                return
+            try:
+                save_custom_country_mapping(country, destination)
+            except Exception as exc:
+                messagebox.showerror(T("Δεν αποθηκεύτηκε", "Could not save"), str(exc), parent=win)
+                return
+            win.destroy()
+            fp = self.excel_var.get().strip()
+            if fp and os.path.isfile(fp):
+                self.load_preview(fp)
+            messagebox.showinfo(T("Η αντιστοίχιση αποθηκεύτηκε", "Mapping saved"),
+                                T(f"Η χώρα «{country}» αντιστοιχίστηκε στη γραμμή «{destination}». "
+                                  "Πατήστε ξανά «Δημιουργία PDF» για να δημιουργηθεί το σωστό δελτίο.",
+                                  f"“{country}” was mapped to “{destination}”. "
+                                  "Click “Create PDF” again to generate the corrected form."), parent=self)
+        ttk.Button(buttons, text=T("Αποθήκευση", "Save mapping"), command=save_mapping).pack(side='left')
+        ttk.Button(buttons, text=T("Ακύρωση", "Cancel"), command=win.destroy).pack(side='right')
+        win.bind('<Return>', lambda _e: save_mapping())
+        win.bind('<Escape>', lambda _e: win.destroy())
+        win.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_height()) // 2)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        combo.focus_set()
+        return 'break'
 
     def load_preview(self, fp):
         """Shows the countries found in the Excel and flags the ones the program does not know."""
@@ -2058,14 +3753,22 @@ class ElstatApp(tk.Tk):
         for country, pax, nights in rows:
             known = resolve_country(country) is not None
             bad += not known
+            destination = resolve_country(country)
+            shown_destination = (next((v for v in country_mapping_destinations()
+                                        if norm(v) == destination), destination)
+                                  if destination else T("⚠ λείπει από το πρόγραμμα",
+                                                        "⚠ missing from the program"))
             self.preview_tree.insert('', 'end', text=country, values=(pax, nights,
-                                     "✓" if known else "⚠ λείπει από το πρόγραμμα"),
+                                     shown_destination),
                                      tags=('ok' if known else 'bad',))
         self.preview_tree.configure(height=max(3, min(len(rows), 7)))
-        text = (f"Βρέθηκαν {len(rows)} χώρες · {sum(r[1] for r in rows)} πελάτες · "
-                f"{sum(r[2] for r in rows)} διανυκτερεύσεις")
+        text = (T(f"Βρέθηκαν {len(rows)} χώρες · {sum(r[1] for r in rows)} πελάτες · "
+                  f"{sum(r[2] for r in rows)} διανυκτερεύσεις",
+                  f"Found {len(rows)} countries · {sum(r[1] for r in rows)} guests · "
+                  f"{sum(r[2] for r in rows)} overnight stays"))
         if bad:
-            text += f"   ⚠ {bad} δεν αναγνωρίστηκαν και ΔΕΝ θα μπουν στο PDF"
+            text += T(f"   ⚠ {bad} δεν αναγνωρίστηκαν και ΔΕΝ θα μπουν στο PDF",
+                      f"   ⚠ {bad} not recognised and will NOT be included in the PDF")
             self.preview_summary.configure(style='CardBad.TLabel')
         else:
             self.preview_summary.configure(style='CardGood.TLabel')
@@ -2079,93 +3782,193 @@ class ElstatApp(tk.Tk):
 
         top = ttk.Frame(tab)
         top.grid(row=0, column=0, sticky="ew", padx=6, pady=(12, 2))
-        ttk.Label(top, text="Έτος:").pack(side="left")
+        ttk.Label(top, text=T("Έτος:", "Year:")).pack(side="left")
         self.hist_year_cb = ttk.Combobox(top, textvariable=self.hist_year_var, state="readonly", width=7)
-        self.hist_year_cb.pack(side="left", padx=(6, 16))
+        self.hist_year_cb.pack(side="left", padx=(6, 12))
         self.hist_year_cb.bind('<<ComboboxSelected>>', lambda e: self.update_dashboard())
-        ttk.Radiobutton(top, text="Διανυκτερεύσεις", value='nights', variable=self.hist_metric_var,
+        ttk.Label(top, text=T("Χώρα:", "Country:")).pack(side="left")
+        self.hist_country_cb = ttk.Combobox(top, textvariable=self.hist_country_var, state="readonly", width=20)
+        self.hist_country_cb.pack(side="left", padx=(6, 12))
+        self.hist_country_cb.bind('<<ComboboxSelected>>', lambda e: self._country_changed())
+        ttk.Radiobutton(top, text=T("Διανυκτερεύσεις", "Overnight stays"), value='nights', variable=self.hist_metric_var,
                         command=self.update_dashboard).pack(side="left")
-        ttk.Radiobutton(top, text="Πελάτες", value='clients', variable=self.hist_metric_var,
+        ttk.Radiobutton(top, text=T("Πελάτες", "Guests"), value='clients', variable=self.hist_metric_var,
                         command=self.update_dashboard).pack(side="left", padx=(10, 0))
-        ttk.Button(top, text="Άνοιγμα CSV",
+        ttk.Button(top, text=T("Άνοιγμα CSV", "Open CSV"),
                    command=lambda: os.path.exists(HISTORY_CSV) and open_file(HISTORY_CSV)).pack(side="right")
-        ttk.Button(top, text="Ανανέωση", command=self.refresh_history).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text=T("Εξαγωγή Excel…", "Export Excel…"), command=self.hist_export).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text=T("Ανανέωση", "Refresh"), command=self.refresh_history).pack(side="right", padx=(0, 8))
 
+        info_row = ttk.Frame(tab)
+        info_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        info_row.columnconfigure(0, weight=1)
         self.hist_info = tk.StringVar()
-        ttk.Label(tab, textvariable=self.hist_info, style='Hint.TLabel').grid(row=1, column=0, sticky="w",
-                                                                              padx=8, pady=(0, 8))
+        self.hist_info_lbl = ttk.Label(info_row, textvariable=self.hist_info, style='Hint.TLabel', justify="left")
+        self.hist_info_lbl.grid(row=0, column=0, sticky="w")
+        autowrap(self.hist_info_lbl, tab, margin=260, minimum=200)
+        ttk.Button(info_row, text=T("Σύμπτυξη", "Collapse"), command=lambda: self._tree_expand(False)).grid(
+            row=0, column=1, padx=(8, 0))
+        ttk.Button(info_row, text=T("Ανάπτυξη", "Expand"), command=lambda: self._tree_expand(True)).grid(
+            row=0, column=2, padx=(6, 0))
+
         kp = ttk.Frame(tab)
         kp.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 8))
-        for i in range(3):
+        for i in range(4):
             kp.columnconfigure(i, weight=1, uniform='kpi')
-        self.kpi_clients = StatCard(kp, "ΠΕΛΑΤΕΣ")
-        self.kpi_clients.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.kpi_nights = StatCard(kp, "ΔΙΑΝΥΚΤΕΡΕΥΣΕΙΣ")
-        self.kpi_nights.grid(row=0, column=1, sticky="ew", padx=3)
-        self.kpi_avg = StatCard(kp, "ΜΕΣΗ ΔΙΑΜΟΝΗ (ΝΥΧΤΕΣ)")
-        self.kpi_avg.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        self.kpi_clients = StatCard(kp, T("ΠΕΛΑΤΕΣ", "GUESTS"))
+        self.kpi_clients.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.kpi_nights = StatCard(kp, T("ΔΙΑΝΥΚΤΕΡΕΥΣΕΙΣ", "OVERNIGHT STAYS"))
+        self.kpi_nights.grid(row=0, column=1, sticky="ew", padx=4)
+        self.kpi_avg = StatCard(kp, T("ΜΕΣΗ ΔΙΑΜΟΝΗ (ΝΥΧΤΕΣ)", "AVERAGE STAY (NIGHTS)"))
+        self.kpi_avg.grid(row=0, column=2, sticky="ew", padx=4)
+        self.kpi_share = StatCard(kp, T("ΑΛΛΟΔΑΠΟΙ", "FOREIGN GUESTS"))
+        self.kpi_share.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         self.hist_chart = HistoryChart(tab, on_pick=self._chart_pick, height=170)
         self.hist_chart.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 8))
 
-        frame = ttk.Frame(tab)
-        frame.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        pane = ttk.PanedWindow(tab, orient="horizontal")
+        pane.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 8))
+
+        frame = ttk.Frame(pane)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.hist_tree = ttk.Treeview(frame, columns=('c', 'n', 'a', 'p'), show='tree headings', height=6)
-        self.hist_tree.heading('#0', text='Έτος / Μήνας / Χώρα', anchor='w')
-        self.hist_tree.heading('c', text='Πελάτες')
-        self.hist_tree.heading('n', text='Διανυκτερεύσεις')
-        self.hist_tree.heading('a', text='Μέση διαμονή')
+        pane.add(frame, weight=3)
+        self.hist_tree = ttk.Treeview(frame, columns=('c', 'n', 'a', 's', 'p'), show='tree headings', height=6)
+        self.hist_tree.heading('#0', text=T('Έτος / Μήνας / Χώρα', 'Year / Month / Country'), anchor='w')
+        self.hist_tree.heading('c', text=T('Πελάτες', 'Guests'))
+        self.hist_tree.heading('n', text=T('Διανυκτ.', 'Nights'))
+        self.hist_tree.heading('a', text=T('Μέση δ.', 'Avg'))
+        self.hist_tree.heading('s', text=T('% πελατών', '% guests'))
         self.hist_tree.heading('p', text='PDF')
-        self.hist_tree.column('#0', width=260, minwidth=170, stretch=True)
-        self.hist_tree.column('c', width=90, minwidth=70, anchor='e', stretch=False)
-        self.hist_tree.column('n', width=120, minwidth=100, anchor='e', stretch=False)
-        self.hist_tree.column('a', width=110, minwidth=90, anchor='e', stretch=False)
-        self.hist_tree.column('p', width=60, minwidth=50, anchor='center', stretch=False)
-        self.hist_tree.tag_configure('year', font=(FONT, 10, 'bold'), background='#dbe7fb')
-        self.hist_tree.tag_configure('month', font=(FONT, 10, 'bold'), background='#eef4fd')
+        self.hist_tree.column('#0', width=200, minwidth=140, stretch=True)
+        self.hist_tree.column('c', width=70, minwidth=55, anchor='e', stretch=False)
+        self.hist_tree.column('n', width=80, minwidth=60, anchor='e', stretch=False)
+        self.hist_tree.column('a', width=60, minwidth=50, anchor='e', stretch=False)
+        self.hist_tree.column('s', width=75, minwidth=60, anchor='e', stretch=False)
+        self.hist_tree.column('p', width=45, minwidth=40, anchor='center', stretch=False)
+        self.hist_tree.tag_configure('year', font=(FONT, 10, 'bold'), background=ROW_YEAR)
+        self.hist_tree.tag_configure('month', font=(FONT, 10, 'bold'), background=ROW_MONTH)
         self.hist_tree.tag_configure('country', background=CARD)
+        self.hist_tree.tag_configure('hl', background=ROW_HL)
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.hist_tree.yview)
         self.hist_tree.configure(yscrollcommand=sb.set)
         self.hist_tree.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
         self.hist_tree.bind('<<TreeviewSelect>>', self._on_hist_select)
         self.hist_tree.bind('<Return>', lambda e: self.hist_open())
+        self.hist_tree.bind('<Double-1>', self._hist_double)
+        self.hist_tree.bind('<Delete>', lambda e: self.hist_delete())
+
+        side = ttk.Frame(pane, style='Card.TFrame')
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(2, weight=1)
+        pane.add(side, weight=2)
+        ttk.Label(side, textvariable=self.top_title_var, style='CardBold.TLabel').grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 0))
+        ttk.Label(side, text=T("Διπλό κλικ σε χώρα = φίλτρο", "Double-click a country = filter"),
+                  style='CardHint.TLabel').grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+        self.top_tree = ttk.Treeview(side, columns=('c', 's'), show='tree headings', height=6)
+        self.top_tree.heading('#0', text=T('Χώρα', 'Country'), anchor='w')
+        self.top_tree.heading('c', text=T('Πελάτες', 'Guests'))
+        self.top_tree.heading('s', text=T('Μερίδιο', 'Share'), anchor='w')
+        self.top_tree.column('#0', width=130, minwidth=90, stretch=True)
+        self.top_tree.column('c', width=60, minwidth=50, anchor='e', stretch=False)
+        self.top_tree.column('s', width=130, minwidth=90, anchor='w', stretch=False)
+        self.top_tree.tag_configure('hl', background=ROW_HL)
+        self.top_tree.grid(row=2, column=0, sticky="nsew")
+        self.top_tree.bind('<Double-1>', self._top_double)
 
         act = ttk.Frame(tab)
         act.grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 12))
         self.month_btns, self.year_btns = [], []
-        ttk.Label(act, text="Δελτίο μήνα:", style='Hint.TLabel').pack(side="left", padx=(0, 6))
-        for text, cmd, style in (("Άνοιγμα", self.hist_open, 'TButton'),
-                                 ("Αποθήκευση ως…", self.hist_save_as, 'TButton'),
-                                 ("Εκτύπωση", self.hist_print, 'PrintSm.TButton')):
+        ttk.Label(act, text=T("Δελτίο μήνα:", "Monthly form:"), style='Hint.TLabel').pack(side="left", padx=(0, 6))
+        for text, cmd, style in ((T("Άνοιγμα", "Open"), self.hist_open, 'TButton'),
+                                 (T("Αποθήκευση ως…", "Save as…"), self.hist_save_as, 'TButton'),
+                                 (T("Εκτύπωση", "Print"), self.hist_print, 'PrintSm.TButton')):
             b = ttk.Button(act, text=text, command=cmd, style=style)
             b.pack(side="left", padx=(0, 6))
             self.month_btns.append(b)
         ttk.Separator(act, orient="vertical").pack(side="left", fill="y", padx=8)
-        ttk.Label(act, text="Σύνοψη έτους:", style='Hint.TLabel').pack(side="left", padx=(0, 6))
-        for text, cmd, style in (("Αποθήκευση PDF…", lambda: self.hist_year_pdf('save'), 'TButton'),
-                                 ("Εκτύπωση", lambda: self.hist_year_pdf('print'), 'PrintSm.TButton')):
+        ttk.Label(act, text=T("Σύνοψη έτους:", "Year summary:"), style='Hint.TLabel').pack(side="left", padx=(0, 6))
+        for text, cmd, style in ((T("Αποθήκευση PDF…", "Save PDF…"), lambda: self.hist_year_pdf('save'), 'TButton'),
+                                 (T("Εκτύπωση", "Print"), lambda: self.hist_year_pdf('print'), 'PrintSm.TButton')):
             b = ttk.Button(act, text=text, command=cmd, style=style)
             b.pack(side="left", padx=(0, 6))
             self.year_btns.append(b)
-        self.del_btn = ttk.Button(act, text="Διαγραφή μήνα", command=self.hist_delete, style='Danger.TButton')
+        self.del_btn = ttk.Button(act, text=T("Διαγραφή μήνα", "Delete month"), command=self.hist_delete, style='Danger.TButton')
         self.del_btn.pack(side="right")
 
         # right-click menu
         self.hist_menu = tk.Menu(self, tearoff=0)
-        self.hist_menu.add_command(label="Άνοιγμα PDF", command=self.hist_open)
-        self.hist_menu.add_command(label="Αποθήκευση ως…", command=self.hist_save_as)
-        self.hist_menu.add_command(label="Εκτύπωση δελτίου", command=self.hist_print)
+        self.hist_menu.add_command(label=T("Άνοιγμα PDF", "Open PDF"), command=self.hist_open)
+        self.hist_menu.add_command(label=T("Αποθήκευση ως…", "Save as…"), command=self.hist_save_as)
+        self.hist_menu.add_command(label=T("Εκτύπωση δελτίου", "Print form"), command=self.hist_print)
         self.hist_menu.add_separator()
-        self.hist_menu.add_command(label="Σύνοψη έτους - αποθήκευση PDF…", command=lambda: self.hist_year_pdf('save'))
-        self.hist_menu.add_command(label="Σύνοψη έτους - εκτύπωση", command=lambda: self.hist_year_pdf('print'))
+        self.hist_menu.add_command(label=T("Σύνοψη έτους - αποθήκευση PDF…", "Year summary - save PDF…"), command=lambda: self.hist_year_pdf('save'))
+        self.hist_menu.add_command(label=T("Σύνοψη έτους - εκτύπωση", "Year summary - print"), command=lambda: self.hist_year_pdf('print'))
         self.hist_menu.add_separator()
-        self.hist_menu.add_command(label="Διαγραφή μήνα", command=self.hist_delete)
+        self.hist_menu.add_command(label=T("Διαγραφή μήνα", "Delete month"), command=self.hist_delete)
         self.hist_tree.bind('<Button-3>', self._hist_popup)
         if sys.platform == 'darwin':
             self.hist_tree.bind('<Button-2>', self._hist_popup)
+
+    # ---- history: new helpers
+    def _all_label(self):
+        return T("Όλες οι χώρες", "All countries")
+
+    def _country_filter(self):
+        v = self.hist_country_var.get()
+        return v if v in self._countries else None
+
+    def _country_changed(self):
+        self.refresh_history()
+
+    def _tree_expand(self, state):
+        def walk(parent=''):
+            for i in self.hist_tree.get_children(parent):
+                yield i
+                yield from walk(i)
+        for i in walk():
+            if self.hist_tree.get_children(i):
+                self.hist_tree.item(i, open=state)
+
+    def _hist_double(self, event):
+        iid = self.hist_tree.identify_row(event.y)
+        if iid and iid[0] == 'm':
+            self.hist_open()
+
+    def _top_double(self, _event=None):
+        cur = self.top_tree.selection()
+        if not cur:
+            return
+        country = self.top_tree.item(cur[0], 'text')
+        if self._country_filter() and norm(self._country_filter()) == norm(country):
+            self.hist_country_var.set(self._all_label())      # second double-click clears the filter
+        elif country in self._countries:
+            self.hist_country_var.set(country)
+        self.refresh_history()
+
+    def hist_export(self):
+        if not self._hist:
+            messagebox.showinfo(T("Ιστορικό", "History"), T("Δεν υπάρχουν δεδομένα για εξαγωγή.", "There is no data to export."))
+            return
+        fp = filedialog.asksaveasfilename(title=T("Εξαγωγή ιστορικού", "Export history"), defaultextension=".xlsx",
+                                          initialdir=self._pdf_start_dir(), initialfile="ELSTAT_History.xlsx",
+                                          filetypes=[("Excel", "*.xlsx")])
+        if not fp:
+            return
+        try:
+            export_history_excel(self._hist, fp)
+        except PermissionError:
+            messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το αρχείο. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
+                                             "I can't write the file. Close it if it is open and try again."))
+            return
+        except Exception as e:
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Δεν ήταν δυνατή η εξαγωγή:\n{e}", f"Could not export:\n{e}"))
+            return
+        self._status(T(f"✓ Το ιστορικό εξήχθη: {fp}", f"✓ History exported: {fp}"))
+        open_file(fp)
 
     # ---- history: helpers
     @staticmethod
@@ -2184,10 +3987,26 @@ class ElstatApp(tk.Tk):
         iid = self.hist_tree.identify_row(event.y)
         if iid:
             self.hist_tree.selection_set(iid)
+        else:
+            self.hist_tree.selection_remove(self.hist_tree.selection())
+
+        # Keep the context menu in sync with the clicked row so disabled actions
+        # cannot accidentally operate on a previously selected month.
+        sel = self._hist_sel()
+        month_ok = bool(sel and sel[1] is not None)
+        year_ok = bool(self._hist)
+        for index in (0, 1, 2, 7):
+            self.hist_menu.entryconfigure(index, state='normal' if month_ok else 'disabled')
+        for index in (4, 5):
+            self.hist_menu.entryconfigure(index, state='normal' if year_ok else 'disabled')
         try:
             self.hist_menu.tk_popup(event.x_root, event.y_root)
         finally:
-            self.hist_menu.grab_release()
+            try:
+                self.hist_menu.grab_release()
+            except tk.TclError:
+                pass
+        return 'break'
 
     def _chart_pick(self, month):
         try:
@@ -2232,28 +4051,47 @@ class ElstatApp(tk.Tk):
         hist = self._hist = load_history()
         tree.delete(*tree.get_children())
 
+        # country filter list (most guests first)
+        totals = {}
+        for months in hist.values():
+            for rows in months.values():
+                for country, c, _n in rows:
+                    totals[country] = totals.get(country, 0) + c
+        self._countries = sorted(totals, key=lambda k: -totals[k])
+        self.hist_country_cb.configure(values=[self._all_label()] + self._countries)
+        if self.hist_country_var.get() not in self._countries:
+            self.hist_country_var.set(self._all_label())
+        flt = self._country_filter()
+        flt_key = norm(flt) if flt else None
+
         def avg(c, n):
-            return f"{n / c:.1f}".replace('.', ',') if c else "-"
+            return fmt_avg(n, c)
+
+        def share(part, whole):
+            return f"{fmt_dec(part / whole * 100)}%" if whole else ""
 
         months_total = 0
         for year in sorted(hist, reverse=True):
             ycl = sum(c for rows in hist[year].values() for _, c, _ in rows)
             yni = sum(n for rows in hist[year].values() for _, _, n in rows)
             yid = f"y{year}"
-            tree.insert('', 'end', iid=yid, text=str(year), values=(ycl, yni, avg(ycl, yni), ""),
+            tree.insert('', 'end', iid=yid, text=str(year), values=(ycl, yni, avg(ycl, yni), "", ""),
                         tags=('year',), open=(year == max(hist)) if first_time else (yid in was_open))
             for month in sorted(hist[year], reverse=True):
                 rows = hist[year][month]
                 mcl, mni = sum(r[1] for r in rows), sum(r[2] for r in rows)
                 months_total += 1
                 mid = f"m{year}-{month}"
-                name = GREEK_MONTHS[month - 1] if 1 <= month <= 12 else str(month)
+                name = month_name(month) if 1 <= month <= 12 else str(month)
                 tree.insert(yid, 'end', iid=mid, text=name,
-                            values=(mcl, mni, avg(mcl, mni), "✓" if os.path.isfile(archive_path(year, month)) else ""),
+                            values=(mcl, mni, avg(mcl, mni), share(mcl, ycl),
+                                    "✓" if os.path.isfile(archive_path(year, month)) else ""),
                             tags=('month',), open=(mid in was_open))
                 for i, (country, c, n) in enumerate(sorted(rows, key=lambda r: -r[1])):
+                    hl = flt_key is not None and norm(country) == flt_key
                     tree.insert(mid, 'end', iid=f"c{year}-{month}-{i}", text=country,
-                                values=(c, n, avg(c, n), ""), tags=('country',))
+                                values=(c, n, avg(c, n), share(c, mcl), ""),
+                                tags=('hl' if hl else 'country',))
         if keep_sel and tree.exists(keep_sel):
             tree.selection_set(keep_sel)
 
@@ -2261,50 +4099,99 @@ class ElstatApp(tk.Tk):
         self.hist_year_cb.configure(values=years)
         if self.hist_year_var.get() not in years:
             self.hist_year_var.set(years[0] if years else "")
-        self._hist_info_base = (f"{months_total} μήνες καταχωρημένοι. Κάντε κλικ σε μήνα (πίνακας ή γράφημα) "
-                                "για να τον ανοίξετε, αποθηκεύσετε ή εκτυπώσετε." if hist else
-                                "Δεν υπάρχει ιστορικό ακόμη - δημιουργείται αυτόματα με το πρώτο δελτίο.")
+        self._hist_info_base = (T(f"{months_total} μήνες καταχωρημένοι. Κλικ σε μήνα (πίνακας ή γράφημα) = επιλογή · "
+                                  "διπλό κλικ = άνοιγμα δελτίου.",
+                                  f"{months_total} months recorded. Click a month (table or chart) = select · "
+                                  "double-click = open the form.") if hist else
+                                T("Δεν υπάρχει ιστορικό ακόμη - δημιουργείται αυτόματα με το πρώτο δελτίο.",
+                                  "No history yet - it is created automatically with the first form."))
         self.hist_info.set(self._hist_info_base)
         self.update_dashboard()
         self._update_hist_buttons()
         self.update_reminder()
 
     def update_dashboard(self, *_):
-        """Cards + bar chart for the chosen year."""
+        """Cards, bar chart and top countries for the chosen year (and country filter)."""
         try:
             year = int(self.hist_year_var.get())
         except ValueError:
             year = None
         by_nights = self.hist_metric_var.get() == 'nights'
+        cards = (self.kpi_clients, self.kpi_nights, self.kpi_avg, self.kpi_share)
         if year is None or year not in self._hist:
-            for card in (self.kpi_clients, self.kpi_nights, self.kpi_avg):
+            for card in cards:
                 card.set("–", "")
-            self.hist_chart.set_data([0] * 12, "Δεν υπάρχουν δεδομένα ακόμη")
+            self.hist_chart.set_data([0] * 12, T("Δεν υπάρχουν δεδομένα ακόμη", "No data yet"))
+            self.top_tree.delete(*self.top_tree.get_children())
+            self.top_title_var.set("")
             return
-        st = year_stats(self._hist, year)
+        flt = self._country_filter()
+        view = filter_hist(self._hist, flt)
+        st = year_stats(view, year)
+        full = year_stats(self._hist, year)
 
         def delta(cur, prev):
             if not prev:
                 return "", MUTED
             pct = (cur - prev) / prev * 100
             arrow = "▲" if pct > 0.05 else ("▼" if pct < -0.05 else "■")
-            text = f"{arrow} {pct:+.1f}% έναντι {year - 1} (ίδιοι μήνες)".replace('.', ',')
+            pct_txt = fmt_dec(pct, signed=True)
+            text = T(f"{arrow} {pct_txt}% έναντι {year - 1} (ίδιοι μήνες)",
+                     f"{arrow} {pct_txt}% vs {year - 1} (same months)")
             return text, (GOOD if pct > 0.05 else BAD if pct < -0.05 else MUTED)
 
         cmp_ = st['cmp']
         t, col = delta(cmp_['cur_cl'], cmp_['prev_cl']) if cmp_ else ("", MUTED)
-        self.kpi_clients.set(fmt_int(st['clients']), t or f"{len(st['months'])} μήνες με δελτίο", col)
+        self.kpi_clients.set(fmt_int(st['clients']), t or T(f"{len(st['months'])} μήνες με δελτίο",
+                                                            f"{len(st['months'])} months with a form"), col)
         t, col = delta(cmp_['cur_ni'], cmp_['prev_ni']) if cmp_ else ("", MUTED)
-        self.kpi_nights.set(fmt_int(st['nights']), t or "συνολικά στο έτος", col)
-        self.kpi_avg.set(fmt_avg(st['nights'], st['clients']), "διανυκτερεύσεις ανά πελάτη")
-        gap_txt = ("   ·   Μήνες χωρίς δελτίο μέσα στο " + str(year) + ": " +
-                   ", ".join(GREEK_MONTHS_SHORT[m - 1] for m in st['gaps'])) if st['gaps'] else ""
-        self.hist_info.set(getattr(self, '_hist_info_base', "") + gap_txt)
-        per_month = [sum((r[2] if by_nights else r[1]) for r in self._hist[year].get(m, [])) for m in range(1, 13)]
+        self.kpi_nights.set(fmt_int(st['nights']), t or T("συνολικά στο έτος", "total for the year"), col)
+        self.kpi_avg.set(fmt_avg(st['nights'], st['clients']), T("διανυκτερεύσεις ανά πελάτη",
+                                                                 "overnight stays per guest"))
+        greece = norm('ΕΛΛΑΔΑ')
+        if flt:
+            pct = st['clients'] / full['clients'] * 100 if full['clients'] else 0
+            self.kpi_share.set(f"{fmt_dec(pct)}%", T(f"των πελατών του {year} ({flt})",
+                                                    f"of the {year} guests ({flt})"))
+        else:
+            gr = sum(c for rows in self._hist[year].values() for k, c, _ in rows if norm(k) == greece)
+            foreign = full['clients'] - gr
+            pct = foreign / full['clients'] * 100 if full['clients'] else 0
+            self.kpi_share.set(f"{fmt_dec(pct)}%", T(f"{fmt_int(foreign)} αλλοδαποί · {fmt_int(gr)} Ελλάδα",
+                                                    f"{fmt_int(foreign)} foreign · {fmt_int(gr)} Greece"))
+
+        gap_txt = (T("   ·   Μήνες χωρίς δελτίο μέσα στο ", "   ·   Months without a form in ") + str(year) + ": " +
+                   ", ".join(month_short(m) for m in full['gaps'])) if full['gaps'] else ""
+        flt_txt = (T(f"   ·   Φίλτρο: {flt}", f"   ·   Filter: {flt}")) if flt else ""
+        self.hist_info.set(getattr(self, '_hist_info_base', "") + flt_txt + gap_txt)
+
+        def series(y):
+            return [sum((r[2] if by_nights else r[1]) for r in view.get(y, {}).get(m, [])) for m in range(1, 13)]
+        per_month = series(year)
+        prev = series(year - 1) if (year - 1) in view else None
+        metric = (T('Διανυκτερεύσεις', 'Overnight stays') if by_nights else T('Πελάτες', 'Guests'))
         sel = self._hist_sel()
         self.hist_chart.set_data(
-            per_month, f"{'Διανυκτερεύσεις' if by_nights else 'Πελάτες'} ανά μήνα · {year}",
-            color=ACCENT if by_nights else TEAL, selected=sel[1] if sel and sel[0] == year else None)
+            per_month, f"{metric} · {year}" + (f" · {flt}" if flt else ""),
+            color=ACCENT if by_nights else TEAL, selected=sel[1] if sel and sel[0] == year else None,
+            prev=prev, prev_label=str(year - 1))
+
+        # top countries of the year
+        by_country = {}
+        for rows in self._hist[year].values():
+            for country, c, _n in rows:
+                by_country[country] = by_country.get(country, 0) + c
+        total = sum(by_country.values())
+        top = sorted(by_country.items(), key=lambda kv: -kv[1])[:10]
+        peak = top[0][1] if top else 1
+        self.top_tree.delete(*self.top_tree.get_children())
+        for i, (country, c) in enumerate(top):
+            bar = "█" * max(1, round(c / peak * 10))
+            hl = flt is not None and norm(country) == norm(flt)
+            self.top_tree.insert('', 'end', iid=f"t{i}", text=country,
+                                 values=(fmt_int(c), f"{bar} {fmt_dec(c / total * 100)}%"),
+                                 tags=('hl',) if hl else ())
+        self.top_title_var.set(T(f"Κορυφαίες χώρες · {year}", f"Top countries · {year}"))
 
     # ---- reminder banner
     def update_reminder(self):
@@ -2312,8 +4199,10 @@ class ElstatApp(tk.Tk):
             else missing_month_reminder(self._hist)
         if r:
             self.reminder_label.configure(
-                text=f"Υπενθύμιση: δεν υπάρχει ακόμη δελτίο για τον {GREEK_MONTHS[r[1] - 1]} {r[0]}. "
-                     "Διαλέξτε το Excel του μήνα στο Βήμα 1 για να το δημιουργήσετε.")
+                text=T(f"Υπενθύμιση: δεν υπάρχει ακόμη δελτίο για τον {month_name(r[1])} {r[0]}. "
+                       "Διαλέξτε το Excel του μήνα στο Βήμα 1 για να το δημιουργήσετε.",
+                       f"Reminder: there is no form yet for {month_name(r[1])} {r[0]}. "
+                       "Choose the month's Excel in Step 1 to create it."))
             self.reminder_frame.grid()
         else:
             self.reminder_frame.grid_remove()
@@ -2331,32 +4220,55 @@ class ElstatApp(tk.Tk):
             return path
         rows = self._hist.get(year, {}).get(month)
         if not rows:
-            messagebox.showerror("Ιστορικό", "Δεν βρέθηκαν στοιχεία για αυτόν τον μήνα.")
+            messagebox.showerror(T("Ιστορικό", "History"), T("Δεν βρέθηκαν στοιχεία για αυτόν τον μήνα.",
+                                               "No data was found for this month."))
             return None
         s, _m, _excel, template, _out = self._collect()
         errors = validate_hotel(s)
         if not template or not os.path.isfile(template):
-            errors.append("Το άδειο PDF (template) δεν βρέθηκε - δείτε την καρτέλα «Στοιχεία ξενοδοχείου».")
+            errors.append(T("Το άδειο PDF (template) δεν βρέθηκε - δείτε την καρτέλα «Στοιχεία ξενοδοχείου».",
+                            "The blank PDF (template) was not found - see the “Hotel details” tab."))
         if errors:
-            messagebox.showerror("Δεν μπορώ να ξαναφτιάξω το δελτίο", "\n".join("• " + e for e in errors))
+            messagebox.showerror(T("Δεν μπορώ να ξαναφτιάξω το δελτίο", "I can't rebuild the form"), "\n".join("• " + e for e in errors))
             return None
         rec = load_month_records().get((year, month), {})
         employees = rec.get('employees', '')
-        name = f"{GREEK_MONTHS[month - 1]} {year}"
+        name = f"{month_name(month)} {year}"
         if not employees:
             employees = simpledialog.askstring(
-                "Σύνολο εργαζομένων",
-                f"Το δελτίο του {name} δημιουργήθηκε πριν αποθηκεύεται ο αριθμός εργαζομένων.\n"
-                "Πληκτρολογήστε το Σύνολο Εργαζομένων εκείνου του μήνα:", parent=self)
+                T("Σύνολο εργαζομένων", "Total employees"),
+                T(f"Το δελτίο του {name} δημιουργήθηκε πριν αποθηκεύεται ο αριθμός εργαζομένων.\n"
+                  "Πληκτρολογήστε το Σύνολο Εργαζομένων εκείνου του μήνα:",
+                  f"The form for {name} was created before the number of employees was saved.\n"
+                  "Type the Total employees for that month:"), parent=self)
             if employees is None:
                 return None
             employees = employees.strip()
         last = calendar.monthrange(year, month)[1]
+        sign_date = self.mon_vars['sign_date'].get().strip() or datetime.date.today().strftime('%d/%m/%Y')
+        while True:       # ask which signing date to print (today by default)
+            sign_date = simpledialog.askstring(
+                T("Ημερομηνία υπογραφής", "Signing date"),
+                T(f"Ποια ημερομηνία υπογραφής να γραφτεί στο δελτίο του {name};\n(ΗΗ/ΜΜ/ΕΕΕΕ - προτείνεται η σημερινή)",
+                  f"Which signing date should be printed on the form for {name}?\n"
+                  "(DD/MM/YYYY - today is suggested)"),
+                initialvalue=datetime.date.today().strftime('%d/%m/%Y') if not sign_date else sign_date,
+                parent=self)
+            if sign_date is None:
+                return None
+            sign_date = sign_date.strip()
+            try:
+                datetime.datetime.strptime(sign_date, "%d/%m/%Y")
+                break
+            except ValueError:
+                messagebox.showerror(T("Λάθος ημερομηνία", "Invalid date"),
+                                     T("Η ημερομηνία πρέπει να είναι της μορφής ΗΗ/ΜΜ/ΕΕΕΕ και υπαρκτή.",
+                                       "The date must be in the format DD/MM/YYYY and must exist."))
         mon = dict(year=str(year), month=str(month), date_to=f"{last:02d}/{month:02d}/{year}",
-                   days_of_month=str(rec.get('days') or last), employees=employees)
+                   days_of_month=str(rec.get('days') or last), employees=employees, sign_date=sign_date)
         problems = validate_month(mon)
         if problems:
-            messagebox.showerror("Λάθος στοιχεία", "\n".join("• " + e for e in problems))
+            messagebox.showerror(T("Λάθος στοιχεία", "Invalid details"), "\n".join("• " + e for e in problems))
             return None
         os.makedirs(ARCHIVE_DIR, exist_ok=True)
         self.config(cursor='watch')
@@ -2365,14 +4277,16 @@ class ElstatApp(tk.Tk):
             process_elstat_report(None, template, path, s, mon, rows_override=rows, save_history=False)
             save_month_record(year, month, employees, mon['days_of_month'], mon['date_to'])
         except PermissionError:
-            messagebox.showerror("Σφάλμα", "Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.")
+            messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
+                                             "I can't write the PDF. Close it if it is open and try again."))
             return None
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Κάτι πήγε στραβά:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
             return None
         finally:
             self.config(cursor='')
-        self._status(f"Το δελτίο {name} ξαναδημιουργήθηκε από το ιστορικό.")
+        self._status(T(f"Το δελτίο {name} ξαναδημιουργήθηκε από το ιστορικό.",
+                       f"The form for {name} was rebuilt from the history."))
         self.refresh_history()
         return path
 
@@ -2385,14 +4299,15 @@ class ElstatApp(tk.Tk):
         path = sel and self._ensure_month_pdf(*sel)
         if path:
             open_file(path)
-            self._status(f"Άνοιξε το δελτίο {GREEK_MONTHS[sel[1] - 1]} {sel[0]}.")
+            self._status(T(f"Άνοιξε το δελτίο {month_name(sel[1])} {sel[0]}.",
+                           f"Opened the form for {month_name(sel[1])} {sel[0]}."))
 
     def hist_save_as(self):
         sel = self._month_from_selection()
         path = sel and self._ensure_month_pdf(*sel)
         if not path:
             return
-        fp = filedialog.asksaveasfilename(title="Αποθήκευση δελτίου ως", defaultextension=".pdf",
+        fp = filedialog.asksaveasfilename(title=T("Αποθήκευση δελτίου ως", "Save form as"), defaultextension=".pdf",
                                           initialdir=self._pdf_start_dir(),
                                           initialfile=os.path.basename(path), filetypes=[("PDF Files", "*.pdf")])
         if not fp:
@@ -2400,9 +4315,9 @@ class ElstatApp(tk.Tk):
         try:
             shutil.copy2(path, fp)
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η αποθήκευση:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Δεν ήταν δυνατή η αποθήκευση:\n{e}", f"Could not save:\n{e}"))
             return
-        self._status(f"✓ Αποθηκεύτηκε: {fp}")
+        self._status(T(f"✓ Αποθηκεύτηκε: {fp}", f"✓ Saved: {fp}"))
 
     def hist_print(self):
         sel = self._month_from_selection()
@@ -2414,18 +4329,22 @@ class ElstatApp(tk.Tk):
         sel = self._month_from_selection()
         if not sel:
             return
-        name = f"{GREEK_MONTHS[sel[1] - 1]} {sel[0]}"
-        if not messagebox.askyesno("Διαγραφή μήνα",
-                                   f"Να διαγραφεί ο μήνας {name} από το ιστορικό;\n"
-                                   "(Θα διαγραφεί και το αρχειοθετημένο PDF του. Το αρχείο που αποθηκεύσατε "
-                                   "εσείς δεν θα πειραχτεί.)", default='no'):
+        name = f"{month_name(sel[1])} {sel[0]}"
+        if not messagebox.askyesno(T("Διαγραφή μήνα", "Delete month"),
+                                   T(f"Να διαγραφεί ο μήνας {name} από το ιστορικό;\n"
+                                     "(Θα διαγραφεί και το αρχειοθετημένο PDF του. Το αρχείο που αποθηκεύσατε "
+                                     "εσείς δεν θα πειραχτεί.)",
+                                     f"Delete the month {name} from the history?\n"
+                                     "(Its archived PDF will also be deleted. The file you saved "
+                                     "yourself will not be touched.)"), default='no'):
             return
         try:
             delete_month(*sel)
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Δεν ήταν δυνατή η διαγραφή:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Δεν ήταν δυνατή η διαγραφή:\n{e}", f"Could not delete:\n{e}"))
             return
-        self._status(f"Ο μήνας {name} διαγράφηκε από το ιστορικό.")
+        self._status(T(f"Ο μήνας {name} διαγράφηκε από το ιστορικό.",
+                       f"The month {name} was deleted from the history."))
         self.refresh_history()
 
     def hist_year_pdf(self, mode):
@@ -2440,7 +4359,7 @@ class ElstatApp(tk.Tk):
         s = {k: v.get().strip() for k, v in self.set_vars.items()}
         name = f"ELSTAT_Synopsi_{year}.pdf"
         if mode == 'save':
-            fp = filedialog.asksaveasfilename(title="Αποθήκευση σύνοψης έτους", defaultextension=".pdf",
+            fp = filedialog.asksaveasfilename(title=T("Αποθήκευση σύνοψης έτους", "Save year summary"), defaultextension=".pdf",
                                               initialdir=self._pdf_start_dir(), initialfile=name,
                                               filetypes=[("PDF Files", "*.pdf")])
             if not fp:
@@ -2451,62 +4370,67 @@ class ElstatApp(tk.Tk):
         try:
             make_year_summary_pdf(year, self._hist, s, fp)
         except PermissionError:
-            messagebox.showerror("Σφάλμα", "Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.")
+            messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό και δοκιμάστε ξανά.",
+                                             "I can't write the PDF. Close it if it is open and try again."))
             return
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Κάτι πήγε στραβά:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
             return
         if mode == 'save':
-            self._status(f"✓ Η σύνοψη του {year} αποθηκεύτηκε: {fp}")
+            self._status(T(f"✓ Η σύνοψη του {year} αποθηκεύτηκε: {fp}", f"✓ The {year} summary was saved: {fp}"))
             open_file(fp)
         else:
             self._status(print_file(fp)[1])
 
     def browse_pdf(self):
-        fp = filedialog.askopenfilename(title="Διαλέξτε το άδειο PDF της ΕΛΣΤΑΤ", initialdir=BASE_DIR,
+        fp = filedialog.askopenfilename(title=T("Διαλέξτε το άδειο PDF της ΕΛΣΤΑΤ",
+                                                "Choose the blank ELSTAT PDF"), initialdir=BASE_DIR,
                                         filetypes=[("PDF Files", "*.pdf")])
         if fp:
-            self.pdf_var.set(fp)
-            self._remember_template(fp)
+            self._accept_dropped_template(fp)
 
     def browse_output(self):
         cur = self.out_var.get().strip()
-        fp = filedialog.asksaveasfilename(title="Αποθήκευση PDF ως", defaultextension=".pdf",
+        fp = filedialog.asksaveasfilename(title=T("Αποθήκευση PDF ως", "Save PDF as"), defaultextension=".pdf",
                                           initialdir=os.path.dirname(cur) or BASE_DIR,
                                           initialfile=os.path.basename(cur) or "ELSTAT_Report.pdf",
                                           filetypes=[("PDF Files", "*.pdf")])
         if fp:
-            self.out_var.set(fp)
-            self.output_custom = True
+            self._accept_dropped_output(fp)
 
     # --------------------------------------------------------------- generate
     def generate(self, print_after=False):
         s, m, excel, template, out = self._collect()
         errors = validate_inputs(s, m, excel, template, out)
         if errors:
-            messagebox.showerror("Λάθος στοιχεία", "\n".join("• " + e for e in errors))
+            messagebox.showerror(T("Λάθος στοιχεία", "Invalid details"), "\n".join("• " + e for e in errors))
             return
 
         info = period_as_month(read_excel_period(excel))
         if info and (str(info[0]), str(int(m['month']))) != (m['year'], str(info[1])):
             if not messagebox.askyesno(
-                    "Διαφορετική περίοδος",
-                    f"Το Excel αφορά τον μήνα {GREEK_MONTHS[info[1] - 1]} {info[0]}, ενώ στη φόρμα έχετε "
-                    f"{GREEK_MONTHS[int(m['month']) - 1]} {m['year']}.\n\nΝα συνεχίσω παρ' όλα αυτά;",
+                    T("Διαφορετική περίοδος", "Different period"),
+                    T(f"Το Excel αφορά τον μήνα {month_name(info[1])} {info[0]}, ενώ στη φόρμα έχετε "
+                      f"{month_name(int(m['month']))} {m['year']}.\n\nΝα συνεχίσω παρ' όλα αυτά;",
+                      f"The Excel is for {month_name(info[1])} {info[0]}, but the form has "
+                      f"{month_name(int(m['month']))} {m['year']}.\n\nContinue anyway?"),
                     default='no'):
                 return
 
         if self.prefs['confirm_overwrite'] and os.path.exists(out):
-            if not messagebox.askyesno("Υπάρχει ήδη αρχείο",
-                                       f"Το αρχείο υπάρχει ήδη:\n{out}\n\nΝα αντικατασταθεί;", default='no'):
+            if not messagebox.askyesno(T("Υπάρχει ήδη αρχείο", "File already exists"),
+                                       T(f"Το αρχείο υπάρχει ήδη:\n{out}\n\nΝα αντικατασταθεί;",
+                                         f"The file already exists:\n{out}\n\nReplace it?"), default='no'):
                 return
 
         saved = dict(s, last_dir=os.path.dirname(excel), last_employees=m['employees'])
         try:
             save_hotel_settings(saved)
         except Exception as e:
-            messagebox.showwarning("Προσοχή", f"Δεν ήταν δυνατή η αποθήκευση των στοιχείων στον φάκελο "
-                                              f"δεδομένων:\n{DATA_DIR}\n\n{e}")
+            messagebox.showwarning(T("Προσοχή", "Warning"), T(f"Δεν ήταν δυνατή η αποθήκευση των στοιχείων στον φάκελο "
+                                                f"δεδομένων:\n{DATA_DIR}\n\n{e}",
+                                                f"Could not save the details to the data "
+                                                f"folder:\n{DATA_DIR}\n\n{e}"))
         self.current_settings = saved
         if template != (self.prefs.get('template_pdf') or DEFAULT_TEMPLATE):
             self._remember_template(template)
@@ -2516,37 +4440,45 @@ class ElstatApp(tk.Tk):
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             result = process_elstat_report(excel, template, out, s, m)
         except PermissionError:
-            messagebox.showerror("Σφάλμα", "Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε άλλο "
-                                           "πρόγραμμα και δοκιμάστε ξανά.")
+            messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε άλλο "
+                                             "πρόγραμμα και δοκιμάστε ξανά.",
+                                             "I can't write the PDF. Close it if it is open in another "
+                                             "program and try again."))
             return
         except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Κάτι πήγε στραβά:\n{e}")
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
             return
         finally:
             self._set_busy(False)
 
         warnings_txt = []
         if result['unmapped']:
-            lines = ", ".join(f"{c} ({p} πελάτες / {n} διανυκτ.)" for c, p, n in result['unmapped'])
-            warnings_txt.append("Αυτές οι χώρες ΔΕΝ μπήκαν στο PDF (λείπουν από το πρόγραμμα): " + lines)
+            lines = ", ".join(T(f"{c} ({p} πελάτες / {n} διανυκτ.)", f"{c} ({p} guests / {n} nights)") for c, p, n in result['unmapped'])
+            warnings_txt.append(T("Αυτές οι χώρες ΔΕΝ μπήκαν στο PDF (λείπουν από το πρόγραμμα): ",
+                                  "These countries were NOT included in the PDF (missing from the program): ") + lines)
         if result['excel_total'] and tuple(result['excel_total']) != tuple(result['computed_total']):
-            warnings_txt.append(f"Το γενικό σύνολο του PDF {result['computed_total']} διαφέρει από το σύνολο "
-                                f"του Excel {result['excel_total']}. Ελέγξτε το πριν το υποβάλετε!")
+            warnings_txt.append(T(f"Το γενικό σύνολο του PDF {result['computed_total']} διαφέρει από το σύνολο "
+                                  f"του Excel {result['excel_total']}. Ελέγξτε το πριν το υποβάλετε!",
+                                  f"The PDF grand total {result['computed_total']} differs from the Excel "
+                                  f"total {result['excel_total']}. Check it before submitting!"))
 
         try:
             gy, gm = int(m['year']), int(m['month'])
             if self.prefs['keep_archive']:
                 archive_copy(gy, gm, out)
             save_month_record(gy, gm, m['employees'], m['days_of_month'], m['date_to'])
-            self._status(f"✓ Το δελτίο {GREEK_MONTHS[gm - 1]} {gy} δημιουργήθηκε και αρχειοθετήθηκε.")
+            self._status(T(f"✓ Το δελτίο {month_name(gm)} {gy} δημιουργήθηκε και αρχειοθετήθηκε.",
+                           f"✓ The form for {month_name(gm)} {gy} was created and archived."))
         except Exception:
             pass
         self.refresh_history()
         print_status = None
         if print_after:
             if warnings_txt:      # never send a form with problems straight to the printer
-                print_status = (False, "Δεν εκτυπώθηκε αυτόματα επειδή υπάρχουν προειδοποιήσεις. "
-                                       "Ελέγξτε το δελτίο και μετά πατήστε «Εκτύπωση».")
+                print_status = (False, T("Δεν εκτυπώθηκε αυτόματα επειδή υπάρχουν προειδοποιήσεις. "
+                                         "Ελέγξτε το δελτίο και μετά πατήστε «Εκτύπωση».",
+                                         "It was not printed automatically because there are warnings. "
+                                         "Check the form and then click “Print”."))
             else:
                 print_status = print_file(out)
         if self.prefs['open_after'] and not print_after:
