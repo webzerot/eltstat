@@ -2034,6 +2034,10 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode)
 
     computed = (totals['9']['clients'], totals['9']['nights'])
+    try:        # the real values of every field (used by the temporary layout editor of the preview)
+        live_values = manual_field_values(settings_data, monthly_data, totals)
+    except Exception:
+        live_values = None
     gr = pdf_data.get(norm('ΕΛΛΑΔΑ'), {'clients': 0, 'nights': 0})
     summary = [
         (T("1.  Ελλάδα", "1.  Greece"), gr['clients'], gr['nights'], False),
@@ -2050,7 +2054,8 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         (T("9.  ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "9.  GRAND TOTAL"), totals['9']['clients'], totals['9']['nights'], True),
     ]
     return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary,
-            'layout_warning': layout_warning, 'layout_info': layout_info, 'pdf_data': pdf_data}
+            'layout_warning': layout_warning, 'layout_info': layout_info, 'pdf_data': pdf_data,
+            'live_values': live_values}
 
 
 # ----------------------------------------------------------------- look & feel
@@ -3423,7 +3428,7 @@ class PDFPreviewDialog(tk.Toplevel):
     PAD = 28
     MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
 
-    def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None):
+    def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None, get_live=None):
         super().__init__(parent)
         self.app = parent
         self.pdf_path = pdf_path
@@ -3431,6 +3436,7 @@ class PDFPreviewDialog(tk.Toplevel):
         self._on_continue = on_continue
         self._on_close = on_close
         self._on_regenerate = on_regenerate
+        self._get_live = get_live       # -> {'values': ..., 'rows': ...} of the form being previewed
         self.layout = None              # temporary layout from the editor; None = the normal way of filling
         self._finished = False
         self._busy = False
@@ -3740,8 +3746,14 @@ class PDFPreviewDialog(tk.Toplevel):
             except tk.TclError:
                 pass
         base = self.layout if self.layout is not None else load_manual_layout()
+        live = None
+        if self._get_live:
+            try:
+                live = self._get_live()
+            except Exception:
+                live = None
         editor = LayoutEditor(self.app, self.template, on_save=self._layout_applied,
-                              layout=base, temporary=True, parent=self)
+                              layout=base, temporary=True, parent=self, live=live)
         self._editor = editor
         editor.lift()
         editor.focus_force()
@@ -3944,7 +3956,7 @@ class LayoutEditor(tk.Toplevel):
     NUDGE_STEPS = ("0.1", "0.5", "1", "2", "5")
     QUICK_COLORS = ('#000000', '#1f2937', '#1d4ed8', '#047857', '#b91c1c', '#7c3aed')
 
-    def __init__(self, app, template_path, on_save=None, layout=None, temporary=False, parent=None):
+    def __init__(self, app, template_path, on_save=None, layout=None, temporary=False, parent=None, live=None):
         # temporary=True: opened from the PDF preview - "Save changes" hands the layout to the preview and
         # nothing is written to the saved manual layout
         host = parent or app
@@ -3975,6 +3987,11 @@ class LayoutEditor(tk.Toplevel):
         self.row_ys = [{}, {}]
         self._read_template()
         self.sample = manual_sample_values()
+        # opened from the preview: show the REAL values and country rows of this report instead of made-up ones
+        self.live_rows = None
+        if temporary and live and live.get('values'):
+            self.sample = dict(live['values'])
+            self.live_rows = dict(live.get('rows') or {})
         self.families = manual_font_families()
         self.show_sample = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar()
@@ -4074,11 +4091,13 @@ class LayoutEditor(tk.Toplevel):
         self.redo_btn.pack(side="left")
         self._update_undo_buttons()
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
-        ttk.Checkbutton(bar, text=T("Δείγμα δεδομένων", "Sample data"), variable=self.show_sample,
+        ttk.Checkbutton(bar, text=(T("Πραγματικά δεδομένα", "Real data") if self.live_rows is not None
+                                   else T("Δείγμα δεδομένων", "Sample data")), variable=self.show_sample,
                         command=self._draw_items).pack(side="left")
         ttk.Button(bar, text=T("Αποθήκευση αλλαγών", "Save changes") if self.temporary else T("Αποθήκευση", "Save"),
                    style='PrintSm.TButton', command=self.save).pack(side="right")
-        ttk.Button(bar, text=T("Δοκιμαστικό PDF", "Test PDF"), command=self._test_pdf).pack(side="right", padx=8)
+        if not self.temporary:      # the test PDF (made-up data) belongs to the normal editor in Settings only
+            ttk.Button(bar, text=T("Δοκιμαστικό PDF", "Test PDF"), command=self._test_pdf).pack(side="right", padx=8)
         ttk.Button(bar, text=T("Επαναφορά όλων", "Reset all"), style='Danger.TButton',
                    command=self._reset_all).pack(side="right")
 
@@ -4415,12 +4434,23 @@ class LayoutEditor(tk.Toplevel):
         drop = px_size * 0.2
         step = it['step']
         sample_on = self.show_sample.get()
+        live = self.live_rows is not None
+
+        def real(target, column):       # the real number of one country ('' = not in this report)
+            d = self.live_rows.get(target)
+            return str(d[column]) if d else ''
+
         parent, country, source = it.get('parent'), it.get('country'), it.get('source')
         if country:
             y0 = self.row_ys[it['page']].get(country)
             if y0 is None:
                 return
-            shown = ('12' if parent.endswith('_c') else '34') if sample_on else ''
+            if not sample_on:
+                shown = ''
+            elif live:
+                shown = real(country, 'clients' if parent.endswith('_c') else 'nights')
+            else:
+                shown = '12' if parent.endswith('_c') else '34'
             entries = [(it['x'], y0 + it['y'], shown)]
         elif parent:
             text = self.sample.get(parent, '')
@@ -4428,7 +4458,13 @@ class LayoutEditor(tk.Toplevel):
             entries = [(it['x'], it['y'], text[idx] if sample_on and 0 <= idx < len(text) else '')]
         elif fid.startswith('rows'):
             ys = list(self.row_ys[it['page']].values()) or [400.0]
-            if sample_on:
+            if sample_on and live:
+                column = 'clients' if fid.endswith('_c') else 'nights'
+                entries = [(it['x'], y + it['y'], real(c, column))
+                           for c, y in self.row_ys[it['page']].items() if c in self.live_rows]
+                if not entries:
+                    entries = [(it['x'], ys[0] + it['y'], '')]
+            elif sample_on:
                 shown = '12' if fid.endswith('_c') else '34'
                 entries = [(it['x'], y + it['y'], shown) for y in ys]
             else:
@@ -4437,7 +4473,12 @@ class LayoutEditor(tk.Toplevel):
             entries = [(it['x'], it['y'], it.get('text', ''))]
         elif source:
             if source.startswith('country:'):
-                shown = ('1234' if source.endswith(':c') else '5678') if sample_on else ''
+                if not sample_on:
+                    shown = ''
+                elif live:
+                    shown = real(source.split(':')[1], 'clients' if source.endswith(':c') else 'nights')
+                else:
+                    shown = '1234' if source.endswith(':c') else '5678'
             else:
                 shown = self.sample.get(source, '') if sample_on else ''
             entries = [(it['x'], it['y'], shown)]
@@ -7694,7 +7735,11 @@ class ElstatApp(TkBase):
             self._status(T("Η προεπισκόπηση έκλεισε - το αρχείο δεν αποθηκεύτηκε.",
                            "The preview was closed - the file was not saved."))
 
-        PDFPreviewDialog(self, target, template, proceed, closed, regenerate)
+        def live_data():
+            res = state['result']
+            return {'values': res.get('live_values'), 'rows': res.get('pdf_data')}
+
+        PDFPreviewDialog(self, target, template, proceed, closed, regenerate, live_data)
 
     def _confirm_replace(self, out, parent=None):
         """The "file already exists" question (when it is turned on in Settings). True = go ahead."""
