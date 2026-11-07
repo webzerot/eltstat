@@ -1757,6 +1757,36 @@ def render_pdf_page_png(pdf_path, page_index, scale):
     return None
 
 
+def commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode='overlay'):
+    """Remembers a finished form: the first form made the default way becomes the layout reference, and the
+    month's rows go into the history CSV (re-running a month replaces its old rows).
+    Kept separate so a previewed form can be committed only after the user chose to save it."""
+    if pdf_mode == 'overlay' and load_layout_reference() is None:
+        try:        # the first real form made the default way shows the template the fixed positions fit
+            save_layout_reference(template_pdf)
+        except Exception:
+            pass
+    csv_filename = HISTORY_CSV
+    csv_data = []
+    for country, vals in pdf_data.items():
+        csv_data.append({
+            'Etos': str(int(monthly_data['year'])),
+            'Minas': str(int(monthly_data['month'])),
+            'Chwra': country,
+            'Pelates': vals['clients'],
+            'Dianykterefseis': vals['nights']
+        })
+    df_csv = pd.DataFrame(csv_data)
+    if os.path.exists(csv_filename):
+        # re-running the same month replaces its old rows instead of duplicating them
+        old_df = pd.read_csv(csv_filename, encoding='utf-8-sig', dtype=str)
+        keep = ~((pd.to_numeric(old_df['Etos'], errors='coerce') == int(monthly_data['year'])) &
+                 (pd.to_numeric(old_df['Minas'], errors='coerce') == int(monthly_data['month'])))
+        df_csv = pd.concat([old_df[keep], df_csv.astype(str)], ignore_index=True)
+    ensure_data_dir()
+    df_csv.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+
+
 def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, monthly_data,
                          rows_override=None, save_history=True, pdf_mode='overlay', manual_layout=None):
     # 1. Φόρτωση Γραμματοσειράς
@@ -2000,34 +2030,8 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
-    if save_history and pdf_mode == 'overlay' and load_layout_reference() is None:
-        try:        # the first real form made the default way shows the template the fixed positions fit
-            save_layout_reference(template_pdf)
-        except Exception:
-            pass
-
     if save_history:
-        # Αυτόματη δημιουργία ή ενημέρωση ιστορικού CSV
-        csv_filename = HISTORY_CSV
-        csv_data = []
-        for country, vals in pdf_data.items():
-            csv_data.append({
-                'Etos': str(int(monthly_data['year'])),
-                'Minas': str(int(monthly_data['month'])),
-                'Chwra': country,
-                'Pelates': vals['clients'],
-                'Dianykterefseis': vals['nights']
-            })
-        df_csv = pd.DataFrame(csv_data)
-    
-        if os.path.exists(csv_filename):
-            # re-running the same month replaces its old rows instead of duplicating them
-            old_df = pd.read_csv(csv_filename, encoding='utf-8-sig', dtype=str)
-            keep = ~((pd.to_numeric(old_df['Etos'], errors='coerce') == int(monthly_data['year'])) &
-                     (pd.to_numeric(old_df['Minas'], errors='coerce') == int(monthly_data['month'])))
-            df_csv = pd.concat([old_df[keep], df_csv.astype(str)], ignore_index=True)
-        ensure_data_dir()
-        df_csv.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+        commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode)
 
     computed = (totals['9']['clients'], totals['9']['nights'])
     gr = pdf_data.get(norm('ΕΛΛΑΔΑ'), {'clients': 0, 'nights': 0})
@@ -2046,7 +2050,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         (T("9.  ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "9.  GRAND TOTAL"), totals['9']['clients'], totals['9']['nights'], True),
     ]
     return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary,
-            'layout_warning': layout_warning, 'layout_info': layout_info}
+            'layout_warning': layout_warning, 'layout_info': layout_info, 'pdf_data': pdf_data}
 
 
 # ----------------------------------------------------------------- look & feel
@@ -3403,127 +3407,406 @@ class HelpPanel(ttk.Frame):
 
 
 class PDFPreviewDialog(tk.Toplevel):
-    """In-app preview of the generated PDF; Continue opens the normal Result dialog."""
+    """In-app preview of the PDF that is about to be made. Nothing has been saved yet:
 
-    def __init__(self, parent, pdf_path, on_continue):
+    * zoom / pan with the same controls as the layout editor (Ctrl + wheel, - / + / Fit, drag to move),
+    * "Edit layout..." opens the layout editor for THIS PDF only (the saved settings are never touched),
+    * "Save & continue" asks the caller to save the file for real and to show the Result window,
+    * "Close preview" throws the preview away without saving anything.
+
+    Callbacks (all given by the application):
+      on_continue(dialog) -> True when everything was saved (the dialog then closes), False to stay here
+      on_close()          -> called after the preview was closed without saving
+      on_regenerate(layout) -> rebuilds the preview PDF with this temporary layout (None = the normal way);
+                               raises when it cannot
+    """
+    PAD = 28
+    MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
+
+    def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None):
         super().__init__(parent)
+        self.app = parent
+        self.pdf_path = pdf_path
+        self.template = template_path
+        self._on_continue = on_continue
+        self._on_close = on_close
+        self._on_regenerate = on_regenerate
+        self.layout = None              # temporary layout from the editor; None = the normal way of filling
+        self._finished = False
+        self._busy = False
+        self._editor = None
+        self.page = 0
+        self.zoom = 1.0
+        self.ox = self.oy = self.PAD
+        self._sw = self._sh = 1
+        self._photos = {}
+        self._version = 0               # grows every time the preview PDF is rebuilt (drops cached pictures)
+        self._auto_fit = True           # keep the page fitted while the window is resized
+        self._fit_pending = True
+        self._redraw_job = None
+        self._last_size = (0, 0)
+        self.sizes = []
+        self._read_pdf()
+
         self.title(T("Προεπισκόπηση PDF", "PDF preview"))
         self.configure(bg=BG)
         self.transient(parent)
-        self.minsize(720, 600)
-        self._on_continue = on_continue
-        self._continued = False
-        self._images = []
+        self.minsize(780, 580)
+        self._build()
+        self._update_edit_state()
 
-        header = ttk.Frame(self, padding=(16, 12, 16, 8))
-        header.pack(fill="x")
-        ttk.Label(
-            header,
-            text=T("Ελέγξτε το δελτίο πριν συνεχίσετε",
-                   "Review the form before continuing"),
-            style='CardBold.TLabel'
-        ).pack(anchor="w")
-        ttk.Label(
-            header,
-            text=T("Αυτή είναι η προεπισκόπηση του PDF που δημιουργήθηκε. "
-                   "Όταν τελειώσετε τον έλεγχο, πατήστε «Συνέχεια στο αποτέλεσμα».",
-                   "This is a preview of the generated PDF. When you finish reviewing it, "
-                   "press “Continue to result”."),
-            style='Hint.TLabel',
-            wraplength=900,
-            justify="left"
-        ).pack(anchor="w", pady=(4, 0))
-
-        viewer = ttk.Frame(self)
-        viewer.pack(fill="both", expand=True, padx=14, pady=(4, 10))
-        self.canvas = tk.Canvas(viewer, bg="#596579", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(viewer, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        content = tk.Frame(self.canvas, bg="#596579")
-        self._content_window = self.canvas.create_window((0, 0), window=content, anchor="n")
-        content.bind("<Configure>", lambda _e: self.canvas.configure(
-            scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", self._resize_content)
-
-        rendered = 0
-        try:
-            reader = pypdf.PdfReader(pdf_path)
-            page_count = len(reader.pages)
-        except Exception:
-            page_count = 0
-
-        for page_index in range(page_count):
-            ttk.Label(
-                content,
-                text=T(f"Σελίδα {page_index + 1}", f"Page {page_index + 1}")
-            ).pack(pady=(14, 5))
-            png = render_pdf_page_png(pdf_path, page_index, 0.85)
-            if png:
-                try:
-                    photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
-                    self._images.append(photo)
-                    image_label = tk.Label(content, image=photo, bg="white",
-                                            bd=1, relief="solid")
-                    image_label.pack(padx=12, pady=(0, 14))
-                    rendered += 1
-                except tk.TclError:
-                    pass
-
-        if not rendered:
-            ttk.Label(
-                content,
-                text=T("Δεν ήταν δυνατή η εμφάνιση προεπισκόπησης σε αυτόν τον υπολογιστή. "
-                       "Μπορείτε να ανοίξετε το PDF εξωτερικά και μετά να συνεχίσετε.",
-                       "A preview could not be rendered on this computer. "
-                       "You can open the PDF externally and then continue."),
-                style='CardHint.TLabel',
-                wraplength=650,
-                justify="center"
-            ).pack(padx=30, pady=50)
-            ttk.Button(
-                content,
-                text=T("Άνοιγμα PDF", "Open PDF"),
-                command=lambda: open_file(pdf_path)
-            ).pack(pady=(0, 24))
-
-        footer = ttk.Frame(self, padding=(14, 8, 14, 14))
-        footer.pack(fill="x")
-        ttk.Button(
-            footer,
-            text=T("Άνοιγμα PDF", "Open PDF"),
-            command=lambda: open_file(pdf_path)
-        ).pack(side="left")
-        ttk.Button(
-            footer,
-            text=T("Συνέχεια στο αποτέλεσμα  →", "Continue to result  →"),
-            style='Primary.TButton',
-            command=self._continue
-        ).pack(side="right")
-
-        self.bind("<Escape>", lambda _e: self._continue())
-        self.protocol("WM_DELETE_WINDOW", self._continue)
-        self.update_idletasks()
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        self.bind('<Escape>', lambda e: self._close())
+        for seq in ('<plus>', '<equal>', '<KP_Add>'):
+            self.bind(seq, lambda e: self._set_zoom(self.zoom * 1.2))
+        for seq in ('<minus>', '<KP_Subtract>'):
+            self.bind(seq, lambda e: self._set_zoom(self.zoom / 1.2))
+        self.bind('<Control-0>', lambda e: self._fit())
+        self.bind('<Prior>', lambda e: self._step_page(-1))
+        self.bind('<Next>', lambda e: self._step_page(1))
+        self.bind('<Up>', lambda e: self.cv.yview_scroll(-3, 'units'))
+        self.bind('<Down>', lambda e: self.cv.yview_scroll(3, 'units'))
+        self.bind('<Left>', lambda e: self.cv.xview_scroll(-3, 'units'))
+        self.bind('<Right>', lambda e: self.cv.xview_scroll(3, 'units'))
         try:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            w, h = min(1100, sw - 50), min(900, sh - 70)
+            w, h = min(1180, sw - 60), min(920, sh - 80)
             x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
             y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
-            self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
-            self.grab_set()
+            self.geometry(f"{w}x{h}+{max(0, min(x, sw - w))}+{max(0, min(y, sh - h - 40))}")
         except tk.TclError:
-            self.geometry("1000x800")
+            self.geometry("1100x820")
+        self.after(120, self._regrab)
 
-    def _resize_content(self, event):
-        self.canvas.coords(self._content_window, event.width // 2, 0)
+    # ------------------------------------------------------------------ setup
+    def _read_pdf(self):
+        sizes = []
+        try:
+            for page in pypdf.PdfReader(self.pdf_path).pages:
+                box = page.mediabox
+                sizes.append((float(box.width), float(box.height)))
+        except Exception:
+            pass
+        self.sizes = sizes or [(595.0, 842.0)]
+        self.page = min(self.page, len(self.sizes) - 1)
 
-    def _continue(self):
-        if self._continued:
+    def _regrab(self):
+        try:
+            if self.winfo_exists():
+                self.grab_set()
+                self.focus_set()
+        except tk.TclError:
+            pass
+
+    def _build(self):
+        head = tk.Frame(self, bg=HEADER_BG)
+        head.pack(fill="x")
+        tk.Label(head, text=T("Προεπισκόπηση PDF", "PDF preview"), bg=HEADER_BG, fg=HEADER_FG,
+                 font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
+        tk.Label(head, text=T("Το αρχείο δεν έχει αποθηκευτεί ακόμα · ελέγξτε το, αλλάξτε τη διάταξη αν χρειάζεται "
+                               "και μετά πατήστε «Αποθήκευση & συνέχεια»",
+                               "The file is not saved yet · check it, change the layout if needed, "
+                               "then press “Save & continue”"),
+                 bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
+
+        # ---- toolbar: pages, zoom (same controls as the layout editor), editing
+        bar = ttk.Frame(self, padding=(14, 10, 14, 6))
+        bar.pack(fill="x")
+        if len(self.sizes) > 1:
+            self.page_seg = Segmented(
+                bar, [(i, T(f"Σελίδα {i + 1}", f"Page {i + 1}")) for i in range(len(self.sizes))],
+                self._on_page_seg, self.page)
+            self.page_seg.pack(side="left")
+            ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
+        else:
+            self.page_seg = None
+        ttk.Button(bar, text="−", width=3, command=lambda: self._set_zoom(self.zoom / 1.2)).pack(side="left")
+        self.zoom_lbl = ttk.Label(bar, text="100%", width=6, anchor="center")
+        self.zoom_lbl.pack(side="left")
+        ttk.Button(bar, text="+", width=3, command=lambda: self._set_zoom(self.zoom * 1.2)).pack(side="left")
+        ttk.Button(bar, text=T("Προσαρμογή", "Fit"), command=self._fit).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="100%", width=6, command=lambda: self._set_zoom(1.0)).pack(side="left", padx=(8, 0))
+
+        right = ttk.Frame(bar)
+        right.pack(side="right")
+        self.edit_chip = tk.Label(right, text=T("✎ Προσωρινή διάταξη - μόνο για αυτό το PDF",
+                                                "✎ Temporary layout - this PDF only"),
+                                  bg=WARN_BG, fg=WARN_FG, font=(FONT, 9, 'bold'), padx=10, pady=4)
+        self.discard_btn = ttk.Button(right, text=T("Αναίρεση αλλαγών διάταξης", "Undo layout changes"),
+                                      command=self._discard_edits)
+        self.edit_btn = ttk.Button(right, text=T("Επεξεργασία διάταξης…", "Edit layout…"),
+                                   command=self._edit_layout)
+        self.edit_btn.pack(side="left")
+
+        # ---- bottom: buttons, then the status line above them
+        footer = ttk.Frame(self, padding=(14, 8, 14, 12))
+        footer.pack(side="bottom", fill="x")
+        ttk.Button(footer, text=T("Άνοιγμα PDF", "Open PDF"),
+                   command=lambda: open_file(self.pdf_path)).pack(side="left")
+        self.continue_btn = ttk.Button(footer, text=T("Αποθήκευση & συνέχεια στο αποτέλεσμα  →",
+                                                      "Save & continue to result  →"),
+                                       style='Primary.TButton', command=self._continue)
+        self.continue_btn.pack(side="right")
+        ttk.Button(footer, text=T("Κλείσιμο προεπισκόπησης", "Close preview"),
+                   command=self._close).pack(side="right", padx=8)
+
+        status = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        status.pack(side="bottom", fill="x")
+        ttk.Label(status, text=T("Ctrl + τροχός = ζουμ · σύρετε για μετακίνηση · διπλό κλικ = προσαρμογή/100%",
+                                 "Ctrl + wheel = zoom · drag to move · double-click = fit/100%"),
+                  style='Status.TLabel').pack(side="left")
+        self.render_note = ttk.Label(status, text=T("● Δεν έχει αποθηκευτεί ακόμα", "● Not saved yet"),
+                                     style='Status.TLabel')
+        self.render_note.pack(side="right")
+
+        # ---- the page
+        mid = tk.Frame(self, bg=BORDER)
+        mid.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+        mid_in = tk.Frame(mid, bg=TAB_BG)
+        mid_in.pack(fill="both", expand=True, padx=1, pady=1)
+        mid_in.rowconfigure(0, weight=1)
+        mid_in.columnconfigure(0, weight=1)
+        self.cv = tk.Canvas(mid_in, bg=TAB_BG, highlightthickness=0, width=700, height=520, takefocus=True)
+        vbar = ttk.Scrollbar(mid_in, orient="vertical", command=self.cv.yview)
+        hbar = ttk.Scrollbar(mid_in, orient="horizontal", command=self.cv.xview)
+        self.cv.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self.cv.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        self.cv.bind('<Configure>', self._on_canvas_configure)
+        self.cv.bind('<ButtonPress-1>', self._on_press)
+        self.cv.bind('<B1-Motion>', self._on_drag)
+        self.cv.bind('<ButtonRelease-1>', lambda e: self.cv.configure(cursor='hand2'))
+        self.cv.bind('<Double-Button-1>', self._on_double_click)
+        self.cv.bind('<Enter>', lambda e: self.cv.configure(cursor='hand2'))
+        self.cv.bind('<MouseWheel>', self._on_wheel)
+        self.cv.bind('<Button-4>', self._on_wheel)
+        self.cv.bind('<Button-5>', self._on_wheel)
+
+    def _update_edit_state(self):
+        edited = self.layout is not None
+        for widget in (self.edit_chip, self.discard_btn):
+            widget.pack_forget()
+        if edited:
+            self.edit_chip.pack(side="left", padx=(0, 8), before=self.edit_btn)
+            self.discard_btn.pack(side="left", padx=(0, 8), before=self.edit_btn)
+
+    # ------------------------------------------------------------------ drawing (centred, like the editor)
+    def _page_photo(self):
+        key = (self._version, self.page, round(self.zoom, 3))
+        if key in self._photos:
+            return self._photos[key]
+        png = render_pdf_page_png(self.pdf_path, self.page, self.zoom)
+        photo = None
+        if png:
+            try:
+                photo = tk.PhotoImage(data=base64.b64encode(png).decode('ascii'))
+            except tk.TclError:
+                photo = None
+        if len(self._photos) > 8:
+            self._photos.clear()
+        self._photos[key] = photo
+        return photo
+
+    def _draw(self):
+        cv, z = self.cv, self.zoom
+        pw, ph = self.sizes[self.page]
+        w, h = pw * z, ph * z
+        cw, ch = max(cv.winfo_width(), 100), max(cv.winfo_height(), 100)
+        # the page is centred horizontally AND vertically whenever it is smaller than the window
+        self.ox = max(self.PAD, int((cw - w) / 2))
+        self.oy = max(self.PAD, int((ch - h) / 2))
+        self._sw = max(self.ox * 2 + w, cw)
+        self._sh = max(self.oy * 2 + h, ch)
+        cv.delete('all')
+        cv.configure(scrollregion=(0, 0, self._sw, self._sh))
+        cv.create_rectangle(self.ox + 4, self.oy + 4, self.ox + w + 4, self.oy + h + 4, fill=BORDER, outline='')
+        self.config(cursor='watch')
+        try:
+            photo = self._page_photo()
+        finally:
+            self.config(cursor='')
+        if photo:
+            cv.create_image(self.ox, self.oy, image=photo, anchor='nw')
+        else:
+            cv.create_rectangle(self.ox, self.oy, self.ox + w, self.oy + h, fill='white', outline='')
+            cv.create_text(self.ox + w / 2, self.oy + h / 2, width=max(200, w - 60), justify='center', fill='#475569',
+                           font=(FONT, 11),
+                           text=T("Δεν ήταν δυνατή η εμφάνιση της σελίδας σε αυτόν τον υπολογιστή "
+                                  "(εγκαταστήστε το pypdfium2: pip install pypdfium2). "
+                                  "Μπορείτε να ανοίξετε το PDF εξωτερικά και μετά να συνεχίσετε.",
+                                  "The page cannot be drawn on this computer "
+                                  "(install pypdfium2: pip install pypdfium2). "
+                                  "You can open the PDF externally and then continue."))
+        cv.create_rectangle(self.ox, self.oy, self.ox + w, self.oy + h, outline=ZONE_IDLE_LINE)
+        self.zoom_lbl.configure(text=f"{round(z * 100)}%")
+
+    def _on_canvas_configure(self, event):
+        if self._fit_pending and event.width > 300 and event.height > 200:
+            self._fit_pending = False
+            self._last_size = (event.width, event.height)
+            self.after(10, self._fit)
             return
-        self._continued = True
-        callback = self._on_continue
+        size = (event.width, event.height)
+        if abs(size[0] - self._last_size[0]) > 2 or abs(size[1] - self._last_size[1]) > 2:
+            self._last_size = size
+            if self._redraw_job:
+                self.after_cancel(self._redraw_job)
+            self._redraw_job = self.after(80, self._after_resize)
+
+    def _after_resize(self):
+        self._redraw_job = None
+        if self._auto_fit:
+            self._fit()
+        else:
+            self._draw()
+
+    # ------------------------------------------------------------------ view controls
+    def _set_zoom(self, zoom, anchor=None):
+        """Zoom around `anchor` (widget coordinates; the middle of the window if omitted)."""
+        zoom = min(max(zoom, self.MIN_ZOOM), self.MAX_ZOOM)
+        if abs(zoom - self.zoom) < 1e-4:
+            return
+        cv = self.cv
+        ax, ay = anchor if anchor else (cv.winfo_width() / 2, cv.winfo_height() / 2)
+        px = (cv.canvasx(ax) - self.ox) / self.zoom          # the spot of the page under the pointer
+        py = (cv.canvasy(ay) - self.oy) / self.zoom
+        self._auto_fit = False
+        self.zoom = zoom
+        self._draw()
+        cv.xview_moveto(max(0.0, (self.ox + px * zoom - ax) / self._sw))
+        cv.yview_moveto(max(0.0, (self.oy + py * zoom - ay) / self._sh))
+
+    def _fit(self):
+        pw, ph = self.sizes[self.page]
+        cw, ch = max(self.cv.winfo_width(), 300), max(self.cv.winfo_height(), 200)
+        zoom = min((cw - 2 * self.PAD) / pw, (ch - 2 * self.PAD) / ph)
+        self.zoom = min(max(round(zoom, 2), self.MIN_ZOOM), self.MAX_ZOOM)
+        self._auto_fit = True
+        self._draw()
+        self.cv.xview_moveto(0)
+        self.cv.yview_moveto(0)
+
+    def _on_double_click(self, _event):
+        if self._auto_fit and abs(self.zoom - 1.0) > 0.02:
+            self._set_zoom(1.0, (_event.x, _event.y))
+        else:
+            self._fit()
+
+    def _on_wheel(self, event):
+        num = getattr(event, 'num', None)
+        delta = 120 if num == 4 else -120 if num == 5 else getattr(event, 'delta', 0)
+        if not delta:
+            return 'break'
+        if event.state & 0x4:                              # Ctrl + wheel = zoom
+            self._set_zoom(self.zoom * (1.12 if delta > 0 else 1 / 1.12), (event.x, event.y))
+        elif event.state & 0x1:                            # Shift + wheel = sideways
+            self.cv.xview_scroll(-3 if delta > 0 else 3, 'units')
+        else:
+            self.cv.yview_scroll(-3 if delta > 0 else 3, 'units')
+        return 'break'
+
+    def _on_press(self, event):
+        self.cv.focus_set()
+        self.cv.scan_mark(event.x, event.y)
+        self.cv.configure(cursor='fleur')
+
+    def _on_drag(self, event):
+        self.cv.scan_dragto(event.x, event.y, gain=1)
+
+    def _on_page_seg(self, value):
+        self.page = value
+        if self._auto_fit:
+            self._fit()
+        else:
+            self._draw()
+            self.cv.yview_moveto(0)
+
+    def _step_page(self, step):
+        if self.page_seg is None:
+            return
+        new = min(max(self.page + step, 0), len(self.sizes) - 1)
+        if new != self.page:
+            self.page_seg.set(new, True)
+
+    # ------------------------------------------------------------------ editing the layout (temporary)
+    def _edit_layout(self):
+        if self._editor is not None:
+            try:
+                if self._editor.winfo_exists():
+                    self._editor.lift()
+                    self._editor.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        base = self.layout if self.layout is not None else load_manual_layout()
+        editor = LayoutEditor(self.app, self.template, on_save=self._layout_applied,
+                              layout=base, temporary=True, parent=self)
+        self._editor = editor
+        editor.lift()
+        editor.focus_force()
+        editor.bind('<Destroy>', lambda e, ed=editor: e.widget is ed and self.after(60, self._regrab))
+
+    def _rebuild(self, layout, failure_title):
+        """Rebuilds the preview PDF with `layout` (None = the normal way). True when it worked."""
+        if not self._on_regenerate:
+            return False
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            self._on_regenerate(layout)
+        except PermissionError:
+            messagebox.showerror(failure_title, T("Δεν μπορώ να ενημερώσω την προεπισκόπηση. Κλείστε το PDF αν είναι "
+                                                  "ανοιχτό σε άλλο πρόγραμμα και δοκιμάστε ξανά.",
+                                                  "I can't update the preview. Close the PDF if it is open in "
+                                                  "another program and try again."), parent=self)
+            return False
+        except Exception as e:
+            messagebox.showerror(failure_title, T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"),
+                                 parent=self)
+            return False
+        finally:
+            self.config(cursor='')
+        self.layout = layout
+        self._version += 1
+        self._photos.clear()
+        self._read_pdf()
+        self._update_edit_state()
+        self._draw()
+        return True
+
+    def _layout_applied(self, layout):
+        """'Save changes' in the editor: the preview is rebuilt, the saved settings stay as they are."""
+        self._rebuild(layout, T("Επεξεργασία διάταξης", "Edit layout"))
+
+    def _discard_edits(self):
+        if self.layout is None:
+            return
+        self._rebuild(None, T("Αναίρεση αλλαγών", "Undo changes"))
+
+    # ------------------------------------------------------------------ leaving
+    def _continue(self):
+        if self._finished or self._busy:
+            return
+        self._busy = True
+        self.config(cursor='watch')
+        try:
+            done = self._on_continue(self) if self._on_continue else True
+        finally:
+            self._busy = False
+            try:
+                self.config(cursor='')
+            except tk.TclError:
+                pass
+        if done:
+            self._finished = True
+            self.destroy()
+
+    def _close(self):
+        if self._finished or self._busy:
+            return
+        self._finished = True
+        callback = self._on_close
         self.destroy()
         if callback:
             callback()
@@ -3661,12 +3944,16 @@ class LayoutEditor(tk.Toplevel):
     NUDGE_STEPS = ("0.1", "0.5", "1", "2", "5")
     QUICK_COLORS = ('#000000', '#1f2937', '#1d4ed8', '#047857', '#b91c1c', '#7c3aed')
 
-    def __init__(self, app, template_path, on_save=None):
-        super().__init__(app)
+    def __init__(self, app, template_path, on_save=None, layout=None, temporary=False, parent=None):
+        # temporary=True: opened from the PDF preview - "Save changes" hands the layout to the preview and
+        # nothing is written to the saved manual layout
+        host = parent or app
+        super().__init__(host)
         self.app = app
+        self.temporary = temporary
         self.template = template_path
         self.on_save = on_save
-        self.layout = load_manual_layout()
+        self.layout = copy.deepcopy(layout) if layout is not None else load_manual_layout()
         self.page = 0
         self.zoom = 1.0
         self.ox = self.PAD
@@ -3710,12 +3997,12 @@ class LayoutEditor(tk.Toplevel):
         self.bind('<F1>', lambda e: self._open_guide())
         self.bind('<Control-f>', lambda e: (self.search_entry.focus_set(), self.search_entry.select_range(0, 'end'), 'break')[2])
         self.bind('<Escape>', lambda e: self._select(None))
-        self.transient(app)
+        self.transient(host)
         try:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
             w, h = min(1340, sw - 60), min(880, sh - 90)
-            x = app.winfo_rootx() + (app.winfo_width() - w) // 2
-            y = app.winfo_rooty() + (app.winfo_height() - h) // 2
+            x = host.winfo_rootx() + (host.winfo_width() - w) // 2
+            y = host.winfo_rooty() + (host.winfo_height() - h) // 2
             self.geometry(f"{w}x{h}+{max(0, min(x, sw - w))}+{max(0, min(y, sh - h - 40))}")
         except tk.TclError:
             self.geometry("1280x820")
@@ -3760,10 +4047,13 @@ class LayoutEditor(tk.Toplevel):
         # ---- header strip, like the main window
         head = tk.Frame(self, bg=HEADER_BG)
         head.pack(fill="x")
-        tk.Label(head, text=T("Επεξεργαστής διάταξης", "Layout editor"), bg=HEADER_BG, fg=HEADER_FG,
+        tk.Label(head, text=self._base_title(), bg=HEADER_BG, fg=HEADER_FG,
                  font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
-        tk.Label(head, text=T("Σύρετε κάθε στοιχείο εκεί που ανήκει στο έντυπο · βελάκια = λεπτομερής μετακίνηση",
-                              "Drag each item to where it belongs on the form · arrow keys = fine movement"),
+        tk.Label(head, text=(T("Αλλαγές μόνο για αυτό το PDF - οι αποθηκευμένες ρυθμίσεις δεν αλλάζουν · ",
+                               "Changes for this PDF only - your saved settings stay unchanged · ")
+                             if self.temporary else "")
+                 + T("Σύρετε κάθε στοιχείο εκεί που ανήκει στο έντυπο · βελάκια = λεπτομερής μετακίνηση",
+                     "Drag each item to where it belongs on the form · arrow keys = fine movement"),
                  bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
 
         # ---- toolbar
@@ -3786,7 +4076,8 @@ class LayoutEditor(tk.Toplevel):
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
         ttk.Checkbutton(bar, text=T("Δείγμα δεδομένων", "Sample data"), variable=self.show_sample,
                         command=self._draw_items).pack(side="left")
-        ttk.Button(bar, text=T("Αποθήκευση", "Save"), style='PrintSm.TButton', command=self.save).pack(side="right")
+        ttk.Button(bar, text=T("Αποθήκευση αλλαγών", "Save changes") if self.temporary else T("Αποθήκευση", "Save"),
+                   style='PrintSm.TButton', command=self.save).pack(side="right")
         ttk.Button(bar, text=T("Δοκιμαστικό PDF", "Test PDF"), command=self._test_pdf).pack(side="right", padx=8)
         ttk.Button(bar, text=T("Επαναφορά όλων", "Reset all"), style='Danger.TButton',
                    command=self._reset_all).pack(side="right")
@@ -4778,10 +5069,26 @@ class LayoutEditor(tk.Toplevel):
             self.dirty = value
             self._update_title()
 
+    def _base_title(self):
+        if self.temporary:
+            return T("Επεξεργαστής διάταξης (προσωρινά)", "Layout editor (temporary)")
+        return T("Επεξεργαστής διάταξης", "Layout editor")
+
     def _update_title(self):
-        self.title(T("Επεξεργαστής διάταξης", "Layout editor") + (" *" if self.dirty else ""))
+        self.title(self._base_title() + (" *" if self.dirty else ""))
 
     def save(self):
+        if self.temporary:          # only for the PDF being previewed: hand the layout over, write nothing
+            self._set_dirty(False)
+            layout, callback = copy.deepcopy(self.layout), self.on_save
+            try:
+                self.grab_release()
+            except tk.TclError:
+                pass
+            self.destroy()
+            if callback:
+                callback(layout)
+            return True
         try:
             save_manual_layout(self.layout)
         except OSError as e:
@@ -4799,11 +5106,16 @@ class LayoutEditor(tk.Toplevel):
             answer = messagebox.askyesnocancel(
                 T("Επεξεργαστής διάταξης", "Layout editor"),
                 T("Υπάρχουν αλλαγές που δεν έχουν αποθηκευτεί.\n\nΝα αποθηκευτούν;",
-                  "There are changes that are not saved.\n\nSave them?"), parent=self)
+                  "There are changes that are not saved.\n\nSave them?") if not self.temporary else
+                T("Υπάρχουν αλλαγές που δεν έχουν εφαρμοστεί στην προεπισκόπηση.\n\nΝα εφαρμοστούν;",
+                  "There are changes that are not applied to the preview.\n\nApply them?"), parent=self)
             if answer is None:
                 return
-            if answer and not self.save():
-                return
+            if answer:
+                if not self.save():
+                    return
+                if self.temporary:          # save() already closed the editor
+                    return
         try:
             self.grab_release()
         except tk.TclError:
@@ -5459,11 +5771,12 @@ class ElstatApp(TkBase):
                                     "Pre-fill “Total employees” with the last value"),
              T("Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
                "Always check the number before creating the form.")),
-            ('preview_before_result', T("Προεπισκόπηση PDF πριν από το παράθυρο «Αποτέλεσμα»",
-                                        "Preview the PDF before the “Result” window"),
-             T("Εμφανίζει το δελτίο μέσα στο πρόγραμμα. Πατήστε «Συνέχεια στο αποτέλεσμα» για να δείτε "
-               "τους ελέγχους και τα σύνολα.",
-               "Shows the form inside the application. Press “Continue to result” to see the checks and totals.")),
+            ('preview_before_result', T("Προεπισκόπηση PDF πριν την αποθήκευση και το παράθυρο «Αποτέλεσμα»",
+                                        "Preview the PDF before it is saved and the “Result” window"),
+             T("Εμφανίζει το δελτίο μέσα στο πρόγραμμα με ζουμ και δυνατότητα προσωρινής αλλαγής της διάταξης. "
+               "Το αρχείο αποθηκεύεται (και ρωτάει αν υπάρχει ήδη) μόνο όταν πατήσετε «Αποθήκευση & συνέχεια».",
+               "Shows the form inside the application with zoom and a temporary layout editor. The file is "
+               "saved (and the “already exists” question asked) only when you press “Save & continue”.")),
         ]
         for r, (key, text, note) in enumerate(behaviours):
             ttk.Checkbutton(f4, text=text, variable=pv[key], style='Card.TCheckbutton',
@@ -7290,11 +7603,11 @@ class ElstatApp(TkBase):
                     default='no'):
                 return
 
-        if self.prefs['confirm_overwrite'] and os.path.exists(out):
-            if not messagebox.askyesno(T("Υπάρχει ήδη αρχείο", "File already exists"),
-                                       T(f"Το αρχείο υπάρχει ήδη:\n{out}\n\nΝα αντικατασταθεί;",
-                                         f"The file already exists:\n{out}\n\nReplace it?"), default='no'):
-                return
+        preview = bool(self.prefs.get('preview_before_result', False))
+        # with the preview on, nothing is written to the output file (and nothing is asked about it) until the
+        # user presses "Save & continue" in the preview
+        if not preview and not self._confirm_replace(out):
+            return
 
         saved = dict(s, last_dir=os.path.dirname(excel), last_employees=m['employees'])
         try:
@@ -7308,22 +7621,92 @@ class ElstatApp(TkBase):
         if template != (self.prefs.get('template_pdf') or DEFAULT_TEMPLATE):
             self._remember_template(template)
 
+        mode = self.prefs.get('pdf_mode', 'overlay')
+        preview_dir = None
         self._set_busy(True)
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-            result = process_elstat_report(excel, template, out, s, m, pdf_mode=self.prefs.get('pdf_mode', 'overlay'))
+            if preview:
+                preview_dir = tempfile.mkdtemp(prefix='elstat_preview_')
+                target = os.path.join(preview_dir, os.path.basename(out) or "ELSTAT_Report.pdf")
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+                target = out
+            result = process_elstat_report(excel, template, target, s, m, pdf_mode=mode, save_history=not preview)
         except PermissionError:
+            if preview_dir:
+                shutil.rmtree(preview_dir, ignore_errors=True)
             messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε άλλο "
                                              "πρόγραμμα και δοκιμάστε ξανά.",
                                              "I can't write the PDF. Close it if it is open in another "
                                              "program and try again."))
             return
         except Exception as e:
+            if preview_dir:
+                shutil.rmtree(preview_dir, ignore_errors=True)
             messagebox.showerror(T("Σφάλμα", "Error"), T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
             return
         finally:
             self._set_busy(False)
 
+        if not preview:
+            self._finish_generation(result, out, s, m, template, print_after)
+            return
+
+        # ---- preview first: the PDF lives in a temporary folder until the user proceeds
+        state = {'mode': mode, 'result': result}
+
+        def regenerate(layout):
+            """The preview was edited: build it again with that temporary layout (None = the normal way)."""
+            if layout is None:
+                new = process_elstat_report(excel, template, target, s, m, pdf_mode=mode, save_history=False)
+                state['mode'] = mode
+            else:
+                new = process_elstat_report(excel, template, target, s, m, pdf_mode='manual',
+                                            manual_layout=layout, save_history=False)
+                state['mode'] = 'manual'
+            state['result'] = new
+
+        def proceed(dialog):
+            """"Save & continue": now the file is really saved, then the Result window follows."""
+            if not self._confirm_replace(out, parent=dialog):
+                return False
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+                shutil.copyfile(target, out)          # the saved file is exactly the one that was previewed
+            except PermissionError:
+                messagebox.showerror(T("Σφάλμα", "Error"), T("Δεν μπορώ να γράψω το PDF. Κλείστε το αν είναι ανοιχτό σε "
+                                                 "άλλο πρόγραμμα και δοκιμάστε ξανά.",
+                                                 "I can't write the PDF. Close it if it is open in another "
+                                                 "program and try again."), parent=dialog)
+                return False
+            except Exception as e:
+                messagebox.showerror(T("Σφάλμα", "Error"), T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"),
+                                     parent=dialog)
+                return False
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            final_result, final_mode = state['result'], state['mode']
+            self.after(60, lambda: self._finish_generation(final_result, out, s, m, template, print_after,
+                                                           commit_mode=final_mode))
+            return True
+
+        def closed():
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            self._status(T("Η προεπισκόπηση έκλεισε - το αρχείο δεν αποθηκεύτηκε.",
+                           "The preview was closed - the file was not saved."))
+
+        PDFPreviewDialog(self, target, template, proceed, closed, regenerate)
+
+    def _confirm_replace(self, out, parent=None):
+        """The "file already exists" question (when it is turned on in Settings). True = go ahead."""
+        if self.prefs['confirm_overwrite'] and os.path.exists(out):
+            return messagebox.askyesno(T("Υπάρχει ήδη αρχείο", "File already exists"),
+                                       T(f"Το αρχείο υπάρχει ήδη:\n{out}\n\nΝα αντικατασταθεί;",
+                                         f"The file already exists:\n{out}\n\nReplace it?"),
+                                       default='no', parent=parent or self)
+        return True
+
+    @staticmethod
+    def _result_warnings(result):
         warnings_txt = []
         if result['unmapped']:
             lines = ", ".join(T(f"{c} ({p} πελάτες / {n} διανυκτ.)", f"{c} ({p} guests / {n} nights)") for c, p, n in result['unmapped'])
@@ -7334,11 +7717,22 @@ class ElstatApp(TkBase):
                                   f"του Excel {result['excel_total']}. Ελέγξτε το πριν το υποβάλετε!",
                                   f"The PDF grand total {result['computed_total']} differs from the Excel "
                                   f"total {result['excel_total']}. Check it before submitting!"))
-
         if result.get('layout_warning'):
             warnings_txt.append(result['layout_warning'])
+        return warnings_txt
 
-        extra = ("  ·  " + result['layout_info']) if result.get('layout_info') else ""
+    def _finish_generation(self, result, out, s, m, template, print_after, commit_mode=None):
+        """Everything that follows a saved PDF: history, archive, printing, opening, the Result window.
+        commit_mode is given when the history was not written yet (the PDF came through the preview)."""
+        warnings_txt = self._result_warnings(result)
+        if commit_mode is not None:
+            try:
+                commit_report_history(result['pdf_data'], m, template, commit_mode)
+            except Exception as e:
+                messagebox.showwarning(T("Προσοχή", "Warning"),
+                                       T(f"Το PDF αποθηκεύτηκε, αλλά το ιστορικό δεν ενημερώθηκε:\n{e}",
+                                         f"The PDF was saved, but the history could not be updated:\n{e}"))
+        extra = ("  ·  " + result['layout_info']) if result.get('layout_info') and commit_mode in (None, 'smart') else ""
         try:
             gy, gm = int(m['year']), int(m['month'])
             if self.prefs['keep_archive']:
@@ -7360,11 +7754,7 @@ class ElstatApp(TkBase):
                 print_status = print_file(out)
         if self.prefs['open_after'] and not print_after:
             open_file(out)
-        show_result = lambda: ResultDialog(self, result, out, warnings_txt, print_status)
-        if self.prefs.get('preview_before_result', False):
-            PDFPreviewDialog(self, out, show_result)
-        else:
-            show_result()
+        ResultDialog(self, result, out, warnings_txt, print_status)
 
 
 if __name__ == "__main__":
