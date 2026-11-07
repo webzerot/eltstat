@@ -556,9 +556,33 @@ def accel_display(accel):
     return accel if accel else T("Κανένα", "None")
 
 
+_GREEK_LAYOUT_KEYSYMS = {
+    'A': ('Greek_alpha',), 'B': ('Greek_beta',), 'C': ('Greek_psi',),
+    'D': ('Greek_delta',), 'E': ('Greek_epsilon',), 'F': ('Greek_phi',),
+    'G': ('Greek_gamma',), 'H': ('Greek_eta',), 'I': ('Greek_iota',),
+    'J': ('Greek_xi',), 'K': ('Greek_kappa',), 'L': ('Greek_lamda', 'Greek_lambda'),
+    'M': ('Greek_mu',), 'N': ('Greek_nu',), 'O': ('Greek_omicron',),
+    'P': ('Greek_pi',), 'R': ('Greek_rho',), 'S': ('Greek_sigma',),
+    'T': ('Greek_tau',), 'U': ('Greek_theta',), 'V': ('Greek_omega',),
+    'W': ('Greek_finalsmallsigma',), 'X': ('Greek_chi',), 'Y': ('Greek_upsilon',),
+    'Z': ('Greek_zeta',),
+}
+_GREEK_CHAR_TO_LATIN = {
+    'α':'A', 'β':'B', 'ψ':'C', 'δ':'D', 'ε':'E', 'φ':'F', 'γ':'G',
+    'η':'H', 'ι':'I', 'ξ':'J', 'κ':'K', 'λ':'L', 'μ':'M', 'ν':'N',
+    'ο':'O', 'π':'P', 'ρ':'R', 'σ':'S', 'τ':'T', 'θ':'U', 'ω':'V',
+    'ς':'W', 'χ':'X', 'υ':'Y', 'ζ':'Z',
+}
+_GREEK_KEYSYM_TO_LATIN = {
+    keysym.lower(): letter
+    for letter, keysyms in _GREEK_LAYOUT_KEYSYMS.items()
+    for keysym in keysyms
+}
+
+
 def accel_keysyms(key):
     if len(key) == 1 and key.isalpha():
-        return [key.lower(), key.upper()]
+        return [key.lower(), key.upper(), *_GREEK_LAYOUT_KEYSYMS.get(key.upper(), ())]
     if len(key) == 1 and key.isdigit():
         return [key, 'KP_' + key]
     return list(_NAME_KEYSYMS.get(key, (key,)))
@@ -581,25 +605,28 @@ def accel_sequences(accel, release=False, shift_variant=False):
 
 
 def event_to_accel(event):
-    """Shortcut text of a key press ('Ctrl+Shift+S'); None for a modifier key on its own or a key that cannot be used."""
-    ks = event.keysym
+    """Shortcut text of a key press, normalized to the physical US-layout letter."""
+    ks = str(getattr(event, 'keysym', '') or '')
     if ks in _MODIFIER_KEYSYMS:
         return None
-    state = event.state
+    state = getattr(event, 'state', 0)
     ctrl = bool(state & 0x4)
     alt = bool(state & (0x20000 if sys.platform.startswith('win') else 0x8))
     shift = bool(state & 0x1)
-    if ks in _KEYSYM_NAMES:
+    key = _GREEK_KEYSYM_TO_LATIN.get(ks.lower())
+    if key is None and len(ks) == 1:
+        key = _GREEK_CHAR_TO_LATIN.get(ks.lower())
+    if key is None and ks in _KEYSYM_NAMES:
         key = _KEYSYM_NAMES[ks]
         if key in _SYMBOL_KEYS:
             shift = False
-    elif len(ks) == 1 and ks.isascii() and ks.isalnum():
+    elif key is None and len(ks) == 1 and ks.isascii() and ks.isalnum():
         key = ks.upper()
-    elif re.fullmatch(r'F([1-9]|1[0-2])', ks):
+    elif key is None and re.fullmatch(r'F([1-9]|1[0-2])', ks):
         key = ks
-    elif re.fullmatch(r'KP_[0-9]', ks):
+    elif key is None and re.fullmatch(r'KP_[0-9]', ks):
         key = ks[3:]
-    else:
+    if key is None:
         return None
     return '+'.join((['Ctrl'] if ctrl else []) + (['Alt'] if alt else []) + (['Shift'] if shift else []) + [key])
 
@@ -656,10 +683,8 @@ def sc_text(text):
 
 
 class ShortcutBinder:
-    """Binds the shortcuts of ONE window (or of the whole program with use_all=True).
-
-    Every key sequence is bound once; which action it runs is looked up when the key is pressed, so changing a
-    shortcut in Settings works at once - also in windows that are already open."""
+    """Binds shortcuts for one window. On Windows, letter shortcuts are matched
+    by the physical virtual-key code so the active input language does not matter."""
     _instances = weakref.WeakSet()
 
     def __init__(self, widget, use_all=False):
@@ -668,42 +693,129 @@ class ShortcutBinder:
         self._entries = []
         self._bound = set()
         self._map = {}
+        self._win_map = {}
+        self._win_release_map = {}
+        self._win_press_bound = False
+        self._win_release_bound = False
         ShortcutBinder._instances.add(self)
 
     def add(self, sid, fn, release=None):
-        """fn(event) runs when the shortcut is pressed (and may return 'break'); release(event) when it is let go."""
         self._entries.append((sid, fn, release))
         return self
 
+    def _bind(self, sequence, handler):
+        if self.use_all:
+            self.widget.bind_all(sequence, handler, add='+')
+        else:
+            self.widget.bind(sequence, handler, add='+')
+
     def apply(self):
         table = {}
+        win_map = {}
+        win_release_map = {}
+        is_windows = sys.platform.startswith('win')
         for sid, fn, release in self._entries:
             accel = shortcut_accel(sid)
             if not accel:
                 continue
             mods, key = accel_parse(accel)
-            info = {'shift': 'Shift' in mods,
-                    'letter': len(key) == 1 and key.isalpha(),
-                    # a plain printable key must never fire while somebody is typing
-                    'plain': not (mods & {'Control', 'Alt'}) and (len(key) == 1 or key == 'Space' or key in _SYMBOL_KEYS)}
+            info = {
+                'shift': 'Shift' in mods,
+                'ctrl': 'Control' in mods,
+                'alt': 'Alt' in mods,
+                'letter': len(key) == 1 and key.isalpha(),
+                'plain': not (mods & {'Control', 'Alt'}) and
+                         (len(key) == 1 or key == 'Space' or key in _SYMBOL_KEYS),
+            }
+
+            # Tk's <Control-Greek_sigma> matching is inconsistent across Windows/Tk
+            # versions. Use the Windows virtual-key code for A-Z instead.
+            if is_windows and info['letter']:
+                variants = [dict(info)]
+                if 'shift' in SHORTCUT_INFO[sid]['flags']:
+                    variants.append(dict(info, shift=True))
+                vk = ord(key.upper())
+                for variant in variants:
+                    win_map.setdefault(vk, []).append((fn, variant))
+                    if release:
+                        win_release_map.setdefault(vk, []).append(
+                            (release, dict(variant, plain=False)))
+                continue
+
             for seq in accel_sequences(accel, shift_variant='shift' in SHORTCUT_INFO[sid]['flags']):
                 table.setdefault(seq, []).append((fn, info))
             if release:
                 for seq in accel_sequences(accel, release=True):
                     table.setdefault(seq, []).append((release, dict(info, plain=False, letter=False)))
+
         self._map = table
+        self._win_map = win_map
+        self._win_release_map = win_release_map
+
         for seq in table:
             if seq in self._bound:
                 continue
             try:
                 handler = lambda event, s=seq: self._dispatch(s, event)
-                if self.use_all:
-                    self.widget.bind_all(seq, handler, add='+')
-                else:
-                    self.widget.bind(seq, handler, add='+')
+                self._bind(seq, handler)
                 self._bound.add(seq)
             except tk.TclError:
                 pass
+
+        if is_windows and win_map and not self._win_press_bound:
+            try:
+                self._bind('<KeyPress>', self._dispatch_windows_press)
+                self._win_press_bound = True
+            except tk.TclError:
+                pass
+        if is_windows and win_release_map and not self._win_release_bound:
+            try:
+                self._bind('<KeyRelease>', self._dispatch_windows_release)
+                self._win_release_bound = True
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _windows_letter_keycode(event):
+        # Tk on Windows normally reports the Windows VK_A..VK_Z values here.
+        code = getattr(event, 'keycode', None)
+        if isinstance(code, int) and 0x41 <= code <= 0x5A:
+            return code
+        # Fallback for Tk builds that expose the translated Greek keysym.
+        ks = str(getattr(event, 'keysym', '') or '')
+        letter = _GREEK_KEYSYM_TO_LATIN.get(ks.lower())
+        if letter is None and len(ks) == 1:
+            letter = _GREEK_CHAR_TO_LATIN.get(ks.lower())
+        return ord(letter) if letter else None
+
+    @staticmethod
+    def _dispatch_windows_entries(entries, event):
+        if not entries:
+            return None
+        state = getattr(event, 'state', 0)
+        state = state if isinstance(state, int) else 0
+        ctrl = bool(state & 0x4)
+        alt = bool(state & (0x20000 if sys.platform.startswith('win') else 0x8))
+        shift = bool(state & 0x1)
+        caps = bool(state & 0x2)
+        effective_shift = shift != caps
+        result = None
+        for fn, info in entries:
+            if ctrl != info['ctrl'] or alt != info['alt'] or effective_shift != info['shift']:
+                continue
+            if info['plain'] and isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox, tk.Text)):
+                continue
+            if fn(event) == 'break':
+                result = 'break'
+        return result
+
+    def _dispatch_windows_press(self, event):
+        vk = self._windows_letter_keycode(event)
+        return self._dispatch_windows_entries(self._win_map.get(vk, ()), event)
+
+    def _dispatch_windows_release(self, event):
+        vk = self._windows_letter_keycode(event)
+        return self._dispatch_windows_entries(self._win_release_map.get(vk, ()), event)
 
     def _dispatch(self, seq, event):
         result = None
@@ -711,7 +823,7 @@ class ShortcutBinder:
         state = state if isinstance(state, int) else 0
         for fn, info in self._map.get(seq, ()):
             if info['letter'] and (bool(state & 0x1) != bool(state & 0x2)) != info['shift']:
-                continue                    # Ctrl+S must not answer to Ctrl+Shift+S (Caps Lock is taken into account)
+                continue
             if info['plain'] and isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox, tk.Text)):
                 continue
             if fn(event) == 'break':
