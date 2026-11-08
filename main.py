@@ -247,6 +247,65 @@ DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "
 DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = COUNTRY_MAPPINGS_FILE = ""
 
 
+def _write_json(path, data, **kw):
+    """Saves JSON safely: written to a temporary file first, then swapped in, so a crash or a full disk
+    in the middle of saving can never leave a half-written (corrupt) settings or layout file."""
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, **kw)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+_last_error_popup = 0.0
+
+
+def _handle_error(exc, val, tb, parent=None):
+    """Any unexpected error: written to elstat_error.log and shown once in plain words - the program keeps running."""
+    import traceback
+    global _last_error_popup
+    text = ''.join(traceback.format_exception(exc, val, tb))
+    where = ''
+    for folder in (globals().get('DATA_DIR'), tempfile.gettempdir()):
+        try:
+            if folder:
+                where = os.path.join(folder, 'elstat_error.log')
+                with open(where, 'a', encoding='utf-8') as f:
+                    f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n{text}")
+                break
+        except Exception:
+            where = ''
+    try:
+        sys.stderr.write(text)
+    except Exception:
+        pass
+    now = time.time()
+    if now - _last_error_popup < 8:          # a burst of the same error must not bury the screen in pop-ups
+        return
+    _last_error_popup = now
+    try:
+        messagebox.showerror(
+            T("Κάτι δεν πήγε καλά", "Something went wrong"),
+            T("Παρουσιάστηκε ένα απρόσμενο σφάλμα, αλλά το πρόγραμμα συνεχίζει να λειτουργεί. "
+              "Τα αποθηκευμένα δεδομένα σας δεν επηρεάστηκαν.", "An unexpected error happened, but the program keeps running. "
+              "Your saved data was not affected.")
+            + (T(f"\n\nΤεχνικές λεπτομέρειες: {where}", f"\n\nTechnical details: {where}") if where else '')
+            + f"\n\n{exc.__name__}: {val}", parent=parent)
+    except Exception:
+        pass
+
+
 def set_data_dir(path):
     """Points every data path of the program at `path`."""
     global DATA_DIR, SETTINGS_CSV, HISTORY_CSV, MONTHS_CSV, PREFS_JSON, ARCHIVE_DIR, COUNTRY_MAPPINGS_FILE
@@ -304,8 +363,7 @@ def load_app_config():
 def save_app_config(cfg):
     """Returns False if the program folder is read-only."""
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        _write_json(CONFIG_FILE, cfg, ensure_ascii=False, indent=2)
         return True
     except OSError:
         return False
@@ -351,7 +409,7 @@ def init_storage():
 
 
 # ------------------------------------------------------------- preferences
-BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading', 'auto_populate_layout')
+BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading', 'auto_populate_layout', 'center_window')
 DEFAULT_PREFS = {
     'language': 'el',                          # 'el' | 'en'  (interface language)
     'theme': 'light',                          # 'light' | 'dark' | 'auto'  (follow the system)
@@ -363,6 +421,7 @@ DEFAULT_PREFS = {
     'smart_ack': False,                        # the 'experimental' notice of Smart Shift was accepted
     'detect_ack': False,                       # the 'experimental' notice of Smart Field Detection was accepted
     'pdf_mode': 'overlay',                     # 'overlay' (Legacy: fixed coordinates) | 'smart' (Smart Shift) | 'detect' (Smart Field Detection) | 'manual' (layout editor)
+    'manual_base': 'overlay',                  # "Set manually" starts from: 'overlay' | 'smart' | 'detect' | 'blank'
     'auto_populate_layout': True,              # the layout editor starts from what the selected PDF method would do (off = blank canvas)
     'open_after': False,
     'confirm_overwrite': True,
@@ -371,6 +430,7 @@ DEFAULT_PREFS = {
     'prefill_employees': False,
     'preview_before_result': False,             # show an in-app PDF preview before the Result dialog
     'show_extra_fields': True,                  # the optional "extra details" drop-down of the Hotel details tab
+    'center_window': True,                     # open the window in the centre of the screen
     'show_loading': True,                       # animated loading indicator while something is working
     'shortcuts': {},                            # keyboard shortcuts the user changed: {id: "Ctrl+Shift+S"} ('' = none)
 }
@@ -420,6 +480,8 @@ def load_prefs():
                                     if isinstance(data[k], dict) else {})
                     else:
                         prefs[k] = bool(data[k]) if isinstance(default, bool) else str(data[k] or '')
+            if 'manual_base' not in data and data.get('auto_populate_layout') is False:
+                prefs['manual_base'] = 'blank'        # older settings: "auto-populate" off meant a blank canvas
     except Exception:
         pass
     if prefs['output_mode'] not in ('program', 'excel', 'custom'):
@@ -428,6 +490,9 @@ def load_prefs():
         prefs['language'] = DEFAULT_PREFS['language']
     if prefs['pdf_mode'] not in ('overlay', 'smart', 'detect', 'manual'):
         prefs['pdf_mode'] = DEFAULT_PREFS['pdf_mode']
+    if prefs['manual_base'] not in MANUAL_BASES:
+        prefs['manual_base'] = DEFAULT_PREFS['manual_base']
+    set_manual_base(prefs['manual_base'])
     if prefs['theme'] not in ('light', 'dark', 'auto'):
         prefs['theme'] = DEFAULT_PREFS['theme']
     if pattern_error(prefs['filename_pattern']):
@@ -437,8 +502,7 @@ def load_prefs():
 
 def save_prefs(prefs):
     ensure_data_dir()
-    with open(PREFS_JSON, 'w', encoding='utf-8') as f:
-        json.dump(prefs, f, ensure_ascii=False, indent=2)
+    _write_json(PREFS_JSON, prefs, ensure_ascii=False, indent=2)
 
 _LATIN_TO_GREEK = str.maketrans({
     'A': 'Α', 'B': 'Β', 'E': 'Ε', 'H': 'Η', 'I': 'Ι', 'K': 'Κ', 'M': 'Μ',
@@ -901,8 +965,7 @@ def load_custom_fields():
 
 def save_custom_fields(fields):
     ensure_data_dir()
-    with open(custom_fields_file(), 'w', encoding='utf-8') as f:
-        json.dump({'version': 1, 'fields': fields}, f, ensure_ascii=False, indent=1)
+    _write_json(custom_fields_file(), {'version': 1, 'fields': fields}, ensure_ascii=False, indent=1)
 
 
 def load_hotel_settings():
@@ -1212,6 +1275,166 @@ def read_nationality_rows(excel_path):
             continue
         rows.append((country_excel, pax, nights))
     return rows, excel_total
+
+
+def read_revenue_rows(excel_path, strict=False):
+    """Revenue columns of the Protel 'Nationalities Statistics' sheet:
+    {country_as_in_excel: (rooms, f&b, extras, total, room_nights)}.  Columns are found by their header (Logis / F&B / Extras /
+    Total), falling back to the usual positions.  Empty dict when nothing is found (strict=True raises instead)."""
+    try:
+        df = pd.read_excel(excel_path, header=None)
+        df = df.map(fix_greek) if hasattr(df, 'map') else df.applymap(fix_greek)
+        cols = {}
+        for r in range(min(len(df), 25)):
+            for c in range(df.shape[1]):
+                v = df.iat[r, c]
+                if not isinstance(v, str):
+                    continue
+                t = ''.join(v.lower().split())
+                for key, names in (('rooms', ('logis',)), ('fb', ('f&b',)), ('extras', ('extras',)),
+                                   ('total', ('total',))):
+                    if t in names and key not in cols and c >= 8:
+                        cols[key] = c
+        idx = [cols.get(k) for k in ('rooms', 'fb', 'extras', 'total')]
+        if None in idx or len(set(idx)) < 4:
+            idx = [10, 11, 12, 13]
+        idx.append(8)                      # room nights, for the average room rate
+        if df.shape[1] <= max(idx):
+            if strict:
+                raise ValueError(f"only {df.shape[1]} columns found, revenue columns missing")
+            return {}
+        def num(v):
+            if v is None or (isinstance(v, float) and v != v):
+                return 0.0
+            if isinstance(v, datetime.time):       # a 0 cell formatted as time reads back as 00:00
+                return (v.hour * 3600 + v.minute * 60 + v.second) / 86400.0
+            if isinstance(v, datetime.datetime):   # a number formatted as a date: turn back into the Excel serial
+                return (v - datetime.datetime(1899, 12, 30)).total_seconds() / 86400.0
+            if isinstance(v, str):
+                v = v.strip().replace('\xa0', '').replace(' ', '')
+                if ',' in v and '.' in v:
+                    v = v.replace('.', '').replace(',', '.') if v.rfind(',') > v.rfind('.') else v.replace(',', '')
+                else:
+                    v = v.replace(',', '.')
+                if v in ('', '-'):
+                    return 0.0
+            return float(v)
+
+        out, sample = {}, None
+        for i in range(len(df)):
+            row = df.iloc[i]
+            if pd.isna(row.iloc[0]):
+                continue
+            name = str(row.iloc[0]).strip()
+            key = norm(name)
+            if not key or key.startswith('ΣΥΝΟΛ') or key.startswith('ΤΟΤΑΛ'):
+                continue
+            try:                                   # same test as the nationality reader: a real country row
+                int(row.iloc[7]); int(row.iloc[9])
+            except (ValueError, TypeError):
+                continue
+            try:
+                out[name] = tuple(num(row.iloc[j]) for j in idx)
+            except (ValueError, TypeError):
+                sample = sample or [repr(row.iloc[j]) for j in idx]
+        if not out and strict:
+            raise ValueError(f"no country rows with revenue (columns used: {idx}, sheet {df.shape[0]}x{df.shape[1]}, sample {sample})")
+        return out
+    except Exception:
+        if strict:
+            raise
+        return {}
+
+
+def attach_revenue(excel_path):
+    """Adds the revenue of a Protel 'Nationalities Statistics' file to a month that is already in the history.
+    Returns (year, month, total_revenue) or raises ValueError with a readable reason."""
+    info = period_as_month(read_excel_period(excel_path))
+    if not info:
+        raise ValueError(T("Το αρχείο δεν καλύπτει έναν ακριβώς ημερολογιακό μήνα.",
+                           "The file does not cover exactly one calendar month."))
+    year, month = info[0], info[1]
+    rev = read_revenue_rows(excel_path, strict=True)
+    if not rev:
+        raise ValueError(T("Δεν βρέθηκαν στήλες εσόδων στο αρχείο.", "No revenue columns found in the file."))
+    if not os.path.exists(HISTORY_CSV):
+        raise ValueError(T("Δεν υπάρχει ιστορικό ακόμη.", "There is no history yet."))
+    df = pd.read_csv(HISTORY_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
+    for col in ('Logis', 'FnB', 'Extras', 'Esoda', 'Domatia'):
+        if col not in df.columns:
+            df[col] = ''
+    by_target = {}
+    for country_excel, vals in rev.items():
+        target = resolve_country(country_excel)
+        if target is None:
+            continue
+        old = by_target.get(target, (0.0,) * 5)
+        by_target[target] = tuple(a + b for a, b in zip(old, vals))
+    hit = ((pd.to_numeric(df['Etos'], errors='coerce') == year) & (pd.to_numeric(df['Minas'], errors='coerce') == month))
+    if not hit.any():
+        raise ValueError(T(f"Ο μήνας {month:02d}/{year} δεν υπάρχει στο ιστορικό.",
+                           f"{month:02d}/{year} is not in the history."))
+    total = 0.0
+    for i in df.index[hit]:
+        v = by_target.get(df.at[i, 'Chwra'])
+        if v:
+            df.loc[i, ['Logis', 'FnB', 'Extras', 'Esoda', 'Domatia']] = [str(round(x, 2)) for x in v]
+            total += v[3]
+    ensure_data_dir()
+    df.to_csv(HISTORY_CSV, index=False, encoding='utf-8-sig')
+    return year, month, total
+
+
+def load_revenue_by_country(year):
+    """{country: revenue} for one year, from the revenue saved with the history."""
+    out = {}
+    if not os.path.exists(HISTORY_CSV):
+        return out
+    try:
+        df = pd.read_csv(HISTORY_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
+    except Exception:
+        return out
+    if 'Esoda' not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        try:
+            if int(r['Etos']) != year or str(r['Esoda']).strip() == '':
+                continue
+            c = pretty_country(str(r['Chwra']))
+            out[c] = out.get(c, 0.0) + float(r['Esoda'])
+        except (ValueError, KeyError):
+            continue
+    return out
+
+
+def load_revenue():
+    """{(year, month): {'rooms','fb','extras','total'}} summed from the revenue columns of elstat_history.csv.
+    Months saved before revenue was tracked are simply missing."""
+    if not os.path.exists(HISTORY_CSV):
+        return {}
+    try:
+        df = pd.read_csv(HISTORY_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
+    except Exception:
+        return {}
+    if 'Esoda' not in df.columns:
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        try:
+            y, m = int(r['Etos']), int(r['Minas'])
+            if str(r['Esoda']).strip() == '':
+                continue
+            tot = float(r['Esoda'])
+        except (ValueError, KeyError):
+            continue
+        d = out.setdefault((y, m), {'rooms': 0.0, 'fb': 0.0, 'extras': 0.0, 'total': 0.0, 'roomn': 0.0})
+        d['total'] += tot
+        for k, col in (('rooms', 'Logis'), ('fb', 'FnB'), ('extras', 'Extras'), ('roomn', 'Domatia')):
+            try:
+                d[k] += float(r.get(col, '') or 0)
+            except ValueError:
+                pass
+    return out
 
 
 def load_history():
@@ -1597,8 +1820,7 @@ def save_layout_reference(template_pdf):
     snap['saved'] = datetime.datetime.now().isoformat(timespec='seconds')
     snap['template'] = os.path.basename(template_pdf)
     ensure_data_dir()
-    with open(layout_file(), 'w', encoding='utf-8') as f:
-        json.dump(snap, f, ensure_ascii=False)
+    _write_json(layout_file(), snap, ensure_ascii=False)
     return snap
 
 
@@ -1953,9 +2175,8 @@ def load_manual_layout():
 
 def save_manual_layout(layout):
     ensure_data_dir()
-    with open(manual_layout_file(), 'w', encoding='utf-8') as f:
-        json.dump({'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS]},
-                  f, ensure_ascii=False, indent=1)
+    _write_json(manual_layout_file(), {'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS]},
+                ensure_ascii=False, indent=1)
 
 
 def delete_manual_layout():
@@ -2449,10 +2670,9 @@ def save_detect_cache(layout, template_pdf=None):
                 sha1 = hashlib.sha1(f.read()).hexdigest()
         except OSError:
             pass
-    with open(detect_layout_file(), 'w', encoding='utf-8') as f:
-        json.dump({'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS],
+    _write_json(detect_layout_file(), {'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS],
                    'sha1': sha1, 'saved': datetime.datetime.now().isoformat(timespec='seconds')},
-                  f, ensure_ascii=False, indent=1)
+                ensure_ascii=False, indent=1)
 
 
 def delete_detect_cache():
@@ -2505,6 +2725,33 @@ def build_mode_layout(mode, template_pdf):
     if mode == 'manual':
         return load_manual_layout(), None
     return manual_default_layout(), None
+
+
+MANUAL_BASES = ('overlay', 'smart', 'detect', 'blank')
+CURRENT_MANUAL_BASE = 'overlay'
+
+
+def set_manual_base(base):
+    global CURRENT_MANUAL_BASE
+    CURRENT_MANUAL_BASE = base if base in MANUAL_BASES else 'overlay'
+
+
+def manual_base_name(base):
+    return {'overlay': T("Παλιά μέθοδος (σταθερές θέσεις)", "Legacy (fixed positions)"),
+            'smart': T("Έξυπνη μετατόπιση", "Smart Shift"),
+            'detect': T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection"),
+            'blank': T("Κενός καμβάς", "Blank canvas")}.get(base, base)
+
+
+def manual_base_layout(base, template_pdf):
+    """The auto-fill the "Set manually" method starts from. -> (layout, note or None)"""
+    if base == 'blank':
+        return blank_layout(), None
+    try:
+        return build_mode_layout(base if base in MANUAL_BASES else 'overlay', template_pdf)
+    except Exception as e:
+        return manual_default_layout(), T(f"Η επιλεγμένη αυτόματη μέθοδος απέτυχε ({e}) - χρησιμοποιήθηκαν οι σταθερές θέσεις.",
+                                          f"The chosen auto-fill failed ({e}) - the fixed positions were used.")
 
 
 def _pretty_target(key):
@@ -3025,7 +3272,10 @@ def commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode='overla
             'Minas': str(int(monthly_data['month'])),
             'Chwra': country,
             'Pelates': vals['clients'],
-            'Dianykterefseis': vals['nights']
+            'Dianykterefseis': vals['nights'],
+            **({'Logis': round(vals['rev'][0], 2), 'FnB': round(vals['rev'][1], 2),
+                'Extras': round(vals['rev'][2], 2), 'Esoda': round(vals['rev'][3], 2),
+                'Domatia': round(vals['rev'][4], 2)} if 'rev' in vals else {})
         })
     df_csv = pd.DataFrame(csv_data)
     if os.path.exists(csv_filename):
@@ -3084,6 +3334,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         rows, excel_total = list(rows_override), None
     else:
         rows, excel_total = read_nationality_rows(excel_path)
+    revenue_rows = read_revenue_rows(excel_path) if rows_override is None else {}
     for country_excel, pax, nights in rows:
         pdf_target = resolve_country(country_excel)
         if pdf_target is None:
@@ -3092,6 +3343,9 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         pdf_data.setdefault(pdf_target, {'clients': 0, 'nights': 0})
         pdf_data[pdf_target]['clients'] += pax
         pdf_data[pdf_target]['nights'] += nights
+        if country_excel in revenue_rows:
+            old = pdf_data[pdf_target].get('rev', (0, 0, 0, 0, 0))
+            pdf_data[pdf_target]['rev'] = tuple(a + b for a, b in zip(old, revenue_rows[country_excel]))
         cat = country_to_cat.get(pdf_target)
         if cat:
             totals[cat]['clients'] += pax
@@ -3310,7 +3564,12 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     # "Set manually": positions, fonts and colours come from the layout made in the layout editor
     manual = manual_values = None
     if pdf_mode == 'manual':
-        manual = manual_layout if manual_layout is not None else load_manual_layout()
+        if manual_layout is not None:
+            manual = manual_layout
+        elif manual_layout_saved() or CURRENT_MANUAL_BASE in ('overlay', 'blank'):
+            manual = load_manual_layout()
+        else:        # nothing saved yet: fill the form with the auto-fill chosen for "Set manually"
+            manual = manual_base_layout(CURRENT_MANUAL_BASE, template_pdf)[0]
     elif pdf_mode == 'detect':
         manual = copy.deepcopy(detect_used)
     if manual is not None:
@@ -3437,11 +3696,85 @@ ENGLISH_MONTHS = ["January", "February", "March", "April", "May", "June",
 
 def autowrap(label, container, margin=40, minimum=160):
     """Makes a label re-wrap its text whenever `container` is resized."""
+    state = {'job': None, 'last': None}
+
+    def _apply():
+        state['job'] = None
+        try:
+            w = container.winfo_width()
+            if w and w > 1:
+                wrap = max(minimum, w - margin)
+                if state['last'] is None or abs(wrap - state['last']) >= 2:      # skip needless re-layouts
+                    state['last'] = wrap
+                    label.configure(wraplength=wrap)
+        except tk.TclError:
+            pass
+
     def _update(_event=None):
-        w = container.winfo_width()
-        if w and w > 1:
-            label.configure(wraplength=max(minimum, w - margin))
+        if state['job'] is None:                  # many Configure events in a row -> one update
+            state['job'] = label.after_idle(_apply)
     container.bind('<Configure>', _update, add='+')
+
+
+class HoverTip:
+    """A small tip that appears when the pointer rests on a widget for a moment (like a file's tooltip in Explorer).
+    `note` is a smaller second line, e.g. "Click for more in the guide"."""
+
+    def __init__(self, widget, text, note=None, delay=700, wrap=340):
+        self.widget, self.text, self.note, self.delay, self.wrap = widget, text, note, delay, wrap
+        self._job = None
+        self._tip = None
+        widget.bind('<Enter>', self._schedule, add='+')
+        widget.bind('<Leave>', self.hide, add='+')
+        widget.bind('<ButtonPress>', self.hide, add='+')
+        widget.bind('<Destroy>', self.hide, add='+')
+
+    def _schedule(self, _event=None):
+        self.hide()
+        self._job = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        self._job = None
+        try:
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            try:
+                tip.wm_attributes('-topmost', True)
+            except tk.TclError:
+                pass
+            frame = tk.Frame(tip, bg=BORDER)
+            frame.pack()
+            inner = tk.Frame(frame, bg=CARD)
+            inner.pack(padx=1, pady=1)
+            tk.Label(inner, text=self.text, bg=CARD, fg=TEXT, font=(FONT, 9), justify="left",
+                     wraplength=self.wrap).pack(anchor="w", padx=10, pady=(7, 7 if not self.note else 2))
+            if self.note:
+                tk.Label(inner, text=self.note, bg=CARD, fg=ACCENT, font=(FONT, 8, 'bold'), justify="left",
+                         wraplength=self.wrap).pack(anchor="w", padx=10, pady=(0, 7))
+            tip.update_idletasks()
+            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            x = min(self.widget.winfo_rootx() + 14, max(self.widget.winfo_screenwidth() - w - 8, 0))
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            if y + h > self.widget.winfo_screenheight() - 8:          # no room below: show it above
+                y = max(self.widget.winfo_rooty() - h - 8, 0)
+            tip.wm_geometry(f"+{x}+{y}")
+            self._tip = tip
+        except tk.TclError:
+            self._tip = None
+
+    def hide(self, _event=None):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
 
 
 class Card(tk.Frame):
@@ -3461,10 +3794,33 @@ class Card(tk.Frame):
             self.badge = tk.Canvas(head, width=26, height=26, bg=CARD, highlightthickness=0)
             self.badge.pack(side="left")
             self.set_done(False)
-        tk.Label(head, text=title, bg=CARD, fg=NAVY,
-                 font=(FONT, 13, 'bold')).pack(side="left", padx=(10 if number is not None else 0, 0))
+        self._head = head
+        self._title = tk.Label(head, text=title, bg=CARD, fg=NAVY, font=(FONT, 13, 'bold'))
+        self._title.pack(side="left", padx=(10 if number is not None else 0, 0))
         self.body = ttk.Frame(inner, style='Card.TFrame', padding=(20, 10, 20, 20))
         self.body.pack(fill="x")
+
+    def make_collapsible(self, start_open=False):
+        """Click the title to fold the card up to just its heading (less clutter)."""
+        state = {'open': start_open}
+        arrow = tk.Label(self._head, bg=CARD, fg=ACCENT, font=(FONT, 12, 'bold'), cursor='hand2')
+        arrow.pack(side="right")
+
+        def show():
+            arrow.configure(text="\u25be" if state['open'] else "\u25b8")
+            if state['open']:
+                self.body.pack(fill="x")
+            else:
+                self.body.pack_forget()
+
+        def toggle(_e=None):
+            state['open'] = not state['open']
+            show()
+
+        for w in (self._head, self._title, arrow):
+            w.configure(cursor='hand2')
+            w.bind('<Button-1>', toggle)
+        show()
 
     def set_done(self, done):
         if self.badge is None or done == self._done:
@@ -3686,8 +4042,10 @@ class ScrollFrame(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, bg=BG)
-        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, bg=BG, yscrollincrement=1)   # 1 unit = 1 pixel
+        self._pending = 0.0                         # pixels still to scroll (the wheel only sets a target)
+        self._anim = None
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self._vbar_command)
         self.canvas.configure(yscrollcommand=self.vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vbar.grid(row=0, column=1, sticky="ns")
@@ -3700,8 +4058,16 @@ class ScrollFrame(ttk.Frame):
         self.body.bind('<Configure>', self._on_body)
         self.canvas.bind('<Configure>', self._on_canvas)
 
+    def _vbar_command(self, *args):
+        if len(args) == 3 and args[0] == 'scroll' and args[2] == 'units':      # arrow clicks: 1 unit is only 1 px now
+            args = ('scroll', int(args[1]) * 24, 'units')
+        self.canvas.yview(*args)
+
     def _on_body(self, _event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        box = self.canvas.bbox("all")
+        if box != getattr(self, '_last_box', None):
+            self._last_box = box
+            self.canvas.configure(scrollregion=box)
         self._update_bar()
 
     def _on_canvas(self, event):
@@ -3719,8 +4085,27 @@ class ScrollFrame(ttk.Frame):
             self.canvas.yview_moveto(0)
 
     def scroll(self, units):
-        if self._needs_scroll():
-            self.canvas.yview_scroll(units, "units")
+        """Mouse wheel: glides to the target in small steps instead of jumping a third of the window at once."""
+        if not self._needs_scroll():
+            return
+        self._pending += units * 14                 # one wheel notch (3 units) = about 42 px
+        if self._anim is None:
+            self._anim = self.after(10, self._glide)
+
+    def _glide(self):
+        self._anim = None
+        if abs(self._pending) < 1:
+            self._pending = 0.0
+            return
+        step = self._pending * 0.35
+        step = max(1, int(abs(step))) * (1 if step > 0 else -1)
+        before = self.canvas.yview()[0]
+        self.canvas.yview_scroll(step, "units")
+        self._pending -= step
+        if self.canvas.yview()[0] == before:        # reached the top or bottom
+            self._pending = 0.0
+            return
+        self._anim = self.after(10, self._glide)
 
 
 def setup_styles(root):
@@ -4012,27 +4397,27 @@ MANUAL = [
                "The folder where **Choose Excel…** and **Latest** start. Empty means the folder of the last Excel you used.")),
         ('h', ("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in")),
         ('p', ("Υπάρχουν τέσσερις τρόποι. Η **Παλιά μέθοδος** είναι η δοκιμασμένη· η **Έξυπνη μετατόπιση** και η **Έξυπνη "
-               "ανίχνευση πεδίων** είναι πειραματικές και μπορούν να αποτύχουν, οπότε το δελτίο φτιάχνεται με την παλιά μέθοδο και "
+               "ανίχνευση πεδίων** μπορεί περιστασιακά να αποτύχουν, οπότε το δελτίο φτιάχνεται με την παλιά μέθοδο και "
                "εμφανίζεται προειδοποίηση.",
                "There are four ways. The **Legacy** method is the proven one; **Smart Shift** and **Smart Field Detection** are "
-               "experimental and can fail, in which case the form is made with the Legacy method and a warning is shown.")),
+               "can occasionally fail, in which case the form is made with the Legacy method and a warning is shown.")),
         ('li', ("**Παλιά μέθοδος (σταθερές συντεταγμένες) · LEGACY**: οι τιμές γράφονται σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
                 "**Legacy (Fixed Coordinates)**: the values are written at fixed positions on the blank PDF. This is how the program has always worked.")),
-        ('li', ("**Έξυπνη μετατόπιση (Smart Shift) · πειραματική**: διαβάζει σημεία-άγκυρες του template, μετρά πόσο μετακινήθηκαν σε "
+        ('li', ("**Έξυπνη μετατόπιση (Smart Shift)**: διαβάζει σημεία-άγκυρες του template, μετρά πόσο μετακινήθηκαν σε "
                 "σχέση με τη διάταξη αναφοράς (διανύσματα μετατόπισης και χωρική παρεμβολή IDW) και μετατοπίζει ανάλογα τις σταθερές "
                 "συντεταγμένες. Χρειάζεται διάταξη αναφοράς.",
-                "**Smart Shift · experimental**: reads anchor texts of the template, measures how far they moved against the reference "
+                "**Smart Shift**: reads anchor texts of the template, measures how far they moved against the reference "
                 "layout (delta vectors and IDW spatial interpolation) and shifts the fixed coordinates accordingly. It needs a reference layout.")),
-        ('li', ("**Έξυπνη ανίχνευση πεδίων (AI / αυτόματη ανίχνευση) · πειραματική**: πλήρως αυτόνομη. Σαρώνει το άδειο PDF εκείνη τη "
+        ('li', ("**Έξυπνη ανίχνευση πεδίων (AI / αυτόματη ανίχνευση)**: πλήρως αυτόνομη. Σαρώνει το άδειο PDF εκείνη τη "
                 "στιγμή, διαβάζει τις ετικέτες, ευθυγραμμίζει τον πίνακα και υπολογίζει τις συντεταγμένες χωρίς καμία σταθερή τιμή για "
                 "τα πεδία του προγράμματος. Δεν χρειάζεται αναφορά. Χρειάζεται το pypdfium2. Δικά σας πεδία και κείμενα μένουν χειροκίνητα (επεξεργαστής διάταξης).",
-                "**Smart Field Detection (AI / Auto-Detect) · experimental**: fully autonomous. It scans the blank PDF on the fly, reads "
+                "**Smart Field Detection (AI / Auto-Detect)**: fully autonomous. It scans the blank PDF on the fly, reads "
                 "the labels, aligns the table grid and computes the coordinates with nothing hardcoded for the program's own fields. "
                 "No reference is needed. It requires pypdfium2. Your own fields and texts stay manual (layout editor).")),
         ('li', ("**Χειροκίνητη τοποθέτηση**: τα βάζετε όλα εσείς στον επεξεργαστή διάταξης.",
                 "**Set manually**: you place everything yourself in the layout editor.")),
-        ('warn', ("Οι πειραματικές μέθοδοι δεν αντικαθιστούν τον έλεγχο: κοιτάξτε πάντα το δελτίο πριν το υποβάλετε.",
-                  "The experimental methods do not replace checking: always look at the form before submitting it.")),
+        ('warn', ("Οι έξυπνες μέθοδοι δεν αντικαθιστούν τον έλεγχο: κοιτάξτε πάντα το δελτίο πριν το υποβάλετε.",
+                  "The smart methods do not replace checking: always look at the form before submitting it.")),
         ('h', ("Έξυπνη ανίχνευση πεδίων: ρύθμιση και έλεγχος", "Smart Field Detection: configure and inspect")),
         ('step', ("Επιλέξτε «Έξυπνη ανίχνευση πεδίων». Από κάτω εμφανίζεται το κουμπί **👉 Ρύθμιση & έλεγχος ανίχνευσης…**.",
                   "Select “Smart Field Detection”. The button **👉 Configure & Inspect Auto-Detection…** appears right beneath it.")),
@@ -4096,13 +4481,53 @@ MANUAL = [
                   "Use **Data** at the top to choose what the page shows: **Sample** (made-up values), **Real** (your saved details and the latest month) or **Names** (only the variable names). Press **Save** (Ctrl+S) when you are happy.")),
         ('go', ("Δείτε τον πλήρη οδηγό του επεξεργαστή", "See the full layout editor guide"), 'sec:editor'),
         ('h', ("Συμπεριφορά του προγράμματος", "Program behaviour")),
-        ('li', ("Άνοιγμα του PDF αμέσως μετά τη δημιουργία.", "Open the PDF right after it is created.")),
-        ('li', ("Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη.", "Ask before replacing a PDF that already exists.")),
-        ('li', ("Αρχειοθέτηση αντιγράφου κάθε δελτίου - επιτρέπει το ξανάνοιγμα και την εκτύπωση παλιών μηνών από το Ιστορικό.",
-                "Archive a copy of every form - lets you reopen and print old months from History.")),
-        ('li', ("Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα.", "Remind me when last month's form is missing.")),
-        ('li', ("Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή - ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
-                "Pre-fill “Total employees” with the last value - always check the number before creating the form.")),
+        ('p', ("Κάθε επιλογή έχει ένα ⓘ στις Ρυθμίσεις· πατώντας το έρχεστε ακριβώς εδώ.",
+               "Every option has an ⓘ in Settings; clicking it brings you straight here.")),
+        ('anchor', 'opt_center_window'),
+        ('li', ("**Κεντράρισμα του παραθύρου κατά την εκκίνηση**: το κύριο παράθυρο ανοίγει στο κέντρο της οθόνης και εμφανίζεται μία φορά, "
+                "χωρίς να «πηδάει». Αν το κλείσετε, τη θέση την επιλέγει το σύστημα. Δεν επηρεάζει τα υπόλοιπα παράθυρα.",
+                "**Centre the window when the program starts**: the main window opens in the middle of the screen and appears once, "
+                "without jumping. If you turn it off, the system chooses the position. It does not affect the other windows.")),
+        ('anchor', 'opt_open_after'),
+        ('li', ("**Άνοιγμα του PDF αμέσως μετά τη δημιουργία**: όταν αποθηκευτεί το δελτίο, ανοίγει στο πρόγραμμα PDF του υπολογιστή σας. "
+                "Με την προεπισκόπηση ανοίγει αφού πατήσετε «Αποθήκευση & συνέχεια». Δεν ανοίγει όταν στέλνετε το δελτίο κατευθείαν στον εκτυπωτή.",
+                "**Open the PDF right after it is created**: once the form is saved it opens in your computer's PDF viewer. "
+                "With the preview it opens after you press “Save & continue”. It does not open when you send the form straight to the printer.")),
+        ('anchor', 'opt_confirm_overwrite'),
+        ('li', ("**Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη**: αν υπάρχει αρχείο με το ίδιο όνομα, ρωτάει «Να αντικατασταθεί;» (η προεπιλογή είναι «Όχι»). "
+                "Αν το κλείσετε, το παλιό αρχείο αντικαθίσταται χωρίς ερώτηση. Αν το PDF είναι ανοιχτό αλλού, το πρόγραμμα δεν μπορεί να το γράψει και σας το λέει.",
+                "**Ask before replacing a PDF that already exists**: if a file with the same name exists you are asked “Replace it?” (the default answer is No). "
+                "If you turn it off, the old file is replaced without asking. If the PDF is open in another program it cannot be written and you are told.")),
+        ('anchor', 'opt_keep_archive'),
+        ('li', ("**Αρχειοθέτηση αντιγράφου κάθε δελτίου**: κάθε δελτίο αντιγράφεται στον φάκελο δεδομένων. Έτσι μπορείτε να ξανανοίξετε ή να "
+                "εκτυπώσετε παλιούς μήνες από το Ιστορικό. Αν το κλείσετε, το δελτίο ξαναφτιάχνεται από τα δεδομένα του ιστορικού όταν το ζητήσετε.",
+                "**Archive a copy of every form**: each form is copied into the data folder, so you can reopen or print old months from History. "
+                "If you turn it off, the form is rebuilt from the history data when you ask for it.")),
+        ('anchor', 'opt_show_reminder'),
+        ('li', ("**Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα**: στην καρτέλα του δελτίου εμφανίζεται μια γραμμή υπενθύμισης με τον μήνα που λείπει. "
+                "Μπορείτε να την κλείσετε από εκεί για τη συγκεκριμένη χρήση.",
+                "**Remind me when last month's form is missing**: a reminder line with the missing month appears on the form tab. "
+                "You can dismiss it there for the current session.")),
+        ('anchor', 'opt_prefill_employees'),
+        ('li', ("**Προσυμπλήρωση του «Σύνολο εργαζομένων»**: το πεδίο παίρνει την τελευταία τιμή που χρησιμοποιήσατε. "
+                "Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
+                "**Pre-fill “Total employees”**: the field gets the last value you used. "
+                "Always check the number before creating the form.")),
+        ('anchor', 'opt_show_extra_fields'),
+        ('li', ("**Πρόσθετα προαιρετικά στοιχεία στα «Στοιχεία ξενοδοχείου»**: εμφανίζει ένα αναδιπλούμενο μενού με Νομό, Δημοτική ενότητα, Οδό, Αριθμό, Τ.Κ. και δικά σας πεδία. "
+                "Αν το κλείσετε, τίποτα από αυτά δεν γράφεται στο δελτίο - οι τιμές όμως διατηρούνται.",
+                "**Optional extra details in “Hotel details”**: shows a drop-down with Prefecture, Municipal unit, Street, Number, Postal code and your own fields. "
+                "If you turn it off, none of them is written on the form - the values are kept.")),
+        ('anchor', 'opt_show_loading'),
+        ('li', ("**Ενδείξεις φόρτωσης**: μια μικρή κινούμενη ένδειξη πάνω δεξιά όσο διαβάζεται το Excel ή δημιουργείται το PDF. "
+                "Αν την κλείσετε, το πρόγραμμα εργάζεται ακριβώς το ίδιο, απλώς χωρίς ένδειξη.",
+                "**Loading indicators**: a small animated badge at the top right while the Excel is read or the PDF is created. "
+                "If you turn it off, the program works exactly the same, just without the badge.")),
+        ('anchor', 'opt_preview_before_result'),
+        ('li', ("**Προεπισκόπηση PDF πριν την αποθήκευση**: το δελτίο εμφανίζεται μέσα στο πρόγραμμα με ζουμ και προσωρινό επεξεργαστή διάταξης. "
+                "Το αρχείο αποθηκεύεται (και γίνεται η ερώτηση «υπάρχει ήδη») μόνο όταν πατήσετε «Αποθήκευση & συνέχεια». Αν κλείσετε την προεπισκόπηση, δεν αποθηκεύεται τίποτα.",
+                "**Preview the PDF before it is saved**: the form is shown inside the program with zoom and a temporary layout editor. "
+                "The file is saved (and the “already exists” question asked) only when you press “Save & continue”. If you close the preview, nothing is saved.")),
         ('p', ("**Επαναφορά ρυθμίσεων** γυρίζει τις ρυθμίσεις στις προεπιλογές. Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
                "**Reset settings** returns the settings to their defaults. It does not delete the history or the hotel details.")),
         ('go', ("Άνοιγμα της καρτέλας Ρυθμίσεις", "Open the Settings tab"), 'tab:settings'),
@@ -4115,11 +4540,14 @@ MANUAL = [
         ('act', ("Άνοιγμα του επεξεργαστή διάταξης", "Open the layout editor"), 'open_editor'),
         ('li', ("Τρέχουσα μέθοδος συμπλήρωσης: **[[pdf_mode_name]]**", "Current filling method: **[[pdf_mode_name]]**")),
         ('h', ("Η οθόνη", "The screen")),
-        ('li', ("**Αριστερά**: η λίστα όλων των στοιχείων, με πεδίο αναζήτησης από πάνω.", "**Left**: the list of every item, with a search box on top.")),
+        ('li', ("**Αριστερά**: τα στοιχεία που τυπώνονται στο PDF, ανά ενότητα και με τον αριθμό τους, με πεδίο αναζήτησης από πάνω. Από κάτω τα κουμπιά προσθήκης και επεξεργασίας (δείτε παρακάτω).",
+                "**Left**: the items that are printed on the PDF, by section and with their count, with a search box on top. Below it, the add and edit buttons (see below).")),
         ('li', ("**Στο κέντρο**: η σελίδα του εντύπου. Κάθε τιμή φαίνεται εκεί που θα τυπωθεί. Το κουμπί **Σελίδα 1 / Σελίδα 2** αλλάζει σελίδα, τα **− / + / Προσαρμογή** το μέγεθος (Ctrl + τροχός = ζουμ).",
                 "**Centre**: the page of the form. Every value appears where it will be printed. **Page 1 / Page 2** switches the page, **− / + / Fit** the size (Ctrl + wheel = zoom).")),
-        ('li', ("**Δεξιά**: οι ιδιότητες του επιλεγμένου στοιχείου. Στο κάτω μέρος του παραθύρου μια μπάρα συμβουλών αλλάζει ανάλογα με το τι έχετε επιλέξει.",
-                "**Right**: the properties of the selected item. At the bottom of the window a tip bar changes with what you have selected.")),
+        ('li', ("**Δεξιά, πάνω**: οι ιδιότητες του επιλεγμένου στοιχείου (κυλίστε αν το παράθυρο είναι μικρό). **Δεξιά, κάτω**: το παράθυρο **Κρυμμένα και αχρησιμοποίητα**. Η διαχωριστική γραμμή ανάμεσά τους σέρνεται.",
+                "**Right, top**: the properties of the selected item (scroll if the window is small). **Right, bottom**: the **Hidden and not used** window. The divider between them can be dragged.")),
+        ('li', ("Στο κάτω μέρος του παραθύρου μια μπάρα συμβουλών αλλάζει ανάλογα με το τι έχετε επιλέξει.",
+                "At the bottom of the window a tip bar changes with what you have selected.")),
         ('h', ("Επιλογή και μετακίνηση", "Selecting and moving")),
         ('step', ("Πατήστε ένα στοιχείο πάνω στη σελίδα ή στη λίστα.", "Click an item on the page or in the list.")),
         ('step', ("Σύρτε το με το ποντίκι ή χρησιμοποιήστε τα βελάκια του πληκτρολογίου: 0,5 pt ανά πάτημα, 5 pt με Shift.",
@@ -4133,7 +4561,28 @@ MANUAL = [
         ('li', ("**Μέγεθος, Έντονα, Πλάγια, Χρώμα** (παλέτα, κωδικός #rrggbb ή γρήγορα χρώματα) και **Στοίχιση**.", "**Size, Bold, Italic, Colour** (palette, #rrggbb code or quick colours) and **Align**.")),
         ('li', ("**Απόσταση ψηφίων**: 0 = κανονικό κείμενο. Μεγαλύτερη τιμή βάζει κάθε γράμμα σε σταθερή απόσταση, για τα κουτάκια του Α.Φ.Μ., των ημερών και των εργαζομένων.",
                 "**Digit spacing**: 0 = normal text. A larger value puts every character at a fixed distance, for the boxes of the VAT number, days and employees.")),
-        ('li', ("**Εμφάνιση στο PDF**: αν το ξετσεκάρετε, το στοιχείο κρύβεται (στη λίστα σημειώνεται με ○).", "**Show in the PDF**: untick it to hide the item (marked ○ in the list).")),
+        ('li', ("**Εμφάνιση στο PDF**: αν το ξετσεκάρετε, το στοιχείο κρύβεται (δείτε Κρυμμένα και αχρησιμοποίητα παρακάτω).",
+                "**Show in the PDF**: untick it to hide the item (see Hidden and not used below).")),
+        ('h', ("Κρυμμένα και αχρησιμοποίητα", "Hidden and not used")),
+        ('p', ("Το παράθυρο κάτω δεξιά έχει δύο λίστες, ώστε να ξέρετε πάντα τι **δεν** τυπώνεται:",
+               "The window at the bottom right has two lists, so you always know what is **not** printed:")),
+        ('li', ("**Κρυμμένα στο PDF**: στοιχεία που έχετε τοποθετήσει αλλά δεν τυπώνονται (τα κρύψατε εσείς ή η αυτόματη ανίχνευση δεν βρήκε θέση). Με ένα κλικ επιλέγονται και στη σελίδα.",
+                "**Hidden on the PDF**: items you placed but that are not printed (you hid them, or auto-detection found no place for them). One click also selects them on the page.")),
+        ('li', ("**Δεν υπάρχουν στο έντυπο**: ό,τι μπορεί να μπει στο δελτίο αλλά δεν έχει τοποθετηθεί πουθενά - πεδία, στήλες χωρών, πρόσθετα στοιχεία και οι μεταβλητές σας, ανά ενότητα.",
+                "**Not on the form**: everything that could go on the form but is not placed anywhere - fields, country columns, extra items and your variables, by section.")),
+        ('step', ("Βρείτε το στοιχείο (έχει δικό του πεδίο αναζήτησης).", "Find the item (the window has its own search box).")),
+        ('step', ("Διπλό κλικ, ή επιλέξτε και πατήστε **Βάλε στο PDF** (ή `Enter`). Επιλέγετε πολλά μαζί με `Ctrl`/`Shift`.",
+                  "Double-click it, or select it and press **Put on the PDF** (or `Enter`). Pick several with `Ctrl`/`Shift`.")),
+        ('step', ("Το στοιχείο εμφανίζεται στη σελίδα και μπαίνει στην αριστερή λίστα. **Εμφάνιση όλων των κρυμμένων** τα επαναφέρει όλα μαζί.",
+                  "The item appears on the page and joins the left list. **Show all hidden** brings every hidden item back at once.")),
+        ('tip', ("Για να βγάλετε κάτι από το PDF χωρίς να το χάσετε, πατήστε **Απόκρυψη** (δίπλα στο Διπλασιασμός και Διαγραφή) - μπορείτε να το φέρετε πίσω οποιαδήποτε στιγμή. Η απόκρυψη και η επαναφορά αναιρούνται με `Ctrl+Z`.",
+                 "To take something off the PDF without losing it, press **Hide** (next to Duplicate and Delete) - you can bring it back any time. Hiding and restoring can be undone with `Ctrl+Z`.")),
+        ('h', ("Μεγάλη ή μικρή οθόνη", "Big or small window")),
+        ('kb', ("F11", ("Μεγιστοποίηση / επαναφορά του επεξεργαστή (όπως και το κουμπί του παραθύρου)", "Maximize / restore the editor (same as the window's own button)"))),
+        ('li', ("Η σελίδα **προσαρμόζεται μόνη της** όταν αλλάζετε το μέγεθος του παραθύρου, μέχρι να κάνετε εσείς ζουμ. Το **Προσαρμογή** την ξαναβάζει σε αυτόματη προσαρμογή.",
+                "The page **fits itself** when you resize the window, until you zoom by hand. **Fit** turns automatic fitting back on.")),
+        ('li', ("Σε στενό παράθυρο η γραμμή εργαλείων σπάει σε δεύτερη γραμμή και τα πλευρικά πλαίσια παραμένουν ολόκληρα ορατά.",
+                "In a narrow window the toolbar wraps onto a second row and the side panels stay fully visible.")),
         ('h', ("Μεμονωμένα στοιχεία", "Individual items")),
         ('p', ("Κάποια στοιχεία κινούνται αρχικά ως ομάδα: οι στήλες χωρών (πελάτες και διανυκτερεύσεις, ανά σελίδα), ο Α.Φ.Μ., οι ημέρες λειτουργίας, οι εργαζόμενοι και το έτος. "
                "Για να τα ελέγχετε ένα-ένα:",
@@ -4480,7 +4929,7 @@ class HelpPanel(ttk.Frame):
                 else:
                     shortcut, description = blk[1], blk[2]
                 parts += [sc_text(shortcut), _tx(description)]
-            elif blk[0] not in ('go', 'live'):
+            elif blk[0] not in ('go', 'live', 'anchor'):
                 parts.append(_tx(blk[1]))
         return _fold(_plain(' '.join(parts)))
 
@@ -4535,6 +4984,8 @@ class HelpPanel(ttk.Frame):
         t = self.text
         t.tag_configure('title', font=(FONT, 22, 'bold'), foreground=NAVY, spacing1=4, spacing3=14)
         t.tag_configure('h', font=(FONT, 13, 'bold'), foreground=NAVY, spacing1=22, spacing3=6)
+        t.tag_configure('toc', font=(FONT, 10), foreground=MUTED, spacing3=14, lmargin1=0, lmargin2=0)
+        t.tag_configure('toclabel', font=(FONT, 10, 'bold'), foreground=NAVY)
         t.tag_configure('p', spacing3=9)
         t.tag_configure('li', lmargin1=8, lmargin2=28, spacing3=6, tabs=('28',))
         t.tag_configure('step', lmargin1=2, lmargin2=34, spacing3=9, tabs=('34',))
@@ -4672,7 +5123,7 @@ class HelpPanel(ttk.Frame):
             self.show(self.current)
             self.text.yview_moveto(y)
 
-    def show(self, sid):
+    def show(self, sid, anchor=None):
         sec = SECTION_BY_ID.get(sid)
         if sec is None:
             return
@@ -4688,6 +5139,15 @@ class HelpPanel(ttk.Frame):
         t.configure(state='normal')
         self._ins(_tx(sec['title']), ('title',))
         t.insert('end', '\n', ('title',))
+        heads = [b for b in sec['blocks'] if b[0] == 'h']
+        if len(heads) >= 4:            # long sections get a clickable index of their headings
+            self._ins(T("Σε αυτή τη σελίδα:", "On this page:") + "  ", ('toc', 'toclabel'))
+            for k, hb in enumerate(heads):
+                if k:
+                    t.insert('end', '  \u00b7  ', ('toc',))
+                self._link(_tx(hb[1]), lambda n=k: self._goto_anchor(f'hd{n}', flash=True), ('toc',))
+            t.insert('end', '\n', ('toc',))
+        hd_no = 0
         step_no = 0
         prev = None
         for blk in sec['blocks']:
@@ -4697,6 +5157,9 @@ class HelpPanel(ttk.Frame):
                 self._inline(_tx(blk[1]), ('p',))
                 t.insert('end', '\n', ('p',))
             elif kind == 'h':
+                t.mark_set(f'anc_hd{hd_no}', 'end-1c')
+                t.mark_gravity(f'anc_hd{hd_no}', 'left')
+                hd_no += 1
                 self._ins(_tx(blk[1]), ('h',))
                 t.insert('end', '\n', ('h',))
             elif kind == 'li':
@@ -4728,6 +5191,9 @@ class HelpPanel(ttk.Frame):
                 t.insert('end', '\n', ('p',))
             elif kind == 'live':
                 self._live(blk[1])
+            elif kind == 'anchor':              # an invisible bookmark: a settings (i) jumps to it
+                t.mark_set('anc_' + blk[1], 'end-1c')
+                t.mark_gravity('anc_' + blk[1], 'left')
             elif kind == 'act':
                 self._link('▸  ' + _tx(blk[1]), lambda k=blk[2]: self.app.help_action(k), ('p',))
                 t.insert('end', '\n', ('p',))
@@ -4747,6 +5213,61 @@ class HelpPanel(ttk.Frame):
         t.yview_moveto(0)
         self.crumb.configure(text=T(f"Ενότητα {i + 1} από {len(order)}", f"Section {i + 1} of {len(order)}"))
         self._schedule_resize()
+        if anchor:
+            self._goto_anchor(anchor)
+            self.after(120, lambda a=anchor, s=sid: self._goto_anchor(a, flash=True) if self.current == s else None)
+
+    def _goto_anchor(self, anchor, flash=False):
+        """Scrolls the guide to a bookmark and (once) lightly highlights that entry for a moment."""
+        t, mark = self.text, 'anc_' + anchor
+        try:
+            t.update_idletasks()
+            t.yview(mark)
+            if flash:
+                t.tag_add('flash', mark, f"{mark} lineend")
+                t.tag_raise('flash')
+                self._fade_flash()
+        except tk.TclError:
+            pass
+
+    def _fade_flash(self, fade_in=150, hold=1100, fade_out=800):
+        """The highlight of the entry the guide jumped to fades in, stays a moment, then fades away (only that text)."""
+        t = self.text
+        self._flash_token = token = getattr(self, '_flash_token', 0) + 1
+
+        def blend(f):
+            try:
+                a, b = t.winfo_rgb(CARD), t.winfo_rgb(ACCENT_SOFT)
+                return '#%02x%02x%02x' % tuple(int((a[i] + (b[i] - a[i]) * f) / 257) for i in range(3))
+            except tk.TclError:
+                return ACCENT_SOFT
+
+        def paint(f):
+            if token != self._flash_token:
+                return False
+            try:
+                t.tag_configure('flash', background=blend(f))
+            except tk.TclError:
+                return False
+            return True
+
+        def step(i, n, direction, ms, then):
+            if not paint(i / n if direction > 0 else 1 - i / n):
+                return
+            if i < n:
+                self.after(max(1, ms // n), step, i + 1, n, direction, ms, then)
+            else:
+                then()
+
+        def done():
+            if token == self._flash_token:
+                try:
+                    t.tag_remove('flash', '1.0', 'end')
+                except tk.TclError:
+                    pass
+        t.tag_configure('flash', background=CARD)
+        step(1, 6, 1, fade_in, lambda: self.after(
+            hold, lambda: step(1, 16, -1, fade_out, done) if token == self._flash_token else None))
 
     # ------------------------------------------------------------ back link
     def refresh_back(self):
@@ -5769,7 +6290,7 @@ class ResultDialog(tk.Toplevel):
         tree.column('#0', width=270, minwidth=180, stretch=True)
         tree.column('c', width=90, minwidth=70, anchor='e', stretch=False)
         tree.column('n', width=130, minwidth=100, anchor='e', stretch=False)
-        tree.tag_configure('bold', font=(FONT, 10, 'bold'), background=ROW_BOLD)
+        tree.tag_configure('bold', font=(FONT, 10, 'bold'), background=HEAD_BG)
         tree.tag_configure('plain', background=CARD)
         for label, c, n, bold in result['summary']:
             tree.insert('', 'end', text=label, values=(c, n), tags=('bold' if bold else 'plain',))
@@ -5865,6 +6386,8 @@ class LayoutEditor(tk.Toplevel):
         self._fit_pending = True
         self._redraw_job = None
         self._last_width = 0
+        self._last_height = 0
+        self._auto_fit = True           # the page follows the window size until the person zooms by hand
         self._fallback_texts = None
         self.undo, self.redo = [], []
         self._snap_key, self._snap_time, self._stagger = None, 0.0, 0
@@ -5885,7 +6408,7 @@ class LayoutEditor(tk.Toplevel):
         self.status_var = tk.StringVar()
 
         self.configure(bg=BG)
-        self.minsize(1060, 680)
+        self.minsize(900, 600)
         self._build()
         self._fill_tree()
         self._load_props()
@@ -5908,7 +6431,8 @@ class LayoutEditor(tk.Toplevel):
             sc.add(sid, lambda e, d=direction: self._on_arrow(e, d))
         sc.apply()
         self.bind('<FocusOut>', lambda e: self._space_up())
-        self.transient(host)
+        self.bind('<F11>', self._toggle_maximize)
+        self.resizable(True, True)
         try:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
             w, h = min(1340, sw - 60), min(880, sh - 90)
@@ -5920,6 +6444,27 @@ class LayoutEditor(tk.Toplevel):
         self.after(150, self._try_grab)
 
     # ------------------------------------------------------------------ setup
+    def _place_sash(self):
+        try:
+            h = self.vpane.winfo_height()
+            if h > 200:
+                self.vpane.sashpos(0, int(h * 0.58))
+            else:
+                self.after(200, self._place_sash)
+        except tk.TclError:
+            pass
+
+    def _toggle_maximize(self, _event=None):
+        """Maximize / restore the editor window (F11, the header button or a double-click on the header)."""
+        try:
+            self.state('normal' if self.state() == 'zoomed' else 'zoomed')
+        except tk.TclError:                         # Linux window managers
+            try:
+                self.attributes('-zoomed', not bool(self.attributes('-zoomed')))
+            except tk.TclError:
+                pass
+        return 'break'
+
     def _try_grab(self):
         try:
             self.grab_set()
@@ -5958,18 +6503,44 @@ class LayoutEditor(tk.Toplevel):
         # ---- header strip, like the main window
         head = tk.Frame(self, bg=HEADER_BG)
         head.pack(fill="x")
-        tk.Label(head, text=self._base_title(), bg=HEADER_BG, fg=HEADER_FG,
-                 font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
-        tk.Label(head, text=(T("Αλλαγές μόνο για αυτό το PDF - οι αποθηκευμένες ρυθμίσεις δεν αλλάζουν · ",
+        self.head_title = tk.Label(head, text=self._base_title(), bg=HEADER_BG, fg=HEADER_FG,
+                                   font=(FONT, 14, 'bold'))
+        self.head_title.pack(side="left", padx=(18, 12), pady=12)
+        self.head_note = tk.Label(head, text=(T("Αλλαγές μόνο για αυτό το PDF - οι αποθηκευμένες ρυθμίσεις δεν αλλάζουν · ",
                                "Changes for this PDF only - your saved settings stay unchanged · ")
                              if self.temporary else self._context_note())
                  + T("Σύρετε κάθε στοιχείο εκεί που ανήκει στο έντυπο · βελάκια = λεπτομερής μετακίνηση",
                      "Drag each item to where it belongs on the form · arrow keys = fine movement"),
-                 bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
+                 bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10))
+        self.head_note.pack_forget()
+        self.head_note.configure(justify="left", anchor="w")
+        self.head_note.pack(side="left", fill="x", expand=True)
+
+        def fit_head(_e=None):
+            room = head.winfo_width() - self.head_title.winfo_reqwidth() - 50
+            self.head_note.configure(wraplength=max(220, room))
+        head.bind('<Configure>', fit_head)
 
         # ---- toolbar
-        bar = ttk.Frame(self, padding=(14, 10, 14, 6))
-        bar.pack(fill="x")
+        bar_outer = ttk.Frame(self, padding=(14, 10, 14, 6))
+        bar_outer.pack(fill="x")
+        bar = ttk.Frame(bar_outer)
+        bar_r = ttk.Frame(bar_outer)
+        bar.grid(row=0, column=0, sticky="w")
+        bar_r.grid(row=0, column=1, sticky="e")
+        bar_outer.columnconfigure(1, weight=1)
+        self._bar_wrapped = False
+
+        def reflow_bar(_e=None):
+            need = bar.winfo_reqwidth() + bar_r.winfo_reqwidth() + 40
+            wrap = bar_outer.winfo_width() > 1 and bar_outer.winfo_width() < need
+            if wrap != self._bar_wrapped:
+                self._bar_wrapped = wrap
+                if wrap:
+                    bar_r.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+                else:
+                    bar_r.grid(row=0, column=1, columnspan=1, sticky="e", pady=0)
+        bar_outer.bind('<Configure>', reflow_bar)
         self.page_seg = Segmented(bar, ((0, T("Σελίδα 1", "Page 1")), (1, T("Σελίδα 2", "Page 2"))),
                                   self._on_page_seg, 0)
         self.page_seg.pack(side="left")
@@ -5989,11 +6560,11 @@ class LayoutEditor(tk.Toplevel):
         self.data_seg = Segmented(bar, (('sample', T("Δείγμα", "Sample")), ('real', T("Πραγματικά", "Real")),
                                         ('names', T("Ονόματα", "Names"))), self._on_data_mode, self.data_mode.get())
         self.data_seg.pack(side="left")
-        ttk.Button(bar, text=T("Αποθήκευση αλλαγών", "Save changes") if self.temporary else T("Αποθήκευση", "Save"),
+        ttk.Button(bar_r, text=T("Αποθήκευση αλλαγών", "Save changes") if self.temporary else T("Αποθήκευση", "Save"),
                    style='PrintSm.TButton', command=self.save).pack(side="right")
-        ttk.Button(bar, text=T("Εκκαθάριση όλων", "Clear all"), style='Danger.TButton',
+        ttk.Button(bar_r, text=T("Εκκαθάριση όλων", "Clear all"), style='Danger.TButton',
                    command=self._wipe_all).pack(side="right")
-        ttk.Button(bar, text=T("Αυτόματη τοποθέτηση", "Auto-place items"),
+        ttk.Button(bar_r, text=T("Αυτόματη τοποθέτηση", "Auto-place items"),
                    command=self._auto_place).pack(side="right", padx=(0, 8))
 
         # ---- status line (bottom, packed before the body so it never disappears)
@@ -6009,18 +6580,24 @@ class LayoutEditor(tk.Toplevel):
                         font=(FONT, 9, 'underline'), cursor='hand2', padx=12)
         more.pack(side="right")
         more.bind('<Button-1>', lambda e: self._open_guide())
+        tk.Label(tipbar, text=T("F11 = μεγιστοποίηση", "F11 = maximize"), bg=ACCENT_SOFT, fg=MUTED,
+                 font=(FONT, 9), padx=6).pack(side="right")
         self.tip_lbl = tk.Label(tipbar, textvariable=self.tip_var, bg=ACCENT_SOFT, fg=TEXT, font=(FONT, 9),
                                 anchor="w", justify="left", padx=12, pady=6)
         self.tip_lbl.pack(side="left", fill="x", expand=True)
-        tipbar.bind('<Configure>', lambda e: self.tip_lbl.configure(wraplength=max(300, e.width - 190)))
+        tipbar.bind('<Configure>', lambda e: self.tip_lbl.configure(wraplength=max(300, e.width - 320)))
 
         # ---- body: field list | page | properties
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=14, pady=(4, 10))
 
         left_outer, left = self._card(body)
-        ttk.Label(left, text=T("Στοιχεία του δελτίου", "Items on the form"), style='CardBold.TLabel').pack(
-            anchor="w", padx=14, pady=(12, 4))
+        self.left_title_var = tk.StringVar()
+        ttk.Label(left, textvariable=self.left_title_var, style='CardBold.TLabel').pack(
+            anchor="w", padx=14, pady=(12, 0))
+        ttk.Label(left, text=T("Μόνο ό,τι τυπώνεται στο PDF. Τα κρυμμένα και όσα δεν χρησιμοποιούνται είναι δεξιά.",
+                               "Only what is printed on the PDF. Hidden and unused items are listed on the right."),
+                  style='CardHint.TLabel', wraplength=250, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
         srow = ttk.Frame(left, style='Card.TFrame')
         srow.pack(fill="x", padx=14, pady=(0, 6))
         ttk.Label(srow, text=T("Αναζήτηση:", "Search:"), style='CardHint.TLabel').pack(side="left", padx=(0, 6))
@@ -6032,7 +6609,7 @@ class LayoutEditor(tk.Toplevel):
         self.q_var.trace_add('write', lambda *a: self._fill_tree())
         tree_box = ttk.Frame(left, style='Card.TFrame')
         tree_box.pack(fill="both", expand=True, padx=8)
-        self.tree = ttk.Treeview(tree_box, show='tree', selectmode='browse', height=18, style='Editor.Treeview')
+        self.tree = ttk.Treeview(tree_box, show='tree', selectmode='browse', height=8, style='Editor.Treeview')
         self.tree.column('#0', width=250, minwidth=180, stretch=True)
         sb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -6046,16 +6623,18 @@ class LayoutEditor(tk.Toplevel):
         self.tree.bind('<Shift-Button-1>', lambda e: self._on_tree_shift(e))
         self.tree.bind('<Control-Shift-Button-1>', lambda e: self._on_tree_shift(e, add=True))
         lrow = ttk.Frame(left, style='Card.TFrame')
-        lrow.pack(fill="x", padx=14, pady=(12, 4))
+        lrow.pack(fill="x", padx=14, pady=(12, 4), side="bottom", before=tree_box)
         ttk.Button(lrow, text=T("+ Προσθήκη στοιχείου…", "+ Add item…"), style='PrintSm.TButton',
                    command=self._add_item_dialog).pack(side="left")
         ttk.Button(lrow, text=T("+ Δικό μου κείμενο", "+ My own text"), command=self._add_custom).pack(side="left", padx=8)
         lrow2 = ttk.Frame(left, style='Card.TFrame')
-        lrow2.pack(fill="x", padx=14, pady=(0, 12))
+        lrow2.pack(fill="x", padx=14, pady=(0, 12), side="bottom", before=lrow)
         self.dup_btn = ttk.Button(lrow2, text=T("Διπλασιασμός", "Duplicate"), command=self._duplicate)
         self.dup_btn.pack(side="left")
+        self.hide_btn = ttk.Button(lrow2, text=T("Απόκρυψη", "Hide"), command=self._hide_selected)
+        self.hide_btn.pack(side="left", padx=8)
         self.del_btn = ttk.Button(lrow2, text=T("Διαγραφή", "Delete"), command=self._delete_selected)
-        self.del_btn.pack(side="left", padx=8)
+        self.del_btn.pack(side="left")
         body.add(left_outer, weight=0)
 
         mid = tk.Frame(body, bg=BORDER)
@@ -6063,7 +6642,7 @@ class LayoutEditor(tk.Toplevel):
         mid_in.pack(fill="both", expand=True, padx=1, pady=1)
         mid_in.rowconfigure(0, weight=1)
         mid_in.columnconfigure(0, weight=1)
-        self.cv = tk.Canvas(mid_in, bg=TAB_BG, highlightthickness=0, width=640, height=560, takefocus=True)
+        self.cv = tk.Canvas(mid_in, bg=TAB_BG, highlightthickness=0, width=320, height=300, takefocus=True)
         vbar = ttk.Scrollbar(mid_in, orient="vertical", command=self.cv.yview)
         hbar = ttk.Scrollbar(mid_in, orient="horizontal", command=self.cv.xview)
         self.cv.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
@@ -6081,9 +6660,21 @@ class LayoutEditor(tk.Toplevel):
         self.cv.bind('<Enter>', lambda e: None if self._typing() else self.cv.focus_set())
         body.add(mid, weight=1)
 
-        right_outer, right = self._card(body)
-        self._build_props(right)
-        body.add(right_outer, weight=0)
+        right_col = ttk.Frame(body)
+        self.vpane = vpane = ttk.PanedWindow(right_col, orient="vertical")
+        vpane.pack(fill="both", expand=True)
+        props_outer, props_card = self._card(vpane)
+        self.props_scroll = ScrollFrame(props_card)
+        self.props_scroll.pack(fill="both", expand=True)
+        self.props_scroll.canvas.configure(bg=CARD, width=310, height=200)
+        self.props_scroll.body.configure(style='Card.TFrame')
+        self._build_props(self.props_scroll.body)
+        vpane.add(props_outer, weight=3)
+        hidden_outer, hidden_card = self._card(vpane)
+        self._build_hidden_panel(hidden_card)
+        vpane.add(hidden_outer, weight=2)
+        body.add(right_col, weight=0)
+        self.after(200, self._place_sash)
 
     def _build_props(self, parent):
         self.empty_lbl = ttk.Label(
@@ -6208,6 +6799,220 @@ class LayoutEditor(tk.Toplevel):
         for var in (self.v_text, self.v_size, self.v_color, self.v_step, self.v_x, self.v_y):
             var.trace_add('write', lambda *a: self._prop_changed())
 
+    # ------------------------------------------------------------------ hidden / unused window
+    def _build_hidden_panel(self, parent):
+        self._h_last = set()
+        self._n_hidden = 0
+        self.hid_title_var = tk.StringVar()
+        self.hq_var = tk.StringVar()
+        ttk.Label(parent, textvariable=self.hid_title_var, style='CardBold.TLabel').pack(
+            anchor="w", padx=14, pady=(12, 0))
+        ttk.Label(parent, text=T("Κρυμμένα = τοποθετημένα αλλά δεν τυπώνονται. Χωρίς χρήση = διαθέσιμα στοιχεία που δεν "
+                                 "έχετε βάλει στη σελίδα. Διπλό κλικ για να μπουν στο PDF.",
+                                 "Hidden = placed but not printed. Not on the form = available items you have not "
+                                 "placed yet. Double-click one to put it on the PDF."),
+                  style='CardHint.TLabel', wraplength=280, justify="left").pack(anchor="w", padx=14, pady=(2, 6))
+        srow = ttk.Frame(parent, style='Card.TFrame')
+        srow.pack(fill="x", padx=14, pady=(0, 6))
+        ttk.Label(srow, text=T("Αναζήτηση:", "Search:"), style='CardHint.TLabel').pack(side="left", padx=(0, 6))
+        ttk.Entry(srow, textvariable=self.hq_var).pack(side="left", fill="x", expand=True)
+        clear = tk.Label(srow, text="\u2715", bg=CARD, fg=MUTED, font=(FONT, 10), cursor='hand2', padx=6)
+        clear.pack(side="left")
+        clear.bind('<Button-1>', lambda e: self.hq_var.set(''))
+        self.hq_var.trace_add('write', lambda *a: self._fill_hidden())
+        box = ttk.Frame(parent, style='Card.TFrame')
+        box.pack(fill="both", expand=True, padx=8)
+        self.htree = ttk.Treeview(box, show='tree', selectmode='extended', height=4, style='Editor.Treeview')
+        self.htree.column('#0', width=270, minwidth=200, stretch=True)
+        hsb = ttk.Scrollbar(box, orient="vertical", command=self.htree.yview)
+        self.htree.configure(yscrollcommand=hsb.set)
+        self.htree.pack(side="left", fill="both", expand=True)
+        hsb.pack(side="right", fill="y")
+        self.htree.tag_configure('group', font=(FONT, 10, 'bold'), foreground=NAVY)
+        self.htree.tag_configure('hint', foreground=MUTED, font=(FONT, 9, 'italic'))
+        self.htree.bind('<<TreeviewSelect>>', self._on_hidden_select)
+        self.htree.bind('<Double-1>', self._on_hidden_double)
+        self.htree.bind('<Return>', lambda e: (self._put_selected(), 'break')[1])
+        brow = ttk.Frame(parent, style='Card.TFrame')
+        brow.pack(fill="x", padx=14, pady=(10, 12), side="bottom", before=box)
+        self.put_btn = ttk.Button(brow, text=T("Βάλε στο PDF", "Put on the PDF"), style='PrintSm.TButton',
+                                  command=self._put_selected)
+        self.put_btn.pack(side="left")
+        self.showall_btn = ttk.Button(brow, text=T("Εμφάνιση όλων των κρυμμένων", "Show all hidden"),
+                                      command=self._show_all_hidden)
+        self.showall_btn.pack(side="left", padx=8)
+        self._update_hidden_buttons()
+
+    def _hid_label(self, fid, it):
+        base = manual_label(fid, it, self.layout['items'])
+        if it.get('country'):
+            return base
+        return base + T(f"  · Σελ. {it.get('page', 0) + 1}", f"  · Pg {it.get('page', 0) + 1}")
+
+    def _unused_catalog(self):
+        """Everything that could be put on the form but is not on it at all (not even hidden)."""
+        items = self.layout['items']
+        used_src = {i['source'] for i in items.values() if i.get('source')}
+        out = []
+        for key, label, gid in manual_source_catalog():
+            if gid == 'country' or key in items or key in used_src:
+                continue
+            out.append((key, label, gid))
+        for f in MANUAL_FIELDS:
+            if f[1] == 'rows' and f[0] not in items:
+                out.append((f[0], f[2], 'rows'))
+        return out
+
+    def _fill_hidden(self):
+        if not hasattr(self, 'htree'):
+            return
+        tv, items = self.htree, self.layout['items']
+        q = _fold(self.hq_var.get().strip())
+        was = {}
+
+        def grab(parent):
+            for r in tv.get_children(parent):
+                if r.startswith(('hg', 'ug')):
+                    was[r] = str(tv.item(r, 'open')).lower() in ('1', 'true')
+                    grab(r)
+        grab('')
+        hidden_all = [(f, i) for f, i in items.items() if not i.get('split') and not i.get('visible', True)]
+        unused_all = self._unused_catalog()
+        kinds = dict(MANUAL_GROUPS)
+        kinds['cfield'] = ("Μεταβλητές", "Variables")
+        kinds['rows'] = ("Γραμμές χωρών", "Country rows")
+        nh, nu = len(hidden_all), len(unused_all)
+        self._n_hidden = nh
+        self.hid_title_var.set(T(f"Κρυμμένα και αχρησιμοποίητα ({nh + nu})", f"Hidden and not used ({nh + nu})"))
+        tv.delete(*tv.get_children())
+        tv.insert('', 'end', iid='hg', text=T(f"Κρυμμένα στο PDF ({nh})", f"Hidden on the PDF ({nh})"),
+                  open=was.get('hg', True) or bool(q), tags=('group',))
+        shown = 0
+        for fid, it in hidden_all:
+            label = self._hid_label(fid, it)
+            if q and q not in _fold(label):
+                continue
+            tv.insert('hg', 'end', iid='h:' + fid, text=label)
+            shown += 1
+        if not shown:
+            tv.insert('hg', 'end', iid='hnone', tags=('hint',),
+                      text=T("(κανένα - όλα εμφανίζονται)" if not nh else "(κανένα αποτέλεσμα)",
+                             "(none - everything is shown)" if not nh else "(no matches)"))
+        tv.insert('', 'end', iid='ug', text=T(f"Δεν υπάρχουν στο έντυπο ({nu})", f"Not on the form ({nu})"),
+                  open=was.get('ug', True) or bool(q), tags=('group',))
+        by_group = {}
+        for key, label, gid in unused_all:
+            text = T(*label)
+            if q and q not in _fold(text + ' ' + T(*kinds.get(gid, (gid, gid)))):
+                continue
+            by_group.setdefault(gid, []).append((key, text))
+        order = [g for g, _n in MANUAL_GROUPS] + ['cfield']
+        for gid in order + [g for g in by_group if g not in order]:
+            if gid not in by_group:
+                continue
+            gi = 'ug:' + gid
+            tv.insert('ug', 'end', iid=gi, text=f"{T(*kinds.get(gid, (gid, gid)))}  ({len(by_group[gid])})",
+                      open=was.get(gi, False) or bool(q), tags=('group',))
+            for key, text in by_group[gid]:
+                tv.insert(gi, 'end', iid='u:' + key, text=text)
+        if not by_group:
+            tv.insert('ug', 'end', iid='unone', tags=('hint',),
+                      text=T("(τίποτα - όλα είναι στη σελίδα)" if not nu else "(κανένα αποτέλεσμα)",
+                             "(nothing - everything is on the page)" if not nu else "(no matches)"))
+        self._h_last = set()
+        self._sync_hidden_selection()
+
+    def _sync_hidden_selection(self):
+        """The window follows the selected item (a hidden one is highlighted there)."""
+        if not hasattr(self, 'htree'):
+            return
+        tv = self.htree
+        want = 'h:' + self.sel if self.sel else None
+        cur = set(tv.selection())
+        if want and tv.exists(want):
+            if cur != {want}:
+                tv.selection_set(want)
+                tv.see(want)
+        elif cur:
+            tv.selection_remove(*cur)
+        self._h_last = set(tv.selection())
+        self._update_hidden_buttons()
+
+    def _update_hidden_buttons(self):
+        if not hasattr(self, 'put_btn'):
+            return
+        picked = [i for i in self.htree.selection() if i[:2] in ('h:', 'u:')]
+        self.put_btn.state(['!disabled'] if picked else ['disabled'])
+        self.showall_btn.state(['!disabled'] if self._n_hidden else ['disabled'])
+
+    def _on_hidden_select(self, _event=None):
+        chosen = self.htree.selection()
+        now = set(chosen)
+        if now == self._h_last:             # the program's own echo
+            return
+        self._h_last = now
+        self._update_hidden_buttons()
+        items = self.layout['items']
+        if len(chosen) == 1 and chosen[0].startswith('h:') and chosen[0][2:] in items:
+            if chosen[0][2:] != self.sel:
+                self._select(chosen[0][2:], from_tree=True)
+                self._sync_tree_selection()
+            self.status_var.set(T("Κρυμμένο στοιχείο - ενεργοποιήστε το «Εμφάνιση στο PDF» ή πατήστε «Βάλε στο PDF».",
+                                  "Hidden item - tick “Show in the PDF” or press “Put on the PDF”."))
+        elif len(chosen) == 1 and chosen[0].startswith('u:'):
+            self.status_var.set(T("Δεν υπάρχει ακόμα στο έντυπο - διπλό κλικ ή «Βάλε στο PDF» για να μπει στη σελίδα.",
+                                  "Not on the form yet - double-click or press “Put on the PDF” to place it on the page."))
+
+    def _on_hidden_double(self, event):
+        iid = self.htree.identify_row(event.y)
+        if iid[:2] in ('h:', 'u:'):
+            self._put_selected([iid])
+            return 'break'
+
+    def _put_selected(self, iids=None):
+        iids = [i for i in (iids if iids is not None else self.htree.selection()) if i[:2] in ('h:', 'u:')]
+        if not iids:
+            return
+        items = self.layout['items']
+        hidden = [i[2:] for i in iids if i.startswith('h:') and i[2:] in items]
+        new = [i[2:] for i in iids if i.startswith('u:')]
+        if hidden:
+            self._snap(None)
+            for fid in hidden:
+                items[fid]['visible'] = True
+            self._set_dirty()
+            self._fill_tree()
+            self._draw_items()
+        for key in new:
+            self._add_source_item(key)
+        if hidden and not new:
+            self._select(hidden[-1])
+            self._reveal()
+        n = len(hidden) + len(new)
+        self.status_var.set(T(f"{n} στοιχεία μπήκαν στο PDF.", f"{n} item(s) put on the PDF."))
+
+    def _show_all_hidden(self):
+        self._put_selected(['h:' + f for f, i in self.layout['items'].items()
+                            if not i.get('split') and not i.get('visible', True)])
+
+    def _hide_selected(self):
+        items = self.layout['items']
+        ids = [self.sel] if self.sel else [f for f in self.group_ids if f in items]
+        ids = [f for f in ids if f in items and not items[f].get('split') and items[f].get('visible', True)]
+        if not ids:
+            return
+        self._snap(None)
+        for f in ids:
+            items[f]['visible'] = False
+        self._set_dirty()
+        self._fill_tree()
+        self._draw_items()
+        if self.sel:
+            self._load_props()
+        self._sync_hidden_selection()
+        self.status_var.set(T(f"{len(ids)} στοιχεία κρύφτηκαν - βρίσκονται στο παράθυρο «Κρυμμένα» δεξιά.",
+                              f"{len(ids)} item(s) hidden - find them in the “Hidden” window on the right."))
+
     # ------------------------------------------------------------------ list of items
     def _tree_text(self, fid, it):
         src = str(it.get('source') or '')
@@ -6217,6 +7022,12 @@ class LayoutEditor(tk.Toplevel):
                 T(f"Σελίδα {it.get('page', 0) + 1} · θέση {same.index(fid) + 1}",
                   f"Page {it.get('page', 0) + 1} · placement {same.index(fid) + 1}")
         return ("" if it.get('visible', True) else "○  ") + manual_label(fid, it, self.layout['items'])
+
+    def _present(self, fid, it):
+        """True when the item is printed on the PDF (a split item counts when any of its pieces is)."""
+        if it.get('split'):
+            return any(i.get('parent') == fid and i.get('visible', True) for i in self.layout['items'].values())
+        return bool(it.get('visible', True))
 
     def _fill_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -6230,25 +7041,26 @@ class LayoutEditor(tk.Toplevel):
                 it = items[it['parent']]
             return it
         for fid, it in items.items():
+            if not self._present(fid, it):          # hidden items live in the "Hidden & not used" window
+                continue
             gid = manual_group(fid, it if not (it.get('parent') in items and not it.get('country')) else root_of(it))
             if q and q not in _fold(manual_label(fid, it, self.layout['items']) + ' ' + T(*groups.get(gid, (gid, gid)))):
                 continue
             rows.append((fid, it, gid))
         used = {g for _f, _i, g in rows}
+        counts = {}
+        for _f, it, gid in rows:
+            if not it.get('split'):
+                counts[gid] = counts.get(gid, 0) + 1
         cf_names = {CF_PREFIX + c['id']: c['name'] for c in load_custom_fields()}
-        shown_vars = [k for k, n in cf_names.items() if not q or q in _fold(n + ' ' + T(*groups['vars']))]
-        if shown_vars:
-            used.add('vars')
+        placed_vars = {str(root_of(it).get('source')) for _f, it, g in rows if g == 'vars'}
+        shown_vars = [k for k in cf_names if k in placed_vars]
         for gid, (gel, gen) in MANUAL_GROUPS:
-            if not q or gid in used:
-                self.tree.insert('', 'end', iid='g:' + gid, text=T(gel, gen),
+            if gid in used:
+                self.tree.insert('', 'end', iid='g:' + gid, text=f"{T(gel, gen)}  ({counts.get(gid, 0)})",
                                  open=(gid not in ('totals',)) or bool(q), tags=('group',))
-        for key in shown_vars:      # every variable is listed (placed or not); its placements hang under it
+        for key in shown_vars:      # a variable is listed once it has a placement; its placements hang under it
             self.tree.insert('g:vars', 'end', iid='var:' + key, text=cf_names[key], open=True, tags=('var',))
-        if not cf_names and not q:
-            self.tree.insert('g:vars', 'end', iid='varhint', tags=('hidden',),
-                             text=T("(καμία - προσθέστε από «Στοιχεία ξενοδοχείου»)",
-                                    "(none - add them in “Hotel details”)"))
         for fid, it, gid in rows:
             parent = 'g:' + gid
             if gid == 'vars':
@@ -6257,11 +7069,13 @@ class LayoutEditor(tk.Toplevel):
                 if not self.tree.exists(parent):        # a variable that was deleted but is still on the form
                     self.tree.insert('g:vars', 'end', iid=parent, text=manual_source_label(vsrc),
                                      open=True, tags=('hidden',))
-            if not q and it.get('parent') in items:       # pieces of a split item sit under it
+            if not q and it.get('parent') in items and self.tree.exists(it['parent']):       # pieces of a split item sit under it
                 parent = it['parent']
-            self.tree.insert(parent, 'end', iid=fid, text=self._tree_text(fid, it),
-                             tags=() if it.get('visible', True) else ('hidden',))
+            self.tree.insert(parent, 'end', iid=fid, text=self._tree_text(fid, it))
+        n_on = sum(1 for i in items.values() if not i.get('split') and i.get('visible', True))
+        self.left_title_var.set(T(f"Στοιχεία στο PDF ({n_on})", f"Items on the PDF ({n_on})"))
         self._sync_tree_selection()
+        self._fill_hidden()
 
     def _sync_tree_selection(self):
         self._sync = True
@@ -6634,11 +7448,12 @@ class LayoutEditor(tk.Toplevel):
             self._fit_pending = False
             self.after(10, self._fit)
             return
-        if abs(event.width - self._last_width) > 2:
-            self._last_width = event.width
+        if abs(event.width - self._last_width) > 2 or abs(event.height - self._last_height) > 2:
+            self._last_width, self._last_height = event.width, event.height
             if self._redraw_job:
                 self.after_cancel(self._redraw_job)
-            self._redraw_job = self.after(80, self._draw_all)
+            follow = self._auto_fit and event.width > 300 and event.height > 200
+            self._redraw_job = self.after(80, self._fit if follow else self._draw_all)
 
     def _hit(self, event):
         x, y = self.cv.canvasx(event.x), self.cv.canvasy(event.y)
@@ -6794,6 +7609,7 @@ class LayoutEditor(tk.Toplevel):
     def _set_zoom(self, zoom, anchor=None):
         """Zoom keeping the spot under `anchor` (widget coordinates) fixed, like Photoshop.
         Without an anchor the middle of the window is used."""
+        self._auto_fit = False
         zoom = round(min(max(zoom, self.MIN_ZOOM), self.MAX_ZOOM), 2)      # whole percents: pictures are reused
         if abs(zoom - self.zoom) < 1e-4:
             return
@@ -6810,6 +7626,7 @@ class LayoutEditor(tk.Toplevel):
         cv.yview_moveto(max(0.0, (self.PAD + py * zoom - ay) / total_h))
 
     def _fit(self):
+        self._auto_fit = True
         pw, ph = self.sizes[self.page]
         cw, ch = max(self.cv.winfo_width(), 300), max(self.cv.winfo_height(), 200)
         self.zoom = min((cw - 2 * self.PAD) / pw, (ch - 2 * self.PAD) / ph)
@@ -6858,6 +7675,7 @@ class LayoutEditor(tk.Toplevel):
         if not from_tree:
             self._sync_tree_selection()
         self._load_props()
+        self._sync_hidden_selection()
         if from_tree:
             self._reveal()
 
@@ -6877,6 +7695,7 @@ class LayoutEditor(tk.Toplevel):
             self.empty_lbl.pack(anchor="nw", padx=18, pady=18)
             self.del_btn.state(['disabled'])
             self.dup_btn.state(['disabled'])
+            self.hide_btn.state(['!disabled'] if self.group_ids else ['disabled'])
             self.tip_var.set(self._context_tip())
             return
         self.tip_var.set(self._context_tip())
@@ -6917,6 +7736,7 @@ class LayoutEditor(tk.Toplevel):
             can_reset = not custom and not child and not it.get('source') and self.sel in MANUAL_FIELD_INDEX
             self.reset_btn.state(['!disabled'] if can_reset else ['disabled'])
             self.del_btn.state(['!disabled'] if deletable else ['disabled'])
+            self.hide_btn.state(['!disabled'] if (it.get('visible', True) and not it.get('split')) else ['disabled'])
             self.dup_btn.state(['!disabled'] if (not child and not rows and not it.get('split')) else ['disabled'])
             # individual controls
             tid = it.get('parent') or self.sel
@@ -6970,6 +7790,7 @@ class LayoutEditor(tk.Toplevel):
             return
         self._snap('prop:' + self.sel)
         it = self.layout['items'][self.sel]
+        was_visible = it.get('visible', True)
         if it.get('custom'):
             it['text'] = self.v_text.get()
         font = self.v_font.get()
@@ -6987,9 +7808,14 @@ class LayoutEditor(tk.Toplevel):
         it['align'] = self.align_seg.value
         it['visible'] = bool(self.v_visible.get())
         self.p_title.configure(text=manual_label(self.sel, it, self.layout['items']))
-        if self.tree.exists(self.sel):
-            self.tree.item(self.sel, text=self._tree_text(self.sel, it),
-                           tags=() if it['visible'] else ('hidden',))
+        if it['visible'] != was_visible:            # moves between "Items on the PDF" and "Hidden"
+            self._fill_tree()
+            self.hide_btn.state(['!disabled'] if it['visible'] else ['disabled'])
+        else:
+            if self.tree.exists(self.sel):
+                self.tree.item(self.sel, text=self._tree_text(self.sel, it))
+            if hasattr(self, 'htree') and self.htree.exists('h:' + self.sel):
+                self.htree.item('h:' + self.sel, text=self._hid_label(self.sel, it))
         self._set_dirty()
         self._draw_items()
 
@@ -7056,7 +7882,7 @@ class LayoutEditor(tk.Toplevel):
         cx, cy = min(max(cx, 20), pw - 120), min(max(cy, 20), ph - 20)
         it = manual_new_item(self.page, round(cx, 1), round(cy, 1), custom=True, text=T("Νέο κείμενο", "New text"))
         self.layout['items'][fid] = it
-        self.tree.insert('g:custom', 'end', iid=fid, text=self._tree_text(fid, it))
+        self._fill_tree()
         self._set_dirty()
         self._select(fid)
         self._draw_items()
@@ -7086,7 +7912,10 @@ class LayoutEditor(tk.Toplevel):
         if self._mode_ref is None:
             mode = self._current_mode()
             try:
-                self._mode_ref = manual_default_layout() if mode == 'manual' else build_mode_layout(mode, self.template)[0]
+                if mode == 'manual':
+                    mode = self.app.prefs.get('manual_base', 'overlay')
+                self._mode_ref = (manual_default_layout() if mode in ('manual', 'overlay', 'blank')
+                                  else build_mode_layout(mode, self.template)[0])
             except Exception:
                 self._mode_ref = manual_default_layout()
         return self._mode_ref
@@ -7112,7 +7941,9 @@ class LayoutEditor(tk.Toplevel):
 
     def _auto_place(self):
         mode = self._current_mode()
-        names = {'overlay': T("Παλιά μέθοδος (σταθερές συντεταγμένες)", "Legacy (fixed coordinates)"),
+        if mode == 'manual':          # "Set manually": use the auto-fill chosen in Settings
+            mode = self.app.prefs.get('manual_base', 'overlay')
+        names = {'blank': T("κενός καμβάς", "blank canvas"), 'overlay': T("Παλιά μέθοδος (σταθερές συντεταγμένες)", "Legacy (fixed coordinates)"),
                  'smart': T("Έξυπνη μετατόπιση", "Smart Shift"),
                  'detect': T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection"),
                  'manual': T("τελευταία αποθηκευμένη διάταξη", "last saved layout")}
@@ -7126,7 +7957,7 @@ class LayoutEditor(tk.Toplevel):
         self.config(cursor='watch')
         self.update_idletasks()
         try:
-            layout, note = build_mode_layout(mode, self.template)
+            layout, note = manual_base_layout(mode, self.template)
         except Exception as e:
             messagebox.showerror(T("Αυτόματη τοποθέτηση", "Auto-place items"),
                                  T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"), parent=self)
@@ -7564,8 +8395,12 @@ class LoadingBadge(tk.Frame):
 
 
 class ElstatApp(TkBase):
+    def report_callback_exception(self, exc, val, tb):
+        _handle_error(exc, val, tb, self)
+
     def __init__(self):
         super().__init__()
+        self.withdraw()                    # stay hidden while the screen is built, so it does not jump around
         self.geometry("920x840")
         self.minsize(640, 560)
         self.configure(bg=BG)
@@ -7616,7 +8451,9 @@ class ElstatApp(TkBase):
         self._shortcuts.add('generate', self._try_generate)
         self._shortcuts.add('generate_print', lambda e: self._try_generate(print_after=True))
         self._shortcuts.apply()
-        self._center()
+        if self.prefs.get('center_window', True):
+            self._center()
+        self.deiconify()                   # now it appears once, already in its final place
         if not DND_AVAILABLE and DND_ERROR:
             self._status("Drag & drop unavailable: " + DND_ERROR)
         elif not DND_AVAILABLE:
@@ -7666,7 +8503,7 @@ class ElstatApp(TkBase):
         self._reminder_dismissed = False
         # settings-tab variables
         self.pv = {k: tk.StringVar(value=self.prefs[k])
-                   for k in ('language', 'theme', 'output_mode', 'output_dir', 'filename_pattern', 'excel_dir', 'pdf_mode')}
+                   for k in ('language', 'theme', 'output_mode', 'output_dir', 'filename_pattern', 'excel_dir', 'pdf_mode', 'manual_base')}
         self.pv.update({k: tk.BooleanVar(value=self.prefs[k]) for k in BOOL_PREFS})
         self.data_dir_var = tk.StringVar(value=DATA_DIR)
         self.name_note_var = tk.StringVar()
@@ -8354,131 +9191,113 @@ class ElstatApp(TkBase):
                    "The folder where “Choose Excel…” and “Latest” start. "
                    "Empty = the folder of the last Excel you used."), 1, columnspan=3)
 
-        # ---- 3b. how the PDF is filled in
+        # ---- 3b. how the PDF is filled in: 1) who sets the positions  2) which method / starting point
         cp = Card(body, None, T("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in"))
         cp.grid(row=4, column=0, sticky="ew", padx=4, pady=6)
         polish_settings_card(cp)
         fp = cp.body
         fp.columnconfigure(0, weight=1)
-        ttk.Radiobutton(fp, text=T("Παλιά μέθοδος (σταθερές συντεταγμένες)  ·  LEGACY",
-                                   "Legacy (Fixed Coordinates)  ·  LEGACY"),
-                        value='overlay', variable=pv['pdf_mode'], style='Card.TRadiobutton',
-                        command=self._pdf_mode_clicked).grid(row=0, column=0, sticky="w")
-        hint(fp, T("Οι τιμές γράφονται σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
-                   "Values are written at fixed positions on top of the blank PDF. This is how the program has always worked."),
-             1, padx=(24, 0), pady=(2, 0), margin=130)
+        self._auto_labels = {'overlay': T("Παλιά μέθοδος - σταθερές θέσεις", "Legacy - fixed positions"),
+                             'smart': T("Έξυπνη μετατόπιση", "Smart Shift"),
+                             'detect': T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection")}
+        self._auto_desc = {
+            'overlay': T("Γράφει τις τιμές σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
+                         "Writes the values at fixed positions on the blank PDF. This is how the program has always worked."),
+            'smart': T("Μετρά πόσο μετακινήθηκε το έντυπο και μετατοπίζει ανάλογα τις σταθερές θέσεις. "
+                       "Χρήσιμο αν η ΕΛΣΤΑΤ αλλάξει λίγο το έντυπο.",
+                       "Measures how far the form moved and shifts the fixed positions to match. "
+                       "Useful if ELSTAT changes the form slightly."),
+            'detect': T("Σαρώνει το άδειο PDF, διαβάζει τις ετικέτες και βρίσκει μόνο του κάθε θέση.",
+                        "Scans the blank PDF, reads its labels and works out every position by itself.")}
+        self._base_labels = {b: manual_base_name(b) for b in MANUAL_BASES}
+        self._base_desc = {
+            'overlay': T("Οι σταθερές θέσεις του προγράμματος.", "The program's fixed positions."),
+            'smart': T("Οι θέσεις όπως θα τις μετατόπιζε η Έξυπνη μετατόπιση.", "Positions as Smart Shift would shift them."),
+            'detect': T("Οι θέσεις όπως θα τις έβρισκε η Έξυπνη ανίχνευση πεδίων.", "Positions as Smart Field Detection would find them."),
+            'blank': T("Τίποτα τοποθετημένο - χτίζετε τη διάταξη από το μηδέν.", "Nothing placed - you build the layout from scratch.")}
 
-        # ---- Smart Shift
-        ttk.Radiobutton(fp, text=T("Έξυπνη μετατόπιση (Smart Shift)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
-                                   "Smart Shift  ·  EXPERIMENTAL"),
-                        value='smart', variable=pv['pdf_mode'], style='Card.TRadiobutton',
-                        command=self._pdf_mode_clicked).grid(row=2, column=0, sticky="w", pady=(10, 0))
-        hint(fp, T("Διαβάζει σημεία-άγκυρες του template, μετρά πόσο μετακινήθηκαν σε σχέση με το σημείο σύγκρισης (διανύσματα "
-                   "μετατόπισης και χωρική παρεμβολή IDW) και μετατοπίζει ανάλογα τις σταθερές συντεταγμένες. Χρήσιμο αν η ΕΛΣΤΑΤ "
-                   "αλλάξει λίγο το έντυπο. Αν το template δεν αναγνωριστεί με ασφάλεια, χρησιμοποιείται αυτόματα η παλιά μέθοδος "
-                   "και εμφανίζεται προειδοποίηση.",
-                   "Reads anchor texts of the template, measures how far they moved against the point of comparison (delta "
-                   "vectors and IDW spatial interpolation) and shifts the fixed coordinates accordingly. Useful if ELSTAT changes "
-                   "the form slightly. If the template is not recognised safely, the Legacy method is used automatically "
-                   "and a warning is shown."),
-             3, padx=(24, 0), pady=(2, 0), margin=130)
-        self.smart_frame = sm = ttk.Frame(fp, style='Card.TFrame')
-        sm.grid(row=4, column=0, sticky="ew")
+        ttk.Label(fp, text=T("Ποιος ορίζει τις θέσεις των τιμών;", "Who sets where the values go?"),
+                  style='Card.TLabel').grid(row=0, column=0, sticky="w")
+        self.kind_seg = Segmented(fp, (('auto', T("Αυτόματα", "Automatic")), ('manual', T("Χειροκίνητα", "Manual"))),
+                                  command=self._kind_changed,
+                                  value='manual' if self.prefs.get('pdf_mode') == 'manual' else 'auto')
+        self.kind_seg.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.kind_desc_var = tk.StringVar()
+        kd = ttk.Label(fp, textvariable=self.kind_desc_var, style='CardHint.TLabel', justify="left")
+        kd.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        autowrap(kd, body, margin=110)
+
+        # ---- automatic: one drop-down instead of three radio buttons with long texts
+        self.auto_frame = af = ttk.Frame(fp, style='Card.TFrame')
+        af.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        af.columnconfigure(0, weight=1)
+        ttk.Label(af, text=T("Μέθοδος", "Method"), style='Card.TLabel').grid(row=0, column=0, sticky="w")
+        self.auto_combo = ttk.Combobox(af, state='readonly', width=44, values=list(self._auto_labels.values()))
+        self.auto_combo.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.auto_combo.bind('<<ComboboxSelected>>', self._auto_method_changed)
+        self.method_desc_var = tk.StringVar()
+        md = ttk.Label(af, textvariable=self.method_desc_var, style='CardHint.TLabel', justify="left")
+        md.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        autowrap(md, body, margin=110)
+
+        # Smart Shift options (only while it is selected)
+        self.smart_frame = sm = ttk.Frame(af, style='Card.TFrame')
+        sm.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         sm.columnconfigure(0, weight=1)
-        ttk.Separator(sm, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
-        warn = ttk.Label(sm, text=T("⚠ Πειραματική λειτουργία: ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Αν κάτι δεν "
-                                    "πάει καλά, γυρίστε στην παλιά μέθοδο.",
-                                    "⚠ Experimental feature: always check the form before submitting it. If anything "
-                                    "looks wrong, switch back to the Legacy method."),
-                         style='CardWarn.TLabel', justify="left")
-        warn.grid(row=1, column=0, sticky="w")
-        autowrap(warn, body, margin=110)
         self.layout_note = ttk.Label(sm, textvariable=self.layout_note_var, style='CardHint.TLabel', justify="left")
-        self.layout_note.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.layout_note.grid(row=0, column=0, sticky="w")
         autowrap(self.layout_note, body, margin=110)
         lrow = ttk.Frame(sm, style='Card.TFrame')
-        lrow.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        lrow.grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Button(lrow, text=T("Έλεγχος template", "Check template"), command=self.layout_check).pack(side="left")
         ttk.Button(lrow, text=T("Αποθήκευση ως αναφορά…", "Save as reference…"),
                    command=self.layout_save_reference).pack(side="left", padx=8)
         ttk.Button(lrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left")
-        hint(sm, T("Το «Δοκιμαστικό δελτίο» φτιάχνει ένα PDF με πλασματικά στοιχεία (μην το υποβάλετε) ώστε να δείτε αν όλα "
-                   "πέφτουν στη θέση τους με τη μέθοδο που έχετε διαλέξει.",
-                   "“Test form” creates a PDF with made-up data (do not submit it) so you can see whether everything "
-                   "lands in place with the method you chose."), 4, pady=(8, 0))
 
-        # ---- Smart Field Detection (AI / Auto-Detect)
-        ttk.Radiobutton(fp, text=T("Έξυπνη ανίχνευση πεδίων (AI / αυτόματη ανίχνευση)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
-                                   "Smart Field Detection (AI / Auto-Detect)  ·  EXPERIMENTAL"),
-                        value='detect', variable=pv['pdf_mode'], style='Card.TRadiobutton',
-                        command=self._pdf_mode_clicked).grid(row=5, column=0, sticky="w", pady=(10, 0))
-        hint(fp, T("Πλήρως αυτόνομη: σαρώνει το άδειο PDF εκείνη τη στιγμή, διαβάζει τις ετικέτες, ευθυγραμμίζει τον πίνακα "
-                   "και υπολογίζει τις συντεταγμένες χωρίς καμία σταθερή τιμή για τα πεδία του προγράμματος. Δικά σας πεδία "
-                   "και κείμενα τοποθετούνται χειροκίνητα από τον επεξεργαστή διάταξης.",
-                   "Fully autonomous: scans the blank PDF on the fly, reads the labels, aligns the table grid and computes the "
-                   "coordinates with nothing hardcoded for the program's own fields. Your own fields and texts are placed by "
-                   "hand in the layout editor."),
-             6, padx=(24, 0), pady=(2, 0), margin=130)
-        self.detect_frame = df = ttk.Frame(fp, style='Card.TFrame')
-        df.grid(row=7, column=0, sticky="ew")
+        # Smart Field Detection options (only while it is selected)
+        self.detect_frame = df = ttk.Frame(af, style='Card.TFrame')
+        df.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         df.columnconfigure(0, weight=1)
-        drow = ttk.Frame(df, style='Card.TFrame')
-        drow.grid(row=0, column=0, sticky="w", padx=(24, 0), pady=(8, 0))
-        ttk.Button(drow, text=T("👉 Ρύθμιση & έλεγχος ανίχνευσης…", "👉 Configure & Inspect Auto-Detection…"),
-                   style='PrintSm.TButton', command=self.open_detect_inspector).pack(side="left")
-        dwarn = ttk.Label(df, text=T("⚠ Πειραματική λειτουργία: ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Αν η ανίχνευση δεν "
-                                     "αναγνωρίσει το template, χρησιμοποιείται αυτόματα η παλιά μέθοδος με προειδοποίηση.",
-                                     "⚠ Experimental feature: always check the form before submitting it. If the detection "
-                                     "does not recognise the template, the Legacy method is used automatically with a warning."),
-                          style='CardWarn.TLabel', justify="left")
-        dwarn.grid(row=1, column=0, sticky="w", padx=(24, 0), pady=(8, 0))
-        autowrap(dwarn, body, margin=130)
         self.detect_note_var = tk.StringVar()
         self.detect_note = ttk.Label(df, textvariable=self.detect_note_var, style='CardHint.TLabel', justify="left")
-        self.detect_note.grid(row=2, column=0, sticky="w", padx=(24, 0), pady=(6, 0))
-        autowrap(self.detect_note, body, margin=130)
+        self.detect_note.grid(row=0, column=0, sticky="w")
+        autowrap(self.detect_note, body, margin=110)
+        ttk.Button(df, text=T("Ρύθμιση & έλεγχος ανίχνευσης…", "Configure & inspect detection…"),
+                   style='PrintSm.TButton', command=self.open_detect_inspector).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
-        # ---- set manually (layout editor)
-        ttk.Radiobutton(fp, text=T("Χειροκίνητη τοποθέτηση (επεξεργαστής διάταξης)", "Set manually (layout editor)"),
-                        value='manual', variable=pv['pdf_mode'], style='Card.TRadiobutton',
-                        command=self._pdf_mode_clicked).grid(row=8, column=0, sticky="w", pady=(10, 0))
-        hint(fp, T("Ανοίγει ένας επεξεργαστής όπου βλέπετε το έντυπο και σέρνετε κάθε στοιχείο εκεί που ανήκει. "
-                   "Για κάθε τιμή ορίζετε επίσης γραμματοσειρά, μέγεθος, χρώμα και στοίχιση. "
-                   "Χρήσιμο όταν θέλετε πλήρη έλεγχο ή το έντυπο της ΕΛΣΤΑΤ αλλάξει.",
-                   "Opens an editor where you see the form and drag each item to where it belongs. "
-                   "For every value you also choose the font, size, colour and alignment. "
-                   "Useful when you want full control or the ELSTAT form changes."),
-             9, padx=(24, 0), pady=(2, 0), margin=130)
+        # editor pre-fill for the automatic methods ("Edit layout…" in the preview)
+        self.prefill_frame = pf = ttk.Frame(af, style='Card.TFrame')
+        pf.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        ttk.Checkbutton(pf, text=T("Ο επεξεργαστής διάταξης ανοίγει προσυμπληρωμένος από αυτή τη μέθοδο",
+                                   "The layout editor opens pre-filled by this method"),
+                        variable=pv['auto_populate_layout'], style='Card.TCheckbutton',
+                        command=self._pref_changed).grid(row=0, column=0, sticky="w")
+
+        # ---- manual: choose the starting point, then open the editor
         self.manual_note_var = tk.StringVar()
         self.manual_frame = mf = ttk.Frame(fp, style='Card.TFrame')
-        mf.grid(row=10, column=0, sticky="ew")
+        mf.grid(row=3, column=0, sticky="ew", pady=(16, 0))
         mf.columnconfigure(0, weight=1)
-        ttk.Separator(mf, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
+        ttk.Label(mf, text=T("Ξεκίνα από", "Start from"), style='Card.TLabel').grid(row=0, column=0, sticky="w")
+        self.base_combo = ttk.Combobox(mf, state='readonly', width=44, values=list(self._base_labels.values()))
+        self.base_combo.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.base_combo.bind('<<ComboboxSelected>>', self._base_changed)
+        self.base_desc_var = tk.StringVar()
+        bd = ttk.Label(mf, textvariable=self.base_desc_var, style='CardHint.TLabel', justify="left")
+        bd.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        autowrap(bd, body, margin=110)
         self.manual_note = ttk.Label(mf, textvariable=self.manual_note_var, style='CardHint.TLabel', justify="left")
-        self.manual_note.grid(row=1, column=0, sticky="w")
+        self.manual_note.grid(row=3, column=0, sticky="w", pady=(12, 0))
         autowrap(self.manual_note, body, margin=110)
         mrow = ttk.Frame(mf, style='Card.TFrame')
-        mrow.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        mrow.grid(row=4, column=0, sticky="w", pady=(10, 0))
         ttk.Button(mrow, text=T("Άνοιγμα επεξεργαστή διάταξης", "Open layout editor"), style='PrintSm.TButton',
                    command=self.open_layout_editor).pack(side="left")
         ttk.Button(mrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left", padx=8)
         ttk.Button(mrow, text=T("Επαναφορά θέσεων", "Reset positions"), command=self.manual_reset).pack(side="left")
-
-        # ---- the layout editor's starting point (applies to every method)
-        ttk.Separator(fp, orient="horizontal").grid(row=11, column=0, sticky="ew", pady=(16, 8))
-        ttk.Checkbutton(fp, text=T("Αυτόματη προσυμπλήρωση του προτύπου χειροκίνητης διάταξης",
-                                   "Auto-populate manual layout template"),
-                        variable=pv['auto_populate_layout'], style='Card.TCheckbutton',
-                        command=self._pref_changed).grid(row=12, column=0, sticky="w")
-        hint(fp, T("Ενεργό: ο επεξεργαστής διάταξης ανοίγει με τα στοιχεία τοποθετημένα όπως θα τα έβαζε η επιλεγμένη μέθοδος "
-                   "(παλιά, Έξυπνη μετατόπιση ή Έξυπνη ανίχνευση). Ανενεργό: ανοίγει εντελώς κενός καμβάς για να χτίσετε τη "
-                   "διάταξη από το μηδέν. Μέσα στον επεξεργαστή μπορείτε πάντα να πατήσετε «Εκκαθάριση όλων» ή «Αυτόματη "
-                   "τοποθέτηση».",
-                   "On: the layout editor opens with the items placed the way the selected method (Legacy, Smart Shift or Smart "
-                   "Field Detection) would place them. Off: it opens a completely blank canvas to build the layout from scratch. "
-                   "Inside the editor you can always press “Clear all” or “Auto-place items”."),
-             13, padx=(24, 0), pady=(2, 0), margin=130)
         self._update_smart_panel()
+        c2.make_collapsible()
+        c3.make_collapsible()
 
         # ---- 4. behaviour
         c4 = Card(body, None, T("Συμπεριφορά του προγράμματος", "Program behaviour"))
@@ -8487,10 +9306,17 @@ class ElstatApp(TkBase):
         f4 = c4.body
         f4.columnconfigure(0, weight=1)
         behaviours = [
+            ('center_window', T("Κεντράρισμα του παραθύρου κατά την εκκίνηση", "Centre the window when the program starts"),
+             T("Το παράθυρο ανοίγει στο κέντρο της οθόνης. Αν το κλείσετε, το σύστημα επιλέγει τη θέση.",
+               "The window opens in the middle of the screen. If you turn it off, the system chooses the position.")),
             ('open_after', T("Άνοιγμα του PDF αμέσως μετά τη δημιουργία",
-                             "Open the PDF right after it is created"), None),
+                             "Open the PDF right after it is created"),
+             T("Μόλις φτιαχτεί το δελτίο, ανοίγει στο πρόγραμμα PDF του υπολογιστή σας.",
+               "As soon as the form is made it opens in your computer's PDF viewer.")),
             ('confirm_overwrite', T("Ερώτηση πριν αντικατασταθεί PDF που υπάρχει ήδη",
-                                    "Ask before replacing a PDF that already exists"), None),
+                                    "Ask before replacing a PDF that already exists"),
+             T("Αν υπάρχει ήδη αρχείο με το ίδιο όνομα, ρωτάει πριν το αντικαταστήσει.",
+               "If a file with the same name already exists, you are asked before it is replaced.")),
             ('keep_archive', T("Αρχειοθέτηση αντιγράφου κάθε δελτίου στον φάκελο δεδομένων",
                                "Archive a copy of every form in the data folder"),
              T("Επιτρέπει να ξανανοίξετε ή να εκτυπώσετε παλιούς μήνες από το Ιστορικό. Αν το κλείσετε, το "
@@ -8498,7 +9324,9 @@ class ElstatApp(TkBase):
                "Lets you reopen or print old months from History. If you turn it off, the "
                "form is rebuilt from the history data when you ask for it.")),
             ('show_reminder', T("Υπενθύμιση όταν λείπει το δελτίο του προηγούμενου μήνα",
-                                "Remind me when last month's form is missing"), None),
+                                "Remind me when last month's form is missing"),
+             T("Εμφανίζει υπενθύμιση στην καρτέλα του δελτίου όταν λείπει ο προηγούμενος μήνας.",
+               "Shows a reminder on the form tab when last month's form is missing.")),
             ('prefill_employees', T("Προσυμπλήρωση του «Σύνολο εργαζομένων» με την τελευταία τιμή",
                                     "Pre-fill “Total employees” with the last value"),
              T("Ελέγχετε πάντα τον αριθμό πριν δημιουργήσετε το δελτίο.",
@@ -8523,11 +9351,15 @@ class ElstatApp(TkBase):
                "saved (and the “already exists” question asked) only when you press “Save & continue”.")),
         ]
         for r, (key, text, note) in enumerate(behaviours):
-            ttk.Checkbutton(f4, text=text, variable=pv[key], style='Card.TCheckbutton',
-                            command=self._pref_changed).grid(row=r * 2, column=0, sticky="w",
-                                                             pady=(8 if r else 0, 0))
-            if note:
-                hint(f4, note, r * 2 + 1, padx=(24, 0), pady=(2, 0), margin=130)
+            rowf = ttk.Frame(f4, style='Card.TFrame')
+            rowf.grid(row=r * 2, column=0, sticky="w", pady=(8 if r else 0, 0))
+            ttk.Checkbutton(rowf, text=text, variable=pv[key], style='Card.TCheckbutton',
+                            command=self._pref_changed).pack(side="left")
+            if note:        # hover the (i) for a moment = the explanation; click it = the guide
+                info = tk.Label(rowf, text="\u24d8", bg=CARD, fg=ACCENT, font=(FONT, 12), cursor='hand2')
+                info.pack(side="left", padx=(8, 0))
+                HoverTip(info, note, T("Πατήστε για περισσότερα στον οδηγό", "Click for more in the guide"))
+                info.bind('<Button-1>', lambda e, k=key: self.open_help('settings', 'opt_' + k))
 
         # ---- 5. keyboard shortcuts
         self._build_shortcuts_card(body, 6, polish_settings_card, hint)
@@ -8541,24 +9373,73 @@ class ElstatApp(TkBase):
                                  "Does not delete history or hotel details."),
                   style='Hint.TLabel').pack(side="left", padx=10)
 
+    # ---- the "How the PDF is filled in" card: Automatic / Manual switch and its two drop-downs
+    def _sync_pdf_widgets(self):
+        """Makes the switch, the drop-downs and their one-line explanations show the saved choice."""
+        mode = self.prefs.get('pdf_mode', 'overlay')
+        if mode != 'manual':
+            self._last_auto = mode
+        auto = getattr(self, '_last_auto', 'overlay')
+        base = self.prefs.get('manual_base', 'overlay')
+        self.kind_seg.set('manual' if mode == 'manual' else 'auto')
+        self.auto_combo.set(self._auto_labels.get(auto, ''))
+        self.base_combo.set(self._base_labels.get(base, ''))
+        desc = self._auto_desc.get(auto, '')
+        if auto in ('smart', 'detect'):
+            desc += " " + T("Μπορεί περιστασιακά να κάνει λάθος - ρίξτε μια ματιά στο δελτίο πριν το υποβάλετε.",
+                            "It can occasionally get things wrong - give the form a quick look before submitting.")
+        self.method_desc_var.set(desc)
+        self.base_desc_var.set(self._base_desc.get(base, ''))
+        self.kind_desc_var.set(
+            T("Το πρόγραμμα βρίσκει μόνο του πού πηγαίνει κάθε τιμή στο έντυπο.",
+              "The program works out by itself where each value goes on the form.")
+            if mode != 'manual' else
+            T("Εσείς τοποθετείτε κάθε τιμή στον επεξεργαστή διάταξης (θέση, γραμματοσειρά, μέγεθος, χρώμα).",
+              "You place every value yourself in the layout editor (position, font, size, colour)."))
+
+    def _kind_changed(self, kind):
+        self.pv['pdf_mode'].set('manual' if kind == 'manual' else getattr(self, '_last_auto', 'overlay'))
+        self._pdf_mode_clicked()
+
+    def _auto_method_changed(self, _event=None):
+        chosen = self.auto_combo.get()
+        for value, label in self._auto_labels.items():
+            if label == chosen:
+                self.pv['pdf_mode'].set(value)
+                break
+        self._pdf_mode_clicked()
+
+    def _base_changed(self, _event=None):
+        chosen = self.base_combo.get()
+        for value, label in self._base_labels.items():
+            if label == chosen:
+                self.pv['manual_base'].set(value)
+                break
+        self._pref_changed()
+
     # ---- manual layout (settings)
     def _update_manual_panel(self):
         frame = getattr(self, 'manual_frame', None)
         if frame is None:
             return
         try:
-            if self.prefs.get('pdf_mode') == 'manual':
+            is_manual = self.prefs.get('pdf_mode') == 'manual'
+            self._sync_pdf_widgets()
+            if is_manual:
+                self.auto_frame.grid_remove()
                 frame.grid()
             else:
                 frame.grid_remove()
+                self.auto_frame.grid()
             if manual_layout_saved():
                 note = T("✓ Υπάρχει αποθηκευμένη δική σας διάταξη. Πατήστε «Άνοιγμα επεξεργαστή διάταξης» για αλλαγές.",
                          "✓ Your own layout is saved. Press “Open layout editor” to change it.")
             else:
-                note = T("⚠ Δεν έχετε αποθηκεύσει ακόμη δική σας διάταξη - χρησιμοποιούνται οι προεπιλεγμένες θέσεις. "
-                         "Ανοίξτε τον επεξεργαστή για να τις προσαρμόσετε.",
-                         "⚠ You have not saved your own layout yet - the default positions are used. "
-                         "Open the editor to adjust them.")
+                base = manual_base_name(self.prefs.get('manual_base', 'overlay'))
+                note = T(f"⚠ Δεν έχετε αποθηκεύσει ακόμη δική σας διάταξη - χρησιμοποιείται: {base}. "
+                         "Ανοίξτε τον επεξεργαστή για να την προσαρμόσετε.",
+                         f"⚠ You have not saved your own layout yet - using: {base}. "
+                         "Open the editor to adjust it.")
             self.manual_note_var.set(note)
             self.manual_note.configure(style='CardHint.TLabel' if manual_layout_saved() else 'CardWarn.TLabel')
         except tk.TclError:
@@ -8568,8 +9449,15 @@ class ElstatApp(TkBase):
         """Where the layout editor starts: with "Auto-populate manual layout template" on, from what the selected
         method would place (Legacy / Smart Shift / Smart Field Detection); off, from a blank canvas.
         A manual layout you saved yourself is always what the manual method starts from. -> (layout, note or None)"""
-        if mode == 'manual' and manual_layout_saved():
-            return load_manual_layout(), None
+        if mode == 'manual':
+            if manual_layout_saved():
+                return load_manual_layout(), None
+            self.config(cursor='watch')
+            self.update_idletasks()
+            try:
+                return manual_base_layout(self.prefs.get('manual_base', 'overlay'), template)
+            finally:
+                self.config(cursor='')
         if not self.prefs.get('auto_populate_layout', True):
             return blank_layout(), None
         if mode == 'detect' and result is not None and result.get('layout_used') is not None:
@@ -8714,36 +9602,6 @@ class ElstatApp(TkBase):
     def _pdf_mode_clicked(self):
         """A radio button of the PDF method was clicked."""
         previous, new = self.prefs.get('pdf_mode'), self.pv['pdf_mode'].get()
-        if new == 'smart' and not self.prefs.get('smart_ack'):
-            if not messagebox.askyesno(
-                    T("Πειραματική λειτουργία", "Experimental feature"),
-                    T("Η «Έξυπνη μετατόπιση» είναι πειραματική.\n\n"
-                      "Προσπαθεί να μετατοπίσει μόνη της τις τιμές αν το έντυπο της ΕΛΣΤΑΤ αλλάξει λίγο. "
-                      "Μπορεί να κάνει λάθος, γι' αυτό ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η παλιά "
-                      "μέθοδος παραμένει διαθέσιμη ανά πάσα στιγμή.\n\nΝα ενεργοποιηθεί;",
-                      "“Smart Shift” is experimental.\n\n"
-                      "It tries to shift the values by itself if the ELSTAT form changes "
-                      "slightly. It can get things wrong, so always check the form before submitting it. The Legacy "
-                      "method stays available at any time.\n\nTurn it on?"), default='no'):
-                self.pv['pdf_mode'].set(previous or 'overlay')
-                self._pref_changed()
-                return
-            self.prefs['smart_ack'] = True
-        if new == 'detect' and not self.prefs.get('detect_ack'):
-            if not messagebox.askyesno(
-                    T("Πειραματική λειτουργία", "Experimental feature"),
-                    T("Η «Έξυπνη ανίχνευση πεδίων» είναι πειραματική.\n\n"
-                      "Σαρώνει το άδειο PDF και βρίσκει μόνη της πού πηγαίνει κάθε τιμή. Μπορεί να κάνει λάθος, γι' αυτό "
-                      "ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η παλιά μέθοδος παραμένει διαθέσιμη ανά πάσα στιγμή.\n\n"
-                      "Να ενεργοποιηθεί;",
-                      "“Smart Field Detection” is experimental.\n\n"
-                      "It scans the blank PDF and works out by itself where each value goes. It can get things wrong, so "
-                      "always check the form before submitting it. The Legacy method stays available at any time.\n\n"
-                      "Turn it on?"), default='no'):
-                self.pv['pdf_mode'].set(previous or 'overlay')
-                self._pref_changed()
-                return
-            self.prefs['detect_ack'] = True
         if new != previous:
             # fine-tuning of the detected layout only lives while Smart Field Detection stays selected
             try:
@@ -8867,6 +9725,8 @@ class ElstatApp(TkBase):
         p['output_dir'] = pv['output_dir'].get().strip()
         p['excel_dir'] = pv['excel_dir'].get().strip()
         p['pdf_mode'] = pv['pdf_mode'].get()
+        p['manual_base'] = pv['manual_base'].get()
+        set_manual_base(p['manual_base'])
         pattern = pv['filename_pattern'].get().strip()
         if pattern_error(pattern) is None:
             p['filename_pattern'] = pattern
@@ -8883,7 +9743,7 @@ class ElstatApp(TkBase):
         except (tk.TclError, AttributeError):
             pass
 
-    def open_help(self, section=None):
+    def open_help(self, section=None, anchor=None):
         """Opens the guide - by default at the section that belongs to the tab you are on."""
         try:
             cur = self.notebook.select()
@@ -8896,7 +9756,7 @@ class ElstatApp(TkBase):
             self._help_prev = cur
         self.notebook.select(self.tab_help)
         if section:
-            self.guide.show(section)
+            self.guide.show(section, anchor)
         self.guide.refresh_back()
 
     def help_context(self):
@@ -8904,8 +9764,8 @@ class ElstatApp(TkBase):
         hist = self._hist or {}
         last = max(((y, m) for y, ms in hist.items() for m in ms), default=None)
         modes = {'overlay': T("Παλιά μέθοδος (σταθερές συντεταγμένες)", "Legacy (fixed coordinates)"),
-                 'smart': T("Έξυπνη μετατόπιση (πειραματική)", "Smart Shift (experimental)"),
-                 'detect': T("Έξυπνη ανίχνευση πεδίων (πειραματική)", "Smart Field Detection (experimental)"),
+                 'smart': T("Έξυπνη μετατόπιση", "Smart Shift"),
+                 'detect': T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection"),
                  'manual': T("Χειροκίνητη τοποθέτηση", "Set manually")}
         themes = {'light': T("Φωτεινή", "Light"), 'dark': T("Σκούρα", "Dark"), 'auto': T("Όπως το σύστημα", "Match system")}
         return dict(
@@ -9304,10 +10164,11 @@ class ElstatApp(TkBase):
     def _build_shortcuts_card(self, body, row, polish, hint):
         """One collapsible block per window; every row is "what it does" + the keys (click to change) + Reset."""
         if not hasattr(self, '_sc_open'):
-            self._sc_open = {'general'}
+            self._sc_open = set()                    # every category starts collapsed
         card = Card(body, None, T("Συντομεύσεις πληκτρολογίου", "Keyboard shortcuts"))
         card.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
         polish(card)
+        card.make_collapsible()
         f = card.body
         f.columnconfigure(0, weight=1)
         hint(f, T("Πατήστε πάνω σε μια συντόμευση και μετά τον νέο συνδυασμό πλήκτρων. Οι αλλαγές ισχύουν αμέσως, "
@@ -9517,9 +10378,14 @@ class ElstatApp(TkBase):
         try:
             self.update_idletasks()
             w, h = self.winfo_width(), self.winfo_height()
-            x = max((self.winfo_screenwidth() - w) // 2, 0)
-            y = max((self.winfo_screenheight() - h) // 3, 0)
-            self.geometry(f"+{x}+{y}")
+            if w <= 1 or h <= 1:            # not shown yet: use the size that was asked for
+                m = re.match(r'(\d+)x(\d+)', self.geometry())
+                w, h = (int(m.group(1)), int(m.group(2))) if m else (920, 840)
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = min(w, sw), min(h, sh - 60)
+            x = max((sw - w) // 2, 0)
+            y = max((sh - h) // 3, 0)
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except (tk.TclError, TypeError):
             pass
 
@@ -10039,7 +10905,7 @@ class ElstatApp(TkBase):
     def _build_history_tab(self):
         tab = self.tab_history
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(4, weight=1)
+        tab.rowconfigure(2, weight=1)
 
         top = ttk.Frame(tab)
         top.grid(row=0, column=0, sticky="ew", padx=6, pady=(12, 2))
@@ -10060,8 +10926,28 @@ class ElstatApp(TkBase):
         ttk.Button(top, text=T("Εξαγωγή Excel…", "Export Excel…"), command=self.hist_export).pack(side="right", padx=(0, 8))
         ttk.Button(top, text=T("Ανανέωση", "Refresh"), command=self.refresh_history).pack(side="right", padx=(0, 8))
 
-        info_row = ttk.Frame(tab)
-        info_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        # ---- view switch: Overview (guests & nights) | Economics
+        sw = ttk.Frame(tab)
+        sw.grid(row=1, column=0, sticky="w", padx=8, pady=(6, 8))
+        self.hist_view_seg = Segmented(sw, (('overview', T("Επισκόπηση", "Overview")),
+                                            ('economics', T("Οικονομικά", "Economics"))),
+                                       self._hist_view_changed, getattr(self, '_hist_view', 'overview'))
+        self.hist_view_seg.pack(side="left")
+
+        content = ttk.Frame(tab)
+        content.grid(row=2, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        ov = self.hist_overview = ttk.Frame(content)
+        ov.grid(row=0, column=0, sticky="nsew")
+        ov.columnconfigure(0, weight=1)
+        ov.rowconfigure(3, weight=1)
+        self.hist_econ = ttk.Frame(content)
+        self.hist_econ.grid(row=0, column=0, sticky="nsew")
+        self._build_economics(self.hist_econ)
+
+        info_row = ttk.Frame(ov)
+        info_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(0, 8))
         info_row.columnconfigure(0, weight=1)
         self.hist_info = tk.StringVar()
         self.hist_info_lbl = ttk.Label(info_row, textvariable=self.hist_info, style='Hint.TLabel', justify="left")
@@ -10072,8 +10958,8 @@ class ElstatApp(TkBase):
         ttk.Button(info_row, text=T("Ανάπτυξη", "Expand"), command=lambda: self._tree_expand(True)).grid(
             row=0, column=2, padx=(6, 0))
 
-        kp = ttk.Frame(tab)
-        kp.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 8))
+        kp = ttk.Frame(ov)
+        kp.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 8))
         for i in range(4):
             kp.columnconfigure(i, weight=1, uniform='kpi')
         self.kpi_clients = StatCard(kp, T("ΠΕΛΑΤΕΣ", "GUESTS"))
@@ -10085,11 +10971,11 @@ class ElstatApp(TkBase):
         self.kpi_share = StatCard(kp, T("ΑΛΛΟΔΑΠΟΙ", "FOREIGN GUESTS"))
         self.kpi_share.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
-        self.hist_chart = HistoryChart(tab, on_pick=self._chart_pick, height=170)
-        self.hist_chart.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 8))
+        self.hist_chart = HistoryChart(ov, on_pick=self._chart_pick, height=170)
+        self.hist_chart.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 8))
 
-        pane = ttk.PanedWindow(tab, orient="horizontal")
-        pane.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        pane = ttk.PanedWindow(ov, orient="horizontal")
+        pane.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 8))
 
         frame = ttk.Frame(pane)
         frame.columnconfigure(0, weight=1)
@@ -10142,8 +11028,8 @@ class ElstatApp(TkBase):
         self.top_tree.grid(row=2, column=0, sticky="nsew")
         self.top_tree.bind('<Double-1>', self._top_double)
 
-        act = ttk.Frame(tab)
-        act.grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 12))
+        act = self.hist_actions = ttk.Frame(tab)
+        act.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 12))
         self.month_btns, self.year_btns = [], []
         ttk.Label(act, text=T("Δελτίο μήνα:", "Monthly form:"), style='Hint.TLabel').pack(side="left", padx=(0, 6))
         for text, cmd, style in ((T("Άνοιγμα", "Open"), self.hist_open, 'TButton'),
@@ -10175,6 +11061,224 @@ class ElstatApp(TkBase):
         self.hist_tree.bind('<Button-3>', self._hist_popup)
         if sys.platform == 'darwin':
             self.hist_tree.bind('<Button-2>', self._hist_popup)
+        self._hist_view_changed(getattr(self, '_hist_view', 'overview'))
+
+    # ---- history: economics view
+    def _hist_view_changed(self, view):
+        self._hist_view = view
+        if view == 'economics':
+            self.hist_overview.grid_remove()
+            self.hist_econ.grid()
+            self.hist_actions.grid_remove()
+            self.update_economics()
+        else:
+            self.hist_econ.grid_remove()
+            self.hist_overview.grid()
+            self.hist_actions.grid()
+
+    def _build_economics(self, parent):
+        """Economics: everything here is computed from the Protel Excel (saved with each month's history)."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(3, weight=1)
+        self._econ_metric = getattr(self, '_econ_metric', 'revenue')
+
+        # four headline numbers
+        kp = ttk.Frame(parent)
+        kp.grid(row=0, column=0, sticky="ew", padx=6, pady=(0, 8))
+        for i in range(4):
+            kp.columnconfigure(i, weight=1, uniform='ekpi')
+        titles = (T("ΣΥΝΟΛΙΚΑ ΕΣΟΔΑ", "TOTAL REVENUE"), T("ΜΕΣΗ ΤΙΜΗ ΔΩΜΑΤΙΟΥ", "AVG ROOM RATE"),
+                  T("ΕΣΟΔΑ ΑΝΑ ΔΙΑΝΥΚΤΕΡΕΥΣΗ", "REVENUE PER NIGHT"), T("ΕΣΟΔΑ ΑΝΑ ΠΕΛΑΤΗ", "REVENUE PER GUEST"))
+        self.econ_cards = []
+        for i, title in enumerate(titles):
+            card = StatCard(kp, title)
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0 if i == 3 else 4))
+            self.econ_cards.append(card)
+
+        # one chart, with a switch for what it shows
+        box = ttk.Frame(parent)
+        box.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 8))
+        box.columnconfigure(0, weight=1)
+        head = ttk.Frame(box)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.econ_seg = Segmented(head, (('revenue', T("Έσοδα", "Revenue")),
+                                         ('adr', T("Τιμή δωματίου", "Room rate")),
+                                         ('pernight', T("Ανά διανυκτέρευση", "Per night"))),
+                                  self._econ_metric_changed, self._econ_metric)
+        self.econ_seg.pack(side="left")
+        self.econ_fill = ttk.Button(head, text=T("Προσθήκη εσόδων παλιών μηνών…", "Add revenue for older months…"),
+                                    command=self._econ_add_revenue)
+        self.econ_fill.pack(side="right")
+        self.econ_chart = HistoryChart(box, height=170)
+        self.econ_chart.grid(row=1, column=0, sticky="ew")
+
+        # plain-language summary + month table
+        self.econ_insight = tk.StringVar()
+        lbl = ttk.Label(parent, textvariable=self.econ_insight, style='Hint.TLabel', justify="left")
+        lbl.grid(row=2, column=0, sticky="w", padx=6, pady=(0, 6))
+        autowrap(lbl, parent, margin=60, minimum=200)
+        lower = ttk.Frame(parent)
+        lower.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 12))
+        lower.columnconfigure(0, weight=1)
+        lower.rowconfigure(0, weight=1)
+        cols = ('n', 'r', 'rm', 'fb', 'ex', 'pn', 'd')
+        self.econ_tree = ttk.Treeview(lower, columns=cols, show='tree headings', height=6)
+        self.econ_tree.heading('#0', text=T('Μήνας', 'Month'), anchor='w')
+        for key, text in (('n', T('Διανυκτ.', 'Nights')), ('r', T('Έσοδα', 'Revenue')),
+                          ('rm', T('Δωμάτια', 'Rooms')), ('fb', 'F&B'), ('ex', T('Έξτρα', 'Extras')),
+                          ('pn', T('€/διανυκτ.', '€/night')), ('d', T('έναντι προηγ. έτους', 'vs prev. year'))):
+            self.econ_tree.heading(key, text=text)
+            self.econ_tree.column(key, width=95, minwidth=70, anchor='e', stretch=(key == 'd'))
+        self.econ_tree.column('#0', width=130, minwidth=90, stretch=True)
+        self.econ_tree.tag_configure('total', font=(FONT, 10, 'bold'), background=HEAD_BG)
+        self.econ_tree.tag_configure('row', background=CARD)
+        esb = ttk.Scrollbar(lower, orient="vertical", command=self.econ_tree.yview)
+        self.econ_tree.configure(yscrollcommand=esb.set)
+        self.econ_tree.grid(row=0, column=0, sticky="nsew")
+        esb.grid(row=0, column=1, sticky="ns")
+
+    def _econ_add_revenue(self):
+        paths = filedialog.askopenfilenames(title=T("Επιλέξτε το «Nationalities Statistics» (ένα ή περισσότερους μήνες)",
+                                                    "Choose the “Nationalities Statistics” file(s) (one or more months)"),
+                                            filetypes=[("Excel Files", "*.xls *.xlsx")])
+        if not paths:
+            return
+        done, errors = [], []
+        for p in paths:
+            try:
+                y, m, tot = attach_revenue(p)
+                done.append(f"{month_name(m)} {y}: {fmt_int(tot)} €")
+            except Exception as e:
+                errors.append(f"{os.path.basename(p)}: {e}")
+        self.update_economics()
+        msg = "\n".join(done) if done else ""
+        if errors:
+            msg += ("\n\n" if msg else "") + "\n".join(errors)
+        (messagebox.showinfo if done and not errors else messagebox.showwarning)(T("Έσοδα", "Revenue"), msg)
+
+    def _econ_metric_changed(self, value):
+        self._econ_metric = value
+        self.update_economics()
+
+    def update_economics(self, *_):
+        if not hasattr(self, 'econ_tree'):
+            return
+        dash = "–"
+        try:
+            year = int(self.hist_year_var.get())
+        except ValueError:
+            year = None
+        self.econ_tree.delete(*self.econ_tree.get_children())
+        for c in self.econ_cards:
+            c.set(dash, "")
+        if year is None or year not in self._hist:
+            self.econ_chart.set_data([0] * 12, T("Δεν υπάρχουν δεδομένα ακόμη", "No data yet"))
+            self.econ_insight.set("")
+            return
+        hist, real = self._hist, load_revenue()
+
+        def nights_of(y, m):
+            return sum(r[2] for r in hist.get(y, {}).get(m, []))
+
+        def guests_of(y, m):
+            return sum(r[1] for r in hist.get(y, {}).get(m, []))
+
+        def rev(y, m):
+            r = real.get((y, m))
+            return r if r and r['total'] > 0 else None
+
+        months = [m for m in sorted(hist[year])]
+        with_rev = [m for m in months if rev(year, m)]
+        missing = [m for m in months if not rev(year, m)]
+        if not with_rev:
+            self.econ_chart.set_data([0] * 12, T("Δεν υπάρχουν έσοδα ακόμη", "No revenue yet"))
+            self.econ_insight.set(T("Τα έσοδα αποθηκεύονται αυτόματα όταν δημιουργείτε τη φόρμα. Για παλιούς μήνες "
+                                    "πατήστε «Προσθήκη εσόδων παλιών μηνών…».",
+                                    "Revenue is saved automatically whenever you make the form. For older months "
+                                    "press “Add revenue for older months…”."))
+            return
+
+        tot = sum(rev(year, m)['total'] for m in with_rev)
+        rooms = sum(rev(year, m)['rooms'] for m in with_rev)
+        fb = sum(rev(year, m)['fb'] for m in with_rev)
+        extras = sum(rev(year, m)['extras'] for m in with_rev)
+        roomn = sum(rev(year, m)['roomn'] for m in with_rev)
+        nights = sum(nights_of(year, m) for m in with_rev)
+        guests = sum(guests_of(year, m) for m in with_rev)
+
+        # headline cards
+        sub, col = T(f"{len(with_rev)} μήνες", f"{len(with_rev)} months"), None
+        both = [m for m in with_rev if rev(year - 1, m)]
+        if both:
+            a = sum(rev(year, m)['total'] for m in both)
+            b = sum(rev(year - 1, m)['total'] for m in both)
+            if b:
+                pct = (a - b) / b * 100
+                sub = f"{'▲' if pct > 0.05 else '▼' if pct < -0.05 else '■'} {fmt_dec(pct, signed=True)}% " + \
+                      T(f"έναντι {year - 1}", f"vs {year - 1}")
+                col = GOOD if pct > 0.05 else BAD if pct < -0.05 else None
+        self.econ_cards[0].set(f"{fmt_int(tot)} €", sub, col)
+        self.econ_cards[1].set(f"{fmt_dec(rooms / roomn)} €" if roomn else dash,
+                               T("έσοδα δωματίων ÷ διανυκτ. δωματίων", "room revenue ÷ room nights"))
+        self.econ_cards[2].set(f"{fmt_dec(tot / nights)} €" if nights else dash,
+                               T("συνολικά έσοδα ÷ διανυκτ.", "total revenue ÷ nights"))
+        self.econ_cards[3].set(f"{fmt_dec(tot / guests)} €" if guests else dash,
+                               T("συνολικά έσοδα ÷ πελάτες", "total revenue ÷ guests"))
+
+        # chart
+        metric = getattr(self, '_econ_metric', 'revenue')
+
+        def value(y, m):
+            r = rev(y, m)
+            if not r:
+                return 0
+            if metric == 'revenue':
+                return r['total']
+            if metric == 'adr':
+                return r['rooms'] / r['roomn'] if r['roomn'] else 0
+            n = nights_of(y, m)
+            return r['total'] / n if n else 0
+        names = {'revenue': T("Έσοδα (€)", "Revenue (€)"), 'adr': T("Μέση τιμή δωματίου (€)", "Average room rate (€)"),
+                 'pernight': T("Έσοδα ανά διανυκτέρευση (€)", "Revenue per night (€)")}
+        prev = [value(year - 1, m) for m in range(1, 13)] if any(rev(year - 1, m) for m in range(1, 13)) else None
+        self.econ_chart.set_data([value(year, m) for m in range(1, 13)], f"{names[metric]} · {year}",
+                                 color={'revenue': ACCENT, 'adr': TEAL}.get(metric, NAVY),
+                                 prev=prev, prev_label=str(year - 1))
+
+        # table
+        for m in months:
+            r = rev(year, m)
+            n = nights_of(year, m)
+            if not r:
+                self.econ_tree.insert('', 'end', text=month_name(m), tags=('row',),
+                                      values=(fmt_int(n), dash, dash, dash, dash, dash, ""))
+                continue
+            old = rev(year - 1, m)
+            delta = f"{fmt_dec((r['total'] - old['total']) / old['total'] * 100, signed=True)}%" if old else ""
+            self.econ_tree.insert('', 'end', text=month_name(m), tags=('row',),
+                                  values=(fmt_int(n), f"{fmt_int(r['total'])} €", f"{fmt_int(r['rooms'])} €",
+                                          f"{fmt_int(r['fb'])} €", f"{fmt_int(r['extras'])} €",
+                                          f"{fmt_dec(r['total'] / n)} €" if n else dash, delta))
+        self.econ_tree.insert('', 'end', text=T(f"ΣΥΝΟΛΟ {year}", f"TOTAL {year}"), tags=('total',),
+                              values=(fmt_int(nights), f"{fmt_int(tot)} €", f"{fmt_int(rooms)} €", f"{fmt_int(fb)} €",
+                                      f"{fmt_int(extras)} €", f"{fmt_dec(tot / nights)} €" if nights else dash, ""))
+
+        # short summary: best month, revenue mix, best-earning markets
+        parts = []
+        best = max(with_rev, key=lambda m: rev(year, m)['total'])
+        parts.append(T(f"Κορυφαίος μήνας: {month_name(best)} ({fmt_dec(rev(year, best)['total'] / tot * 100)}% των εσόδων)",
+                       f"Best month: {month_name(best)} ({fmt_dec(rev(year, best)['total'] / tot * 100)}% of revenue)"))
+        if tot:
+            parts.append(T(f"Δωμάτια {fmt_dec(rooms / tot * 100)}% · F&B {fmt_dec(fb / tot * 100)}% · έξτρα {fmt_dec(extras / tot * 100)}%",
+                           f"Rooms {fmt_dec(rooms / tot * 100)}% · F&B {fmt_dec(fb / tot * 100)}% · extras {fmt_dec(extras / tot * 100)}%"))
+        bc = sorted(load_revenue_by_country(year).items(), key=lambda kv: -kv[1])[:3]
+        if bc and tot:
+            parts.append(T("Κορυφαίες αγορές σε έσοδα: ", "Top markets by revenue: ") +
+                         ", ".join(f"{c} {fmt_dec(v / tot * 100)}%" for c, v in bc))
+        if missing:
+            parts.append(T(f"Χωρίς έσοδα: {', '.join(month_name(m) for m in missing)}",
+                           f"No revenue saved for: {', '.join(month_name(m) for m in missing)}"))
+        self.econ_insight.set("   ·   ".join(parts))
 
     # ---- history: new helpers
     def _all_label(self):
@@ -10377,6 +11481,7 @@ class ElstatApp(TkBase):
 
     def update_dashboard(self, *_):
         """Cards, bar chart and top countries for the chosen year (and country filter)."""
+        self.update_economics()
         try:
             year = int(self.hist_year_var.get())
         except ValueError:
@@ -10868,5 +11973,8 @@ if __name__ == "__main__":
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
+    sys.excepthook = lambda e, v, t: _handle_error(e, v, t)
+    if hasattr(threading, 'excepthook'):
+        threading.excepthook = lambda a: _handle_error(a.exc_type, a.exc_value, a.exc_traceback)
     app = ElstatApp()
     app.mainloop()
