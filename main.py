@@ -1396,6 +1396,8 @@ def validate_inputs(settings, monthly, excel, template, out):
     errors = validate_hotel(settings) + validate_month(monthly)
     if not excel or not os.path.isfile(excel):
         errors.append(T("Επιλέξτε υπαρκτό αρχείο Excel ή CSV.", "Choose an existing Excel or CSV file."))
+    else:
+        errors.extend(protel_problems(excel))
     if not template or not os.path.isfile(template):
         errors.append(T("Το άδειο PDF (template) δεν βρέθηκε.", "The blank PDF (template) was not found."))
     if not out:
@@ -1532,6 +1534,111 @@ def read_nationality_rows(excel_path):
     return rows, excel_total
 
 
+def verify_protel_file(path):
+    """Checks that a file really is a Protel 'Nationalities Statistics' export and not just any Excel/CSV.
+    Returns a list of readable problems (empty list = the file is genuine).
+    Checks: Protel header fingerprint (protel / report title / report id / Printdate), the expected column headers,
+    the report period, Protel's own 'Totals' row, and that the country rows add up to that Totals row
+    (so an edited or hand-made table is caught)."""
+    problems = []
+    try:
+        df = read_sheet(path)
+        df = df.map(fix_greek) if hasattr(df, 'map') else df.applymap(fix_greek)
+    except Exception:
+        return [T("Το αρχείο δεν μπορεί να διαβαστεί ως Excel/CSV.", "The file cannot be read as Excel/CSV.")]
+    if df.empty:
+        return [T("Το αρχείο είναι κενό.", "The file is empty.")]
+
+    head = []                                     # text cells of the Protel header block (top of the file)
+    if is_csv_path(path):                         # a CSV's real header is read raw (read_sheet rebuilds the header rows)
+        try:
+            with open(path, 'rb') as f:
+                text = _decode_csv_bytes(f.read(400000))
+            raw = list(csv.reader(io.StringIO(text, newline=''), delimiter=_csv_delimiter(text)))[:30]
+        except Exception:
+            raw = []
+        cells = [v for row in raw for v in row]
+    else:
+        cells = [df.iat[r, c] for r in range(min(len(df), 30)) for c in range(df.shape[1])]
+    for v in cells:
+        v = fix_greek(v)
+        if isinstance(v, str) and v.strip():
+            head.append(''.join(v.lower().split()))
+    joined = ' '.join(head)
+
+    if 'protel' not in head:
+        problems.append(T("Δεν βρέθηκε η υπογραφή «protel» στην κεφαλίδα.", "The “protel” signature was not found in the header."))
+    if not any(h.startswith('nationalitystatistik') for h in head):
+        problems.append(T("Δεν βρέθηκε ο κωδικός αναφοράς «nationalitystatistik» του Protel.",
+                          "The Protel report id “nationalitystatistik” was not found."))
+    if 'nationalitiesstatistics' not in joined:
+        problems.append(T("Ο τίτλος αναφοράς δεν είναι «Nationalities Statistics».",
+                          "The report title is not “Nationalities Statistics”."))
+    if not any(h.startswith('printdate') for h in head):
+        problems.append(T("Λείπει η γραμμή «Printdate» που τυπώνει το Protel.", "The “Printdate” line that Protel prints is missing."))
+    missing_cols = [w for w in ('arrivals', 'nights', 'logis', 'f&b', 'extras', 'revenue') if w not in joined]
+    if missing_cols:
+        problems.append(T("Λείπουν οι στήλες του Protel: ", "Protel columns missing: ") + ', '.join(missing_cols))
+    if not read_excel_period(path):
+        problems.append(T("Δεν βρέθηκε η περίοδος (Από / Έως Ημερομηνία) στην κεφαλίδα.",
+                          "The report period (From / To date) was not found in the header."))
+    if problems:                                   # no point checking the numbers of a file that is not a Protel report
+        return problems
+
+    try:
+        rows, total = read_nationality_rows(path)
+    except Exception:
+        return [T("Τα δεδομένα χωρών δεν μπορούν να διαβαστούν.", "The country data cannot be read.")]
+    if not rows:
+        problems.append(T("Δεν βρέθηκαν γραμμές χωρών.", "No country rows were found."))
+    if total is None:
+        problems.append(T("Λείπει η γραμμή «Σύνολα» του Protel.", "Protel's “Totals” row is missing."))
+    elif rows and (sum(r[1] for r in rows), sum(r[2] for r in rows)) != tuple(total):
+        problems.append(T(f"Τα αθροίσματα δεν ταιριάζουν με τη γραμμή «Σύνολα» (χώρες: {sum(r[1] for r in rows)}/{sum(r[2] for r in rows)}, "
+                          f"σύνολα: {total[0]}/{total[1]}). Το αρχείο μοιάζει να έχει τροποποιηθεί.",
+                          f"The country rows do not add up to the “Totals” row (countries: {sum(r[1] for r in rows)}/{sum(r[2] for r in rows)}, "
+                          f"totals: {total[0]}/{total[1]}). The file looks edited."))
+    return problems
+
+
+PROTEL_OVERRIDES = set()      # files the user chose to use even though the Protel check failed
+
+
+def _override_key(path):
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except Exception:
+        return str(path)
+
+
+def protel_problems(path):
+    """Like verify_protel_file, but empty for a file the user already chose to use anyway."""
+    if _override_key(path) in PROTEL_OVERRIDES:
+        return []
+    return verify_protel_file(path)
+
+
+def ask_use_anyway(problems, parent=None):
+    """Asks whether to use a file that failed the Protel check. Remembers a 'yes' for that file (done by the caller)."""
+    return messagebox.askyesno(
+        T("Μη αναγνωρισμένο αρχείο", "File not recognised"),
+        T("Το αρχείο δεν φαίνεται να είναι αναφορά «Nationalities Statistics» από το Protel:",
+          "This file does not look like a “Nationalities Statistics” report from Protel:")
+        + "\n\n" + "\n".join("• " + x for x in problems)
+        + "\n\n" + T("Να χρησιμοποιηθεί παρ' όλα αυτά;", "Use it anyway?"),
+        icon='warning', default='no', parent=parent)
+
+
+def protel_error_text(path):
+    """One message for dialogs, or '' when the file is genuine."""
+    p = verify_protel_file(path)
+    if not p:
+        return ''
+    return (T("Το αρχείο δεν φαίνεται να είναι αναφορά «Nationalities Statistics» από το Protel:",
+              "This file does not look like a “Nationalities Statistics” report from Protel:")
+            + '\n' + '\n'.join('• ' + x for x in p))
+
+
 def read_revenue_rows(excel_path, strict=False):
     """Revenue columns of the Protel 'Nationalities Statistics' sheet:
     {country_as_in_excel: (rooms, f&b, extras, total, room_nights)}.  Columns are found by their header (Logis / F&B / Extras /
@@ -1604,6 +1711,9 @@ def read_revenue_rows(excel_path, strict=False):
 def attach_revenue(excel_path):
     """Adds the revenue of a Protel 'Nationalities Statistics' file to a month that is already in the history.
     Returns (year, month, total_revenue) or raises ValueError with a readable reason."""
+    bad = protel_problems(excel_path)
+    if bad:
+        raise ValueError(T("Δεν είναι αρχείο Protel: ", "Not a Protel file: ") + '; '.join(bad))
     info = period_as_month(read_excel_period(excel_path))
     if not info:
         raise ValueError(T("Το αρχείο δεν καλύπτει έναν ακριβώς ημερολογιακό μήνα.",
@@ -11956,6 +12066,9 @@ class ElstatApp(TkBase):
         token = self._load_token
 
         def work():
+            bad = protel_problems(fp)
+            if bad:
+                return None, None, bad
             try:
                 rows = read_nationality_rows(fp)[0]
             except Exception:
@@ -11964,12 +12077,26 @@ class ElstatApp(TkBase):
                 info = period_as_month(read_excel_period(fp))
             except Exception:
                 info = None
-            return rows, info
+            return rows, info, []
 
         def done(res):
             if token != self._load_token:
                 return
-            rows, info = res
+            rows, info, bad = res
+            if bad:                                  # not a recognised Protel export: let the user decide
+                if ask_use_anyway(bad):
+                    PROTEL_OVERRIDES.add(_override_key(fp))
+                    self._load_token += 1
+                    self.load_period(fp)             # read it again, this time without the check
+                    return
+                self.excel_var.set('')
+                self._loaded_excel = ''
+                self.preview_frame.grid_remove()
+                self._show_period(
+                    lambda: T("✗ Το αρχείο δεν είναι αναφορά Protel και δεν χρησιμοποιήθηκε.",
+                              "✗ This is not a Protel report and was not used."),
+                    'CardBad.TLabel')
+                return
             self._apply_preview(rows)
             if info:
                 year, month, last = info
@@ -12549,6 +12676,9 @@ class ElstatApp(TkBase):
         done, errors = [], []
         for p in paths:
             try:
+                bad = protel_problems(p)
+                if bad and ask_use_anyway([os.path.basename(p)] + bad):
+                    PROTEL_OVERRIDES.add(_override_key(p))
                 y, m, tot = attach_revenue(p)
                 done.append(f"{month_name(m)} {y}: {fmt_int(tot)} €")
             except Exception as e:
