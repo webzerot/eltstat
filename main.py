@@ -1,6 +1,7 @@
 import pandas as pd
 import pypdf
 import io
+import csv
 import os
 import warnings
 import datetime
@@ -11,6 +12,7 @@ import subprocess
 import shutil
 import math
 import sys
+import difflib
 import json
 import hashlib
 import base64
@@ -524,7 +526,7 @@ SHORTCUT_GROUPS = [
 #   flags: 'hold'  = one key that is held down (pressed / released), 'mod' = needs Ctrl or Alt (a plain key would
 #          block typing), 'shift' = Shift + the key does the same with a bigger step
 SHORTCUTS = [
-    ('open_excel', 'general', ("Επιλογή αρχείου Excel", "Choose the Excel file"), "Ctrl+O", ''),
+    ('open_excel', 'general', ("Επιλογή αρχείου Excel ή CSV", "Choose the Excel or CSV file"), "Ctrl+O", ''),
     ('generate', 'general', ("Δημιουργία PDF", "Create PDF"), "Ctrl+Enter", ''),
     ('generate_print', 'general', ("Δημιουργία & Εκτύπωση", "Create & Print"), "Ctrl+P", ''),
     ('help', 'general', ("Άνοιγμα του οδηγού", "Open the guide"), "F1", ''),
@@ -1003,11 +1005,264 @@ def _to_date(v):
                 pass
     return None
 
+# ---------------------------------------------------------------- Protel file: Excel (.xls/.xlsx) or CSV
+SHEET_EXTS = ('.xls', '.xlsx', '.csv')
+_DATE_RE = re.compile(r'^\s*(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\s*$')
+# where the readers expect each figure (the same positions the Excel sheet has)
+_COL_PAX, _COL_ROOMN, _COL_NIGHTS, _COL_LOGIS, _COL_FB, _COL_EXTRAS, _COL_TOTAL = 7, 8, 9, 10, 11, 12, 13
+_SHEET_WIDTH = 19
+
+
+def is_csv_path(path):
+    return str(path).lower().endswith('.csv')
+
+
+def _decode_csv_bytes(raw):
+    """CSV text from bytes: UTF-8 (with/without BOM) or UTF-16 when marked, otherwise Windows-1253 (what Protel writes)."""
+    if raw.startswith(b'\xef\xbb\xbf'):
+        return raw[3:].decode('utf-8', errors='replace')
+    if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return raw.decode('utf-16', errors='replace')
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw.decode('cp1253', errors='replace')
+
+
+def _csv_delimiter(text):
+    """Comma, semicolon or tab - whichever splits the first lines into the most columns."""
+    sample = text[:200000]
+    best, best_n = ',', 0
+    for d in (',', ';', '\t'):
+        n = 0
+        try:
+            for i, r in enumerate(csv.reader(io.StringIO(sample, newline=''), delimiter=d)):
+                n = max(n, len(r))
+                if i >= 40:
+                    break
+        except csv.Error:
+            continue
+        if n > best_n:
+            best, best_n = d, n
+    return best
+
+
+def _csv_number(v):
+    """'20.341,00' / '813,00' / '256' / '1,234.50' / '-12.19' / '100%' -> number (whole numbers stay int); None if not a number."""
+    if isinstance(v, (int, float)):
+        return v
+    t = str(v).strip().replace('\xa0', '').replace(' ', '')
+    if t.endswith('%'):
+        t = t[:-1]
+    if not t or not re.fullmatch(r'[-+]?[\d.,]+', t) or not any(ch.isdigit() for ch in t):
+        return None
+    neg = t.startswith('-')
+    t = t.lstrip('+-')
+    if ',' in t and '.' in t:                         # the separator that comes last is the decimal one
+        dec = ',' if t.rfind(',') > t.rfind('.') else '.'
+        t = t.replace('.' if dec == ',' else ',', '').replace(dec, '.')
+    elif ',' in t:
+        t = t.replace(',', '.') if t.count(',') == 1 else t.replace(',', '')
+    elif '.' in t and re.fullmatch(r'\d{1,3}(\.\d{3})+', t):
+        t = t.replace('.', '')                        # 1.113 -> 1113 (Greek thousands dot)
+    try:
+        x = float(t)
+    except ValueError:
+        return None
+    if neg:
+        x = -x
+    return int(x) if '.' not in t and x == int(x) else x
+
+
+def _csv_parse_date(text, month_first=False):
+    m = _DATE_RE.match(str(text))
+    if not m:
+        return None
+    a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    d, mo = (b, a) if month_first else (a, b)
+    try:
+        return datetime.date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _csv_resolve_period(s_from, s_to):
+    """The two header dates as dates. Day/month (Greek) first; month/day only if that gives a sensible period instead."""
+    cands = []
+    for month_first in (False, True):
+        a, b = _csv_parse_date(s_from, month_first), _csv_parse_date(s_to, month_first)
+        if a and b and a <= b:
+            cands.append((a, b))
+    for c in cands:
+        if period_as_month(c):
+            return c
+    return cands[0] if cands else None
+
+
+def _csv_find_period(rows, limit=15):
+    """Locates the 'Από/Έως Ημερομηνία' labels in the first rows. -> ({'from': (r, c), 'to': (r, c)}, (date_from, date_to) or None)."""
+    pos = {}
+    for r in range(min(len(rows), limit)):
+        for c, cell in enumerate(rows[r]):
+            label = norm(fix_greek(cell)) if isinstance(cell, str) else ''
+            for key, tag in (('ΑΠΟΗΜΕΡΟΜΗΝΙΑ', 'from'), ('ΕΩΣΗΜΕΡΟΜΗΝΙΑ', 'to')):
+                if label.startswith(key) and tag not in pos:
+                    for c2 in range(c + 1, len(rows[r])):
+                        if _DATE_RE.match(str(rows[r][c2])):
+                            pos[tag] = (r, c2)
+                            break
+    period = None
+    if 'from' in pos and 'to' in pos:
+        period = _csv_resolve_period(rows[pos['from'][0]][pos['from'][1]], rows[pos['to'][0]][pos['to'][1]])
+    return pos, period
+
+
+def _csv_modif_index(row):
+    for j, c in enumerate(row):
+        if re.sub(r'\s+', '', str(c)).lower().startswith('%modif'):
+            return j
+    return None
+
+
+def _flat_columns(headers):
+    """Index (0-15) of each figure among a flattened record's 16 values, read from the headers; usual positions if unclear."""
+    default = {'pax': 4, 'roomn': 5, 'nights': 6, 'logis': 7, 'fb': 8, 'extras': 9, 'total': 10}
+    pos = {}
+    for i, h in enumerate(headers):
+        t = re.sub(r'\s+', '', str(h)).lower()
+        if t.startswith('pr.'):
+            continue
+        if 'pax' in t and 'arriv' in t:
+            pos.setdefault('pax', i)
+        elif 'room' in t and 'night' in t:
+            pos.setdefault('roomn', i)
+        elif 'adult' in t and 'night' in t:
+            pos.setdefault('nights', i)
+        elif t.startswith('logis'):
+            pos.setdefault('logis', i)
+        elif t.startswith('f&b'):
+            pos.setdefault('fb', i)
+        elif t.startswith('extras'):
+            pos.setdefault('extras', i)
+        elif t.startswith('total'):
+            pos.setdefault('total', i)
+    if len(pos) == 7 and len(set(pos.values())) == 7:
+        return pos
+    return default
+
+
+def _sheet_row(name, values, cols):
+    """One Excel-shaped row: name in column 0, the 16 values from column 3, key figures at their fixed Excel columns."""
+    row = [None] * _SHEET_WIDTH
+    row[0] = name
+    conv = []
+    for i, v in enumerate(values[:16]):
+        n = _csv_number(v)
+        conv.append(n)
+        row[3 + i] = n if n is not None else (str(v).strip() or None)
+    for key, col in (('pax', _COL_PAX), ('roomn', _COL_ROOMN), ('nights', _COL_NIGHTS), ('logis', _COL_LOGIS),
+                     ('fb', _COL_FB), ('extras', _COL_EXTRAS), ('total', _COL_TOTAL)):
+        i = cols[key]
+        row[col] = conv[i] if i < len(conv) else None
+    return row
+
+
+def _csv_flat_grid(rows):
+    """Protel's 'Nationalities Statistics Comparison' CSV repeats the header and totals on every line (one line per country).
+    Turns it into the same grid as the Excel sheet. None when the file is not in that shape."""
+    recs = []
+    for r in rows:
+        j = _csv_modif_index(r)
+        if j is not None and len(r) >= j + 18:
+            recs.append((r, j))
+    if not recs:
+        return None
+    grid, total_row = [], None
+    pos, period = _csv_find_period([recs[0][0]], limit=1)
+    head = [[None] * _SHEET_WIDTH for _ in range(3)]
+    head[0][0], head[1][0] = 'Από Ημερομηνία', 'Έως Ημερομηνία'
+    if period:
+        head[0][1], head[1][1] = period
+    for col, label in ((_COL_PAX, 'Pax'), (_COL_ROOMN, 'Room Nights'), (_COL_NIGHTS, 'Adult Nights'),
+                       (_COL_LOGIS, 'Logis'), (_COL_FB, 'F&B'), (_COL_EXTRAS, 'Extras'), (_COL_TOTAL, 'Total')):
+        head[2][col] = label
+    for r, j in recs:
+        cols = _flat_columns(r[max(0, j - 15):j + 1] if j >= 15 else [])
+        name = str(r[j + 1]).strip()
+        if name:
+            grid.append(_sheet_row(name, r[j + 2:j + 18], cols))
+        k = j + 18                                    # "Σύνολα :" block that follows the country
+        if total_row is None and k < len(r) and norm(fix_greek(r[k])).startswith(('ΣΥΝΟΛ', 'ΤΟΤΑΛ')):
+            total_row = _sheet_row(str(r[k]).strip(), r[k + 1:k + 17], cols)
+    if total_row:
+        grid.append(total_row)
+    return head + grid
+
+
+def _csv_plain_grid(rows):
+    """An ordinary CSV copy of the Excel sheet: same columns, cells converted the way Excel would store them."""
+    pos, period = _csv_find_period(rows)
+    out = []
+    for r, row in enumerate(rows):
+        cells = []
+        for c, cell in enumerate(row):
+            t = str(cell).strip()
+            if t == '':
+                cells.append(None)
+            elif period and (r, c) == pos.get('from'):
+                cells.append(period[0])
+            elif period and (r, c) == pos.get('to'):
+                cells.append(period[1])
+            elif c == 0:
+                cells.append(t)
+            else:
+                n = _csv_number(t)
+                cells.append(n if n is not None else t)
+        out.append(cells)
+    return out
+
+
+def _read_csv_grid(path):
+    with open(path, 'rb') as f:
+        text = _decode_csv_bytes(f.read())
+    delim = _csv_delimiter(text)
+    rows = [r for r in csv.reader(io.StringIO(text, newline=''), delimiter=delim)]
+    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    if not rows:
+        raise ValueError(T("Το αρχείο CSV είναι κενό.", "The CSV file is empty."))
+    grid = _csv_flat_grid(rows)
+    if grid is None:
+        grid = _csv_plain_grid(rows)
+    width = max(len(r) for r in grid)
+    width = max(width, _SHEET_WIDTH)
+    return pd.DataFrame([r + [None] * (width - len(r)) for r in grid], dtype=object)
+
+
+def read_sheet(path, nrows=None):
+    """The Protel sheet as a header-less table - the same shape pd.read_excel(header=None) gives.
+    A .csv file is turned into that same table, so the preview, the PDF, the history and the revenue treat CSV and Excel alike."""
+    if is_csv_path(path):
+        df = _read_csv_grid(path)
+        return df.iloc[:nrows] if nrows else df
+    return pd.read_excel(path, header=None, nrows=nrows)
+
+
+def _csv_is_protel(path):
+    """True for a CSV that looks like the Protel nationality report (so unrelated CSVs in the folder are ignored)."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(400000)
+    except OSError:
+        return False
+    t = _decode_csv_bytes(head).lower()
+    return 'nationalit' in t or ('arrivals' in t and 'revenue' in t)
+
+
 def read_excel_period(excel_path):
     """Reads the report period (Από / Έως Ημερομηνία) printed in the Protel header.
     Returns (date_from, date_to) or None if it cannot be found."""
     try:
-        df = pd.read_excel(excel_path, header=None, nrows=15)
+        df = read_sheet(excel_path, nrows=15)
     except Exception:
         return None
     # the label cells are Greek text saved as cp1253 -> repair like in the main reader
@@ -1140,7 +1395,7 @@ def validate_month(monthly):
 def validate_inputs(settings, monthly, excel, template, out):
     errors = validate_hotel(settings) + validate_month(monthly)
     if not excel or not os.path.isfile(excel):
-        errors.append(T("Επιλέξτε υπαρκτό αρχείο Excel.", "Choose an existing Excel file."))
+        errors.append(T("Επιλέξτε υπαρκτό αρχείο Excel ή CSV.", "Choose an existing Excel or CSV file."))
     if not template or not os.path.isfile(template):
         errors.append(T("Το άδειο PDF (template) δεν βρέθηκε.", "The blank PDF (template) was not found."))
     if not out:
@@ -1252,7 +1507,7 @@ def read_nationality_rows(excel_path):
     """Reads the Protel 'Nationalities Statistics' sheet.
     Returns ([(country_as_in_excel, clients, nights), ...], excel_grand_total_or_None).
     Used both for the live preview and for building the PDF, so they always agree."""
-    df = pd.read_excel(excel_path, header=None)
+    df = read_sheet(excel_path)
     df = df.map(fix_greek) if hasattr(df, 'map') else df.applymap(fix_greek)
     rows, excel_total = [], None
     for idx in range(len(df)):
@@ -1282,7 +1537,7 @@ def read_revenue_rows(excel_path, strict=False):
     {country_as_in_excel: (rooms, f&b, extras, total, room_nights)}.  Columns are found by their header (Logis / F&B / Extras /
     Total), falling back to the usual positions.  Empty dict when nothing is found (strict=True raises instead)."""
     try:
-        df = pd.read_excel(excel_path, header=None)
+        df = read_sheet(excel_path)
         df = df.map(fix_greek) if hasattr(df, 'map') else df.applymap(fix_greek)
         cols = {}
         for r in range(min(len(df), 25)):
@@ -1407,6 +1662,34 @@ def load_revenue_by_country(year):
     return out
 
 
+def load_revenue_detail(year):
+    """{country: {'total','rooms','fb','extras','roomn'}} for one year, from the revenue saved with the history."""
+    out = {}
+    if not os.path.exists(HISTORY_CSV):
+        return out
+    try:
+        df = pd.read_csv(HISTORY_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
+    except Exception:
+        return out
+    if 'Esoda' not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        try:
+            if int(r['Etos']) != year or str(r['Esoda']).strip() == '':
+                continue
+            d = out.setdefault(pretty_country(str(r['Chwra'])),
+                               {'total': 0.0, 'rooms': 0.0, 'fb': 0.0, 'extras': 0.0, 'roomn': 0.0})
+            d['total'] += float(r['Esoda'])
+            for k, col in (('rooms', 'Logis'), ('fb', 'FnB'), ('extras', 'Extras'), ('roomn', 'Domatia')):
+                try:
+                    d[k] += float(r.get(col, '') or 0)
+                except ValueError:
+                    pass
+        except (ValueError, KeyError):
+            continue
+    return out
+
+
 def load_revenue():
     """{(year, month): {'rooms','fb','extras','total'}} summed from the revenue columns of elstat_history.csv.
     Months saved before revenue was tracked are simply missing."""
@@ -1457,10 +1740,15 @@ def load_history():
 
 
 def find_recent_excel(folder):
-    """Newest .xls/.xlsx file in `folder` (ignores Excel's ~$ lock files), or None."""
+    """Newest .xls/.xlsx (or Protel .csv) file in `folder` (ignores Excel's ~$ lock files), or None."""
     try:
-        files = [os.path.join(folder, f) for f in os.listdir(folder)
-                 if f.lower().endswith(('.xls', '.xlsx')) and not f.startswith('~$')]
+        files = []
+        for f in os.listdir(folder):
+            if f.startswith('~$'):
+                continue
+            p, low = os.path.join(folder, f), f.lower()
+            if low.endswith(('.xls', '.xlsx')) or (low.endswith('.csv') and os.path.isfile(p) and _csv_is_protel(p)):
+                files.append(p)
     except OSError:
         return None
     return max(files, key=os.path.getmtime) if files else None
@@ -1815,6 +2103,15 @@ def load_layout_reference():
     return None
 
 
+def delete_layout_reference():
+    """Removes the saved reference layout (Smart Shift then asks for a new one). -> True when there was one."""
+    try:
+        os.remove(layout_file())
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def save_layout_reference(template_pdf):
     snap = read_template_snapshot(template_pdf)
     snap['saved'] = datetime.datetime.now().isoformat(timespec='seconds')
@@ -1822,6 +2119,22 @@ def save_layout_reference(template_pdf):
     ensure_data_dir()
     _write_json(layout_file(), snap, ensure_ascii=False)
     return snap
+
+
+def _prune_pairs(pairs, k=6, tol=15.0):
+    """Drops pairs whose move disagrees with what the texts around them did (a wrongly paired repeated word,
+    or a text that was put somewhere else). A whole section that moved together agrees with itself and stays."""
+    if len(pairs) < 3 * k:
+        return pairs
+    vec = [(n[0] - r[0], n[1] - r[1]) for r, n in pairs]
+    keep = []
+    for i, (r, _n) in enumerate(pairs):
+        near = sorted((j for j in range(len(pairs)) if j != i),
+                      key=lambda j: (pairs[j][0][0] - r[0]) ** 2 + (pairs[j][0][1] - r[1]) ** 2)[:k]
+        mdx, mdy = _median([vec[j][0] for j in near]), _median([vec[j][1] for j in near])
+        if abs(vec[i][0] - mdx) <= tol and abs(vec[i][1] - mdy) <= tol:
+            keep.append(pairs[i])
+    return keep if len(keep) >= MIN_ANCHORS else pairs
 
 
 def match_snapshots(ref, new):
@@ -1852,11 +2165,35 @@ def match_snapshots(ref, new):
                 if math.hypot(best[0] - px, best[1] - py) <= DUP_TOLERANCE:
                     ns.remove(best)
                     pairs.append(((rx, ry), best))
-        # one overall shift/scale for the page, from every pair that was found
+        # texts that changed a little (a year, a typo, a split word) are still found: the most similar text close to
+        # where the reference text is expected counts as the same text
+        used_r = {r for r, _n in pairs}
+        used_n = {n for _r, n in pairs}
+        for t, x, y in r_items:
+            if (x, y) in used_r or len(t) < 4:
+                continue
+            px, py = ax * x + bx, ay * y + by
+            best = None
+            for t2, x2, y2 in n_items:
+                if (x2, y2) in used_n or abs(len(t2) - len(t)) > 3:
+                    continue
+                d = math.hypot(x2 - px, y2 - py)
+                if d > DUP_TOLERANCE:
+                    continue
+                sim = difflib.SequenceMatcher(None, t, t2).ratio()
+                if sim >= 0.8 and (best is None or (sim, -d) > best[0]):
+                    best = ((sim, -d), (x2, y2))
+            if best:
+                pairs.append(((x, y), best[1]))
+                used_r.add((x, y))
+                used_n.add(best[1])
+        found = len(pairs)
+        pairs = _prune_pairs(pairs)             # unreliable pairs do not steer the page model or the local shifts
+        # one overall shift/scale for the page, from every reliable pair
         mx = _fit_line([(r[0], n[0]) for r, n in pairs])
         my = _fit_line([(r[1], n[1]) for r, n in pairs])
         out.append({'anchors': [(r[0], r[1], n[0] - r[0], n[1] - r[1]) for r, n in pairs],
-                    'model': (mx, my), 'matched': len(pairs), 'total': len(r_items)})
+                    'model': (mx, my), 'matched': found, 'total': len(r_items)})
     return out
 
 
@@ -1874,6 +2211,9 @@ class TemplateLayout:
         for anchors, ((ax, bx), (ay, by)) in zip(pages, models):
             self.pages.append([(x, y, dx - ((ax - 1.0) * x + bx), dy - ((ay - 1.0) * y + by))
                                for x, y, dx, dy in anchors])
+        # share of the reference texts that moved differently from the page as a whole (0 = the page moved as one piece)
+        self.spread = [sum(1 for a in anchors if abs(a[2]) > self.AGREE or abs(a[3]) > self.AGREE) / len(anchors)
+                       if anchors else 1.0 for anchors in self.pages]
 
     def size(self, page):
         return tuple(self.sizes[page])
@@ -1898,6 +2238,38 @@ class TemplateLayout:
     def place(self, page, x, y):
         dx, dy = self.offset(page, x, y)
         return x + dx, y + dy
+
+    def confidence(self, page, x, y):
+        """-> (score 0..1, why).  How far a position can be trusted: it needs reference texts around it that
+        were found again AND that agree with each other about how far this part of the form moved."""
+        anchors = self.pages[page]
+        if not anchors:
+            return 0.4, 'shift_far'
+        ranked = sorted([((a[0] - x) ** 2 + (a[1] - y) ** 2, a) for a in anchors], key=lambda t: t[0])
+        near = [a for _d, a in ranked[:self.NEAREST]]
+        nearest = math.sqrt(ranked[0][0])
+        mdx, mdy = _median([a[2] for a in near]), _median([a[3] for a in near])
+        bad = sum(1 for a in near if abs(a[2] - mdx) > self.AGREE or abs(a[3] - mdy) > self.AGREE)
+        close = sum(1 for d, _a in ranked if d <= 80.0 ** 2)
+        # Being far from any text only matters when different parts of the page moved differently: a page that moved
+        # as one piece is as trustworthy in an empty cell as next to a label.
+        het = min(1.0, 0.15 + 6.0 * self.spread[page])
+        penalties = []                      # (factor, reason)
+        if nearest > 60.0:
+            penalties.append((1.0 - (1.0 - max(0.55, 1.0 - (nearest - 60.0) / 250.0)) * het, 'shift_far'))
+        elif close < 3:
+            penalties.append((1.0 - 0.15 * het, 'shift_few'))
+        if bad:
+            penalties.append((1.0 - 0.6 * bad / len(near), 'shift_disagree'))
+        dx, dy = self.offset(page, x, y)
+        if math.hypot(dx, dy) > LARGE_SHIFT:
+            penalties.append((0.9, 'shift_large'))
+        score = 1.0
+        for factor, _why in penalties:
+            score *= factor
+        worst = min(penalties) if penalties else (1.0, '')
+        why = worst[1] if worst[0] < 0.97 else ''
+        return score, why
 
 
 def analyze_template(template_pdf):
@@ -1927,8 +2299,13 @@ def analyze_template(template_pdf):
     if rep['reason']:
         return None, rep
     rep['ok'] = True
-    return TemplateLayout([m['anchors'] for m in matches], [pg['size'] for pg in new['pages']],
-                          [m['model'] for m in matches]), rep
+    tl = TemplateLayout([m['anchors'] for m in matches], [pg['size'] for pg in new['pages']],
+                        [m['model'] for m in matches])
+    try:
+        rep['confidence'] = smart_shift_confidence(tl, template_pdf, rep['identical'])
+    except Exception:
+        rep['confidence'] = None
+    return tl, rep
 
 
 def describe_report(rep):
@@ -1966,6 +2343,9 @@ def describe_report(rep):
     if rep.get('ok') and max((pg['max_shift'] for pg in rep.get('pages', [])), default=0.0) > LARGE_SHIFT:
         lines += ["", T("⚠ Το template έχει μετακινηθεί πολύ. Δημιουργήστε ένα «Δοκιμαστικό δελτίο» και ελέγξτε το πριν το υποβάλετε.",
                          "⚠ The template moved a lot. Create a “Test form” and check it before submitting.")]
+    conf_text = describe_confidence(rep.get('confidence')) if rep.get('ok') else ''
+    if conf_text:
+        lines += ["", conf_text]
     return "\n".join(lines)
 
 
@@ -2186,6 +2566,217 @@ def delete_manual_layout():
         pass
 
 
+# ------------------------------------------------------- recognition confidence
+# "The template was recognised" is too coarse: some parts of a form are found with certainty (a printed label with a
+# drawn line next to it) and others only guessed (no line, a width that had to be estimated, a row code without its
+# printed word).  Every field therefore gets a score from 0 to 1 and a reason, the scores are averaged per section of
+# the form, and the fields that fall below CONF_OK are outlined in the preview so the person knows exactly what to look at.
+CONF_OK = 0.90          # at or above: nothing to check
+CONF_LOW = 0.70         # between CONF_LOW and CONF_OK: please check (amber); below: low (red)
+CONF_SECTIONS = [
+    ('hotel', ("Στοιχεία καταλύματος", "Hotel information")),
+    ('dates', ("Πεδία ημερομηνιών", "Date fields")),
+    ('country', ("Πίνακας χωρών", "Country table")),
+    ('totals', ("Σύνολα", "Totals")),
+]
+CONF_BOX_W = {'name': 180.0, 'type': 120.0, 'category': 90.0, 'phone': 95.0, 'email': 125.0, 'company': 200.0,
+              'year': 45.0, 'month': 60.0, 'nomos': 80.0, 'dimotiki': 90.0, 'odos': 110.0, 'arithmos': 40.0, 'tk': 45.0}
+CONF_WHY = {
+    'missing': ("Δεν βρέθηκε στο template - τοποθετήστε το στον επεξεργαστή", "Not found on the template - place it in the editor"),
+    'ambiguous_label': ("Η ετικέτα εμφανίζεται περισσότερες από μία φορές", "The printed label appears more than once"),
+    'border': ("Το πλάτος προήλθε από το τυπωμένο όριο του κελιού", "The width comes from the printed cell border"),
+    'no_line': ("Δεν βρέθηκε γραμμή γραφής - η θέση εκτιμήθηκε", "No writing line found - the position is an estimate"),
+    'open_width': ("Δεν βρέθηκε όριο πλάτους - το πλάτος εκτιμήθηκε", "No width limit found - the width is an estimate"),
+    'narrow': ("Πολύ λίγος χώρος - το κείμενο ίσως δεν χωράει", "Very little room - the text may not fit"),
+    'slashes': ("Οι θέσεις προήλθαν από τις κάθετες «/» και όχι από γραμμές", "Slots were taken from the “/” marks, not from drawn lines"),
+    'box_count': ("Ο αριθμός των κουτιών δεν είναι ο αναμενόμενος", "The number of digit boxes is not what was expected"),
+    'ambiguous_boxes': ("Βρέθηκαν πολλά πιθανά κουτιά", "Several candidate digit boxes were found"),
+    'code_only': ("Βρέθηκε ο κωδικός γραμμής αλλά όχι η λέξη «Σύνολο» δίπλα του", "The row code was found, but not the word “Total” beside it"),
+    'ambiguous_code': ("Ο κωδικός γραμμής εμφανίζεται περισσότερες από μία φορές", "The row code appears more than once"),
+    'rows_partial': ("Δεν βρέθηκαν όλες οι γραμμές χωρών", "Not every country row was found"),
+    'shift_few': ("Λίγα σημεία αναφοράς κοντά", "Few reference texts nearby"),
+    'shift_far': ("Μακριά από κάθε σημείο αναφοράς", "Far from any reference text"),
+    'shift_disagree': ("Τα γειτονικά σημεία αναφοράς διαφωνούν μεταξύ τους", "The nearby reference texts disagree with each other"),
+    'shift_large': ("Μεγάλη μετατόπιση σε αυτό το σημείο", "Large shift at this spot"),
+    'unrated': ("Δεν έχει αξιολογηθεί", "Not rated"),
+}
+
+
+def conf_section(fid):
+    """The section of the form a field belongs to (one of CONF_SECTIONS)."""
+    if fid.startswith('rows'):
+        return 'country'
+    if fid.startswith('tot_'):
+        return 'totals'
+    if fid.startswith(('date_from_', 'date_to_', 'sign_')):
+        return 'dates'
+    return 'hotel'
+
+
+def conf_level(score, why=''):
+    if why == 'missing':
+        return 'missing'
+    return 'ok' if score >= CONF_OK else 'check' if score >= CONF_LOW else 'low'
+
+
+def conf_percent(score):
+    """Whole percent, rounded DOWN: 100% is only shown when nothing at all is in doubt."""
+    return 100 if score >= 0.9995 else max(0, min(99, int(score * 100)))
+
+
+def conf_why(code):
+    pair = CONF_WHY.get(code) or CONF_WHY['unrated']
+    return T(*pair)
+
+
+def conf_sections(scores):
+    """{fid: score} -> [{'id', 'name', 'score', 'pct', 'level', 'count', 'weak': [fids]}] in form order."""
+    out = []
+    for sid, name in CONF_SECTIONS:
+        ids = [f for f in scores if conf_section(f) == sid]
+        if not ids:
+            continue
+        mean = sum(scores[f] for f in ids) / len(ids)
+        out.append({'id': sid, 'name': name, 'score': mean, 'pct': conf_percent(mean), 'level': conf_level(mean),
+                    'count': len(ids), 'weak': [f for f in ids if scores[f] < CONF_OK]})
+    return out
+
+
+def conf_item_box(fid, it, digits=None):
+    """[x0, y0, x1, y1] in PDF points: the area a value will occupy (for the outline in the preview)."""
+    size = float(it.get('size') or 10.0)
+    step = float(it.get('step') or 0.0)
+    if step:                                                 # one digit per box, centred in the first box
+        w = step * (digits or MANUAL_SPLIT_LEN.get(fid) or 2)
+        x0 = it['x'] - step / 2.0
+    else:
+        w = float(it.get('maxw') or CONF_BOX_W.get(fid, 70.0))
+        x0 = it['x'] - w / 2.0 if it.get('align') == 'center' else it['x']
+    return [round(x0, 1), round(it['y'] - 0.3 * size, 1), round(x0 + w, 1), round(it['y'] + size, 1)]
+
+
+def _detect_confidence(wanted, items, found, conf, colx, row_ys, coverage, boxes):
+    """The confidence of Smart Field Detection: {'fields': {fid: {...}}, 'sections': [...]}."""
+    fields = {}
+    for fid in wanted:
+        if fid not in found:
+            fields[fid] = {'score': 0.0, 'why': 'missing'}
+            continue
+        it = items[fid]
+        # the table fields carry no rating of their own: they are as sure as the share of rows that was found
+        c = {'score': 1.0, 'why': ''} if fid.startswith('rows') else conf.get(fid, {'score': 0.9, 'why': 'unrated'})
+        score, why = c['score'], c['why']
+        entry = {'page': it['page'], 'x': it['x'], 'y': it['y']}
+        if fid.startswith('rows'):
+            # the table is as sure as the share of country rows that were found again
+            if coverage < score:
+                score, why = coverage, 'rows_partial'
+            if coverage < 0.9995:
+                entry['flag'] = True            # even 95% means some countries get no value: always worth a look
+            ys = list(row_ys[it['page']].values()) if it['page'] < len(row_ys) else []
+            if ys:
+                x0, x1 = colx.get((it['page'], fid[-1]), (it['x'] - 30.0, it['x'] + 30.0))
+                entry['band'] = [round(x0, 1), round(min(ys) - 4, 1), round(x1, 1), round(max(ys) + 10, 1)]
+        else:
+            entry['box'] = conf_item_box(fid, it, boxes.get(fid))
+        entry.update({'score': score, 'why': why})
+        fields[fid] = entry
+    return {'fields': fields, 'sections': conf_sections({f: v['score'] for f, v in fields.items()})}
+
+
+def smart_shift_confidence(layout, template_pdf, identical=False):
+    """The confidence of Smart Shift for every field, from the reference texts around the place it is moved to.
+    `identical`: the template is byte-for-byte the reference, so nothing moved and everything is certain."""
+    base = manual_default_layout()
+    try:
+        rows = detect_template_rows(template_pdf)
+    except Exception:
+        rows = [{}, {}]
+    expected = len(MAPPED_TARGETS | {norm('ΕΛΛΑΔΑ')})
+    coverage = min(1.0, (len(rows[0]) + len(rows[1])) / expected) if expected else 0.0
+    fields = {}
+    for fid, it in base['items'].items():
+        page = it['page']
+        if fid.startswith('rows'):
+            ys = sorted(rows[page].values()) if page < len(rows) else []
+            ry = ys[len(ys) // 2] if ys else 400.0
+            score, why = layout.confidence(page, it['x'], ry)
+            x = it['x'] + layout.offset(page, it['x'], ry)[0]
+            if coverage < score:
+                score, why = coverage, 'rows_partial'
+            entry = {'page': page, 'x': round(x, 2), 'y': 0.0, 'score': score, 'why': why}
+            if coverage < 0.9995:
+                entry['flag'] = True
+            if ys:
+                entry['band'] = [round(x - 32.0, 1), round(ys[0] - 4, 1), round(x + 32.0, 1), round(ys[-1] + 10, 1)]
+        else:
+            x, y = layout.place(page, it['x'], it['y'])
+            score, why = layout.confidence(page, it['x'], it['y'])
+            placed = dict(it, x=round(x, 2), y=round(y, 2))
+            entry = {'page': page, 'x': placed['x'], 'y': placed['y'], 'score': score, 'why': why,
+                     'box': conf_item_box(fid, placed)}
+        fields[fid] = entry
+    if identical:
+        for entry in fields.values():
+            entry.update({'score': 1.0, 'why': ''})
+            entry.pop('flag', None)
+    return {'fields': fields, 'sections': conf_sections({f: v['score'] for f, v in fields.items()})}
+
+
+def confidence_view(conf, layout=None):
+    """What the screen needs: {'sections': [...], 'flags': [...]}, or None when there is no recognition to report.
+    `layout` is the layout the preview was made with.  A position that the person has moved (or hidden, or placed by
+    hand when it was not found) in the editor counts as checked, so fine-tuning raises the confidence."""
+    if not conf or not conf.get('fields'):
+        return None
+    items = layout.get('items', {}) if layout else {}
+    scores, flags = {}, []
+    for fid, f in conf['fields'].items():
+        score, why = f['score'], f.get('why', '')
+        it = items.get(fid) if layout else None
+        adjusted = False
+        if it is not None and (score < CONF_OK or f.get('flag')):
+            if 'x' not in f:                                   # was not found: placed by hand when it is visible now
+                adjusted = bool(it.get('visible', True))
+            elif not it.get('visible', True):                  # hidden on purpose: nothing will be written there
+                adjusted = True
+            else:
+                moved_x = abs(it.get('x', 0.0) - f['x']) > 0.6
+                moved_y = (not fid.startswith('rows')) and abs(it.get('y', 0.0) - f['y']) > 0.6
+                adjusted = it.get('page', f['page']) != f['page'] or moved_x or moved_y
+        scores[fid] = 1.0 if adjusted else score
+        level = conf_level(score, why)
+        if level == 'ok' and f.get('flag'):
+            level = 'check'
+        if level != 'ok' and not adjusted:
+            flags.append({'fid': fid, 'label': manual_label(fid, {}, None), 'score': score, 'pct': conf_percent(score),
+                          'level': level, 'why': why, 'section': conf_section(fid), 'page': f.get('page'),
+                          'box': f.get('box'), 'band': f.get('band')})
+    flags.sort(key=lambda f: (f['score'], f['label']))
+    sections = conf_sections(scores)
+    for sec in sections:
+        sec['weak'] = [f['fid'] for f in flags if f['section'] == sec['id']]
+    return {'sections': sections, 'flags': flags}
+
+
+def describe_confidence(conf, layout=None):
+    """The confidence of every section in words (current language), plus the least certain positions."""
+    view = confidence_view(conf, layout)
+    if not view:
+        return ""
+    lines = [T("Βεβαιότητα αναγνώρισης ανά ενότητα:", "Recognition confidence per section:")]
+    for sec in view['sections']:
+        extra = T(f" · {len(sec['weak'])} προς έλεγχο", f" · {len(sec['weak'])} to check") if sec['weak'] else ""
+        lines.append(f"{'⚠' if sec['weak'] else '✓'} {T(*sec['name'])}: {sec['pct']}%{extra}")
+    if view['flags']:
+        lines += ["", T("Ελέγξτε αυτές τις θέσεις:", "Please check these positions:")]
+        for f in view['flags'][:8]:
+            lines.append(f"  – {f['label']}: {f['pct']}% ({conf_why(f['why'])})")
+        if len(view['flags']) > 8:
+            lines.append(T(f"  … και άλλες {len(view['flags']) - 8}", f"  … and {len(view['flags']) - 8} more"))
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------- Smart Field Detection ("AI / Auto-Detect")
 # The third way of filling the form.  Nothing is hardcoded for the program's own fields: the blank template is
 # scanned on the fly (every word with its exact box, every drawn line), the printed labels are recognised, the
@@ -2265,6 +2856,31 @@ def _page_lines(page, pdfium_raw):
     return hl, vl
 
 
+def _page_rects(page, pdfium_raw):
+    """[(l, b, r, t)] - the drawn rectangles (cell and frame borders) of a page."""
+    out = []
+    try:
+        for obj in page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_PATH]):
+            try:
+                l, b, r, t = obj.get_bounds()
+            except Exception:
+                continue
+            if 6 <= r - l < 500 and 6 <= t - b < 400:
+                out.append((l, b, r, t))
+    except Exception:
+        pass
+    return out
+
+
+def _border_right(page_geo, x, y):
+    """x of the nearest printed vertical border to the right of x that spans height y (lines and rectangle edges)."""
+    cands = [v['x'] for v in page_geo['v'] if v['x'] > x and v['y0'] - 1 <= y <= v['y1'] + 1]
+    for (l, b, r, t) in page_geo.get('r', []):
+        if b - 1 <= y <= t + 1:
+            cands += [e for e in (l, r) if e > x]
+    return min(cands) if cands else None
+
+
 def _read_geometry(template_pdf):
     """Words and lines of the first 2 pages of a template."""
     try:
@@ -2286,7 +2902,8 @@ def _read_geometry(template_pdf):
                 page = doc[pi]
                 width, height = page.get_size()
                 hl, vl = _page_lines(page, pdfium_raw)
-                pages.append({'size': (float(width), float(height)), 'words': _page_words(page), 'h': hl, 'v': vl})
+                pages.append({'size': (float(width), float(height)), 'words': _page_words(page), 'h': hl, 'v': vl,
+                              'r': _page_rects(page, pdfium_raw)})
         except DetectError:
             raise
         except Exception as e:
@@ -2299,7 +2916,7 @@ def _read_geometry(template_pdf):
     return pages
 
 
-def _find_phrase(page, phrase, max_y=None, min_y=None, near_y=None):
+def _find_phrase(page, phrase, max_y=None, min_y=None, near_y=None, prefer_line=False):
     """The first run of consecutive words of one text line that spells `phrase` (compared in a normalised form).
     -> {'x0','x1','y','words'} or None.  max_y/min_y limit where the phrase may be, near_y prefers the closest one."""
     target = _dn(phrase)
@@ -2321,9 +2938,14 @@ def _find_phrase(page, phrase, max_y=None, min_y=None, near_y=None):
                 break
     if not found:
         return None
-    if near_y is not None:
-        return min(found, key=lambda m: abs(m['y'] - near_y))
-    return found[0]
+    if prefer_line and len(found) > 1:
+        # deep pass: of several identical printed labels, the one with a drawn writing line after it is the real one
+        lined = [m for m in found if any(0 <= h['x0'] - m['x1'] <= 40 for h in _underlines(page, m['y'], m['x1'], tol=4.5))]
+        if lined:
+            found = lined
+    best = min(found, key=lambda m: abs(m['y'] - near_y)) if near_y is not None else found[0]
+    best['n'] = len(found)          # more than one candidate = the label is ambiguous (lowers the confidence)
+    return best
 
 
 def _find_word_starting(page, prefix):
@@ -2396,10 +3018,11 @@ def _table_columns(page):
     return {'name': cols[ic - 2], 'code': cols[ic - 1], 'clients': cols[ic], 'nights': cols[inn]}
 
 
-def _page_rows(page, columns, targets):
+def _page_rows(page, columns, targets, relaxed=False):
     """{target: baseline} of every country row found in the name column of a page."""
     x0, x1 = columns['name']
-    inside = [w for w in page['words'] if w['x0'] >= x0 - 2 and w['x1'] <= x1 + 6]
+    sl, sr = (6, 30) if relaxed else (2, 6)
+    inside = [w for w in page['words'] if w['x0'] >= x0 - sl and w['x1'] <= x1 + sr]
     inside.sort(key=lambda w: (-round(w['by'] / 2.0), w['x0']))
     lines, cur = [], []
     for w in inside:
@@ -2415,6 +3038,12 @@ def _page_rows(page, columns, targets):
         text = ''.join(norm(w['s']) for w in line)
         hit = text if text in targets else next((t for t in sorted(targets, key=len, reverse=True)
                                                  if text.startswith(t)), None)
+        if relaxed and not hit:
+            # deep pass: a name with a number or a stray mark around it, or only the first line of a wrapped name
+            hit = next((t for t in sorted(targets, key=len, reverse=True) if len(t) >= 5 and t in text), None)
+            if not hit and len(text) >= 6:
+                starts = [t for t in targets if t.startswith(text)]
+                hit = starts[0] if len(starts) == 1 else None
         if hit and hit not in rows:
             rows[hit] = round(line[0]['by'], 2)
     return rows
@@ -2428,22 +3057,43 @@ def _item(page, x, y, size, align='left', step=0.0, maxw=None):
     return it
 
 
-def _after_label(page_geo, page, label, size, fields_out, fid, gap=DETECT_GAP):
-    """A value written after a printed label (and on its line, if one is drawn there)."""
+def _after_label(page_geo, page, label, size, fields_out, fid, gap=DETECT_GAP, rate=None, deep=False):
+    """A value written after a printed label (and on its line, if one is drawn there).
+    `rate(fid, score, why)` is told how sure the placement is: a drawn line is the best evidence,
+    a neighbouring text that limits the width is good, a guessed width is weak."""
     start = label['x1'] + gap
     limit = None
-    under = [h for h in _underlines(page_geo, label['y'], label['x1'], tol=3.5)]
+    under = [h for h in _underlines(page_geo, label['y'], label['x1'], tol=5.0 if deep else 3.5)]
+    if deep and under:                       # only the line closest to the printed baseline counts
+        dy = min(abs(h['y'] - label['y']) for h in under)
+        under = [h for h in under if abs(h['y'] - label['y']) - dy < 0.8]
     if under:
         first = under[0]
-        if first['x0'] > start and first['x0'] - label['x1'] <= 25:
+        if first['x0'] > start and first['x0'] - label['x1'] <= (45 if deep else 25):
             start = first['x0'] + 3.0
         if first['x0'] <= start + 6:
             limit = first['x1']
+    anchored = limit is not None
+    border = None
+    if deep and not anchored:                # no writing line: the printed border of the cell is the next best evidence
+        bx = _border_right(page_geo, start + 12, label['y'])
+        if bx is not None and bx - start < 260:
+            border = limit = bx - 3.0
     rivals = [w['x0'] for w in page_geo['words'] if abs(w['by'] - label['y']) < 3 and w['x0'] > start + 8]
     if rivals:
         limit = min(limit, min(rivals) - 6) if limit else min(rivals) - 6
+    bounded = limit is not None
     limit = limit or min(page_geo['size'][0] - 40, start + 200)
     fields_out[fid] = _item(page, start, label['y'] + DETECT_LIFT, size, maxw=max(limit - start, 20))
+    if rate:
+        score, why = ((1.0, '') if anchored else (0.96, 'border') if border else
+                      (0.9, 'no_line') if bounded else (0.8, 'open_width'))
+        if limit - start < 40:
+            score, why = min(score, 0.7), 'narrow'
+        if label.get('n', 1) > 1:
+            score *= 0.93
+            why = why or 'ambiguous_label'
+        rate(fid, score, why)
     return True
 
 
@@ -2451,60 +3101,86 @@ def _slot_item(page, slot, y, size):
     return _item(page, (slot[0] + slot[1]) / 2.0, y, size, align='center', maxw=max(slot[1] - slot[0] - 1, 8))
 
 
-def _date_slots(page_geo, label):
+def _date_slots(page_geo, label, deep=False):
     """Three writing slots (day / month / year) of a date row: the drawn underlines, else the gaps between the slashes."""
-    under = _underlines(page_geo, label['y'], label['x1'], tol=4.5)
-    under = [u for u in under if u['x1'] - u['x0'] < 90][:3]
-    if len(under) == 3:
-        return [(u['x0'], u['x1']) for u in under], under[0]['y']
+    for tol in ((4.5, 7.0) if deep else (4.5,)):
+        under = _underlines(page_geo, label['y'], label['x1'], tol=tol)
+        under = [u for u in under if u['x1'] - u['x0'] < 90]
+        if deep and under:
+            dy = min(abs(u['y'] - label['y']) for u in under)
+            under = [u for u in under if abs(u['y'] - label['y']) - dy < 0.8]
+        under = under[:3]
+        if len(under) == 3:
+            return [(u['x0'], u['x1']) for u in under], under[0]['y'], 'lines'
     slashes = sorted([w for w in page_geo['words'] if w['s'] == '/' and abs(w['by'] - label['y']) < 3
                       and w['x0'] > label['x1']], key=lambda w: w['x0'])[:2]
     if len(slashes) == 2:
         return [(label['x1'] + 3, slashes[0]['x0'] - 2), (slashes[0]['x1'] + 2, slashes[1]['x0'] - 2),
-                (slashes[1]['x1'] + 2, slashes[1]['x1'] + 34)], label['y'] - 0.6
-    return None, None
+                (slashes[1]['x1'] + 2, slashes[1]['x1'] + 34)], label['y'] - 0.6, 'slashes'
+    return None, None, None
 
 
-def detect_template_fields(template_pdf):
+def _detect_core(template_pdf, geo, deep=False):
     """Scans the blank template and computes a position for every field of the form.
+    deep=True adds the extra-evidence checks of the deep pass (see detect_template_fields).
     -> (layout, report).  Raises DetectError when the template cannot be read or is not recognised safely.
     report = {'ok', 'found': [ids], 'missing': [ids], 'rows': {'found', 'expected', 'missing': [targets]},
               'row_ys': [{target: y}, {target: y}], 'sha1', 'sizes'}"""
-    geo = _read_geometry(template_pdf)
     with open(template_pdf, 'rb') as f:
         sha1 = hashlib.sha1(f.read()).hexdigest()
     p0, p1 = geo[0], geo[1]
     out, how = {}, {}
+    conf = {}                       # fid -> {'score': 0..1, 'why': code}: how sure each placement is
+
+    def find(page, phrase, **kw):
+        return _find_phrase(page, phrase, prefer_line=deep, **kw)
 
     def got(fid):
         how[fid] = True
 
+    def rate(fid, score, why=''):
+        conf[fid] = {'score': max(0.0, min(1.0, float(score))), 'why': why}
+
+    def lab(label):                 # a printed label that appears more than once on the page is ambiguous
+        return (1.0, '') if label.get('n', 1) <= 1 else (0.93, 'ambiguous_label')
+
+    def rate_slot(fid, slot, suffix, how_, label, consistent=False):
+        # slots from the "/" marks are more believable when the day and month slots are equally wide (deep pass)
+        score, why = (1.0, '') if how_ == 'lines' else ((0.93, 'slashes') if consistent else (0.85, 'slashes'))
+        if slot[1] - slot[0] < (22.0 if suffix == 'y' else 11.0):
+            score, why = min(score, 0.7), 'narrow'
+        s2, w2 = lab(label)
+        rate(fid, score * s2, why or w2)
+
     # ---- survey year and month: written on the line after their labels
-    year = _find_phrase(p0, 'Έτος έρευνας')
-    month = _find_phrase(p0, 'Μήνας', near_y=year['y'] if year else None)
+    year = find(p0, 'Έτος έρευνας')
+    month = find(p0, 'Μήνας', near_y=year['y'] if year else None)
     for fid, label in (('year', year), ('month', month)):
         if label:
-            under = [u for u in _underlines(p0, label['y'], label['x1'] - 1, tol=4.5) if u['x0'] - label['x1'] < 45]
+            under = [u for u in _underlines(p0, label['y'], label['x1'] - 1, tol=6.0 if deep else 4.5)
+                     if u['x0'] - label['x1'] < (60 if deep else 45)]
             if under:
                 out[fid] = _slot_item(0, (under[0]['x0'], under[0]['x1']), under[0]['y'] + DETECT_LIFT - 0.3, 11.0)
                 got(fid)
+                rate(fid, lab(label)[0], lab(label)[1])
             else:
                 out[fid] = _item(0, label['x1'] + 12, label['y'] + DETECT_LIFT, 11.0)
                 got(fid)
+                rate(fid, 0.7 * lab(label)[0], 'no_line')
 
     # ---- the hotel lines: a value after each printed label
-    type_label = _find_phrase(p0, 'Είδος καταλύματος')
+    type_label = find(p0, 'Είδος καταλύματος')
     ceiling = type_label['y'] + 2 if type_label else None
     for fid, phrase, size in (('type', 'Είδος καταλύματος', 11.0), ('category', 'Κατηγορία', 11.0),
                               ('name', 'Τίτλος καταλύματος', 11.0), ('nomos', 'Νομός', 10.0),
                               ('dimotiki', 'Δημοτική ενότητα', 10.0), ('odos', 'Οδός', 10.0),
                               ('arithmos', 'Αριθμός', 10.0), ('tk', 'ΤΚ', 10.0),
                               ('phone', 'Τηλέφωνα', 11.0)):
-        label = _find_phrase(p0, phrase, max_y=ceiling + 1 if fid != 'type' and ceiling else None,
+        label = find(p0, phrase, max_y=ceiling + 1 if fid != 'type' and ceiling else None,
                              near_y=type_label['y'] if (type_label and fid in ('type', 'category')) else None)
         if fid == 'phone':
-            label = _find_phrase(p0, phrase, max_y=type_label['y'] - 1 if type_label else None)
-        if label and _after_label(p0, 0, label, size, out, fid):
+            label = find(p0, phrase, max_y=type_label['y'] - 1 if type_label else None)
+        if label and _after_label(p0, 0, label, size, out, fid, rate=rate, deep=deep):
             got(fid)
     mail = None
     for w in p0['words']:
@@ -2512,11 +3188,11 @@ def detect_template_fields(template_pdf):
             if type_label is None or w['by'] < type_label['y']:
                 mail = {'x0': w['x0'], 'x1': w['x1'], 'y': w['by']}
                 break
-    if mail and _after_label(p0, 0, mail, 11.0, out, 'email'):
+    if mail and _after_label(p0, 0, mail, 11.0, out, 'email', rate=rate, deep=deep):
         got('email')
 
     # ---- the company: written under its printed label, inside the panel that is drawn there
-    comp = _find_phrase(p0, 'Επωνυμία επιχείρησης')
+    comp = find(p0, 'Επωνυμία επιχείρησης')
     if comp:
         cx = (comp['x0'] + comp['x1']) / 2.0
         below = sorted([h for h in p0['h'] if h['y'] < comp['y'] - 8 and h['x0'] <= cx <= h['x1']
@@ -2526,52 +3202,82 @@ def detect_template_fields(template_pdf):
             out['company'] = _item(0, (panel['x0'] + panel['x1']) / 2.0, panel['y'] + 0.3 * (comp['y'] - panel['y']),
                                    11.0, align='center', maxw=panel['x1'] - panel['x0'] - 14)
             got('company')
+            roomy = panel['x1'] - panel['x0'] - 14 >= 60
+            rate('company', (1.0 if roomy else 0.7) * lab(comp)[0], '' if roomy else 'narrow')
 
     # ---- digit boxes: VAT number, operating days, employees
     groups = _box_groups(p0)
 
-    def put_boxes(fid, group, size=11.0):
+    def put_boxes(fid, group, size=11.0, cands=1, label=None):
         h = group['y1'] - group['y0']
         y = group['y0'] + (h - 0.72 * size) / 2.0 + 0.6
         out[fid] = _item(0, group['x0'] + group['pitch'] / 2.0, y, size, align='center', step=group['pitch'])
         got(fid)
         how[fid] = group['n']
+        expected = MANUAL_SPLIT_LEN.get(fid)        # the form prints a fixed number of boxes for these
+        score, why = (1.0, '') if expected in (None, group['n']) else (0.6, 'box_count')
+        if cands > 1:
+            score *= 0.93
+            why = why or 'ambiguous_boxes'
+        if label:
+            score *= lab(label)[0]
+        rate(fid, score, why)
 
-    afm = _find_phrase(p0, 'ΑΦΜ')
+    def exact_count(fid, cand):             # deep pass: of several box rows, prefer the one with the printed number of boxes
+        if deep and MANUAL_SPLIT_LEN.get(fid):
+            exact = [g for g in cand if g['n'] == MANUAL_SPLIT_LEN[fid]]
+            return exact or cand
+        return cand
+
+    def nearest_only(cand, dist):           # deep pass: one box row clearly closest to its label is not "ambiguous"
+        if deep and len(cand) > 1:
+            ranked = sorted(cand, key=dist)
+            if dist(ranked[1]) > 2.0 * max(dist(ranked[0]), 5.0):
+                return ranked[:1]
+        return cand
+
+    afm = find(p0, 'ΑΦΜ')
     if afm:
         cand = [g for g in groups if g['y0'] - 4 <= afm['y'] <= g['y1'] + 4 and g['x0'] >= afm['x1'] - 2]
+        cand = nearest_only(exact_count('afm', cand), lambda g: abs(g['x0'] - afm['x1']))
         if cand:
-            put_boxes('afm', min(cand, key=lambda g: g['x0']))
+            put_boxes('afm', min(cand, key=lambda g: g['x0']), cands=len(cand), label=afm)
     for fid, phrase in (('days', 'Ημέρες λειτουργίας'), ('employees', 'Σύνολο εργαζομένων')):
-        label = _find_phrase(p0, phrase)
+        label = find(p0, phrase)
         if label:
             cx = (label['x0'] + label['x1']) / 2.0
             cand = [g for g in groups if g['y1'] < label['y'] and abs(g['x0'] + g['pitch'] * g['n'] / 2.0 - cx) < 80]
+            cand = nearest_only(exact_count(fid, cand), lambda g: abs(g['x0'] + g['pitch'] * g['n'] / 2.0 - cx) + (label['y'] - g['y1']))
             if cand:
-                put_boxes(fid, max(cand, key=lambda g: g['y1']))
+                put_boxes(fid, max(cand, key=lambda g: g['y1']), cands=len(cand), label=label)
 
     # ---- the period of operation: day / month / year slots of the "From" and "To" rows
-    period = _find_phrase(p0, 'Περίοδος λειτουργίας')
+    period = find(p0, 'Περίοδος λειτουργίας')
     for prefix, phrase in (('date_from', 'Από'), ('date_to', 'Έως')):
-        label = _find_phrase(p0, phrase, max_y=period['y'] if period else None, near_y=(period['y'] - 50) if period else None)
-        slots, base = _date_slots(p0, label) if label else (None, None)
+        label = find(p0, phrase, max_y=period['y'] if period else None, near_y=(period['y'] - 50) if period else None)
+        slots, base, how_ = _date_slots(p0, label, deep) if label else (None, None, None)
         if slots:
+            cons = deep and abs((slots[0][1] - slots[0][0]) - (slots[1][1] - slots[1][0])) < 2.5
             for suffix, slot in zip(('d', 'm', 'y'), slots):
                 out[f'{prefix}_{suffix}'] = _slot_item(0, slot, base + 1.7, 11.0)
                 got(f'{prefix}_{suffix}')
+                rate_slot(f'{prefix}_{suffix}', slot, suffix, how_, label, cons)
 
     # ---- signature date (page 2)
-    sign = _find_phrase(p1, 'Ημερομηνία')
-    slots, base = _date_slots(p1, sign) if sign else (None, None)
+    sign = find(p1, 'Ημερομηνία')
+    slots, base, how_ = _date_slots(p1, sign, deep) if sign else (None, None, None)
     if slots:
+        cons = deep and abs((slots[0][1] - slots[0][0]) - (slots[1][1] - slots[1][0])) < 2.5
         for suffix, slot in zip(('d', 'm', 'y'), slots):
             out[f'sign_{suffix}'] = _slot_item(1, slot, base + 1.4, 10.0)
             got(f'sign_{suffix}')
+            rate_slot(f'sign_{suffix}', slot, suffix, how_, sign, cons)
 
     # ---- the country table: columns, total rows, country rows
     cols = [_table_columns(p0), _table_columns(p1)]
     targets = set(MAPPED_TARGETS) | {norm('ΕΛΛΑΔΑ')}
     row_ys = [{}, {}]
+    colx = {}                       # (page, 'c'|'n') -> x range of the column, for highlighting
     for pi, (pg, col) in enumerate(zip(geo, cols)):
         if col is None:
             continue
@@ -2579,7 +3285,8 @@ def detect_template_fields(template_pdf):
             mid = (col[kind][0] + col[kind][1]) / 2.0
             out[f'rows{pi}_{tag}'] = _item(pi, mid, 0.0, size, align='center')
             got(f'rows{pi}_{tag}')
-        row_ys[pi] = _page_rows(pg, col, targets)
+            colx[(pi, tag)] = col[kind]
+        row_ys[pi] = _page_rows(pg, col, targets, relaxed=deep)
         cx0, cx1 = col['code']
         for key, code in DETECT_TOTAL_CODES.items():
             if (key == '2.1') != (pi == 0):
@@ -2587,11 +3294,53 @@ def detect_template_fields(template_pdf):
             cand = [w for w in pg['words'] if w['s'] == code and cx0 - 1 <= w['x0'] and w['x1'] <= cx1 + 1]
             if not cand:
                 continue
+            if deep and len(cand) > 1:
+                tot = [c for c in cand if 'ΣΥΝΟΛΟ' in ''.join(norm(w['s']) for w in pg['words']
+                                                           if abs(w['by'] - c['by']) < 11 and w['x1'] <= cx0 + 1)]
+                cand = tot or cand
             ys = round(cand[0]['by'], 2)
+            # second witness: the word "Σύνολο" printed to the left of the code, on the same line
+            left = sorted((w for w in pg['words'] if abs(w['by'] - cand[0]['by']) < 4.5 and w['x1'] <= cx0 + 1),
+                          key=lambda w: w['x0'])
+            tscore, twhy = (1.0, '') if 'ΣΥΝΟΛΟ' in ''.join(norm(w['s']) for w in left) else (0.88, 'code_only')
+            if deep and twhy == 'code_only':
+                # deep pass: look further around the code for the word, and for the ruling of a table row
+                near = sorted((w for w in pg['words'] if abs(w['by'] - cand[0]['by']) < 11 and w['x1'] <= cx0 + 1),
+                              key=lambda w: (-round(w['by'] / 2.0), w['x0']))
+                above = any(0 < h['y'] - cand[0]['by'] < 14 and h['x0'] <= cx0 + 2 and h['x1'] >= cx1 - 2 for h in pg['h'])
+                below = any(0 < cand[0]['by'] - h['y'] < 14 and h['x0'] <= cx0 + 2 and h['x1'] >= cx1 - 2 for h in pg['h'])
+                if 'ΣΥΝΟΛΟ' in ''.join(norm(w['s']) for w in near):
+                    tscore, twhy = 0.99, ''
+                elif above and below:
+                    tscore, twhy = 0.96, ''
+            if len(cand) > 1:
+                tscore *= 0.93
+                twhy = twhy or 'ambiguous_code'
             for kind, tag in (('clients', 'c'), ('nights', 'n')):
                 mid = (col[kind][0] + col[kind][1]) / 2.0
                 out[f'tot_{key}_{tag}'] = _item(pi, mid, ys, 10.0, align='center')
                 got(f'tot_{key}_{tag}')
+                rate(f'tot_{key}_{tag}', tscore, twhy)
+
+    # ---- deep pass, cross-check: fields printed on the same row of the form must sit on the same baseline
+    if deep:
+        for group in (('nomos', 'dimotiki'), ('odos', 'arithmos', 'tk'), ('type', 'category'),
+                      ('date_from_d', 'date_from_m', 'date_from_y'), ('date_to_d', 'date_to_m', 'date_to_y'),
+                      ('sign_d', 'sign_m', 'sign_y')):
+            ids = [f for f in group if f in out]
+            if len(ids) < 2:
+                continue
+            med = sorted(out[f]['y'] for f in ids)[len(ids) // 2]
+            agree = [f for f in ids if abs(out[f]['y'] - med) <= 0.8]
+            if len(agree) < 2:
+                continue
+            for f in ids:
+                c = conf.get(f)
+                if f in agree:
+                    if c and c['why'] == 'ambiguous_label':     # an independent witness removes the doubt
+                        rate(f, min(1.0, c['score'] / 0.93 * 0.99), '')
+                elif abs(out[f]['y'] - med) <= 6.0 and not f.startswith(('date_', 'sign_')):
+                    out[f]['y'] = med                           # the odd one out is pulled onto the shared baseline
 
     # ---- what was found, what was not
     wanted = [f[0] for f in MANUAL_FIELDS]
@@ -2623,7 +3372,113 @@ def detect_template_fields(template_pdf):
             parked['visible'] = False
             items[fid] = parked
     layout = {'version': 1, 'items': items, 'known': wanted}
+    coverage = found_rows / expected_rows if expected_rows else 0.0
+    report['confidence'] = _detect_confidence(wanted, items, out, conf, colx, row_ys, coverage, report['boxes'])
     return layout, report
+
+
+DETECT_DEEP_NAME = "elstat_detect_deep.json"
+
+
+def detect_deep_file():
+    return os.path.join(DATA_DIR, DETECT_DEEP_NAME)
+
+
+def _file_sha1(path):
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return ''
+
+
+def detect_deep_saved(template_pdf):
+    """True when the person pressed Rerun Auto-Detection for this very template: the deep pass is used from then on."""
+    try:
+        with open(detect_deep_file(), encoding='utf-8') as f:
+            data = json.load(f)
+        sha1 = data.get('sha1', '')
+        return bool(sha1) and sha1 == _file_sha1(template_pdf)
+    except Exception:
+        return False
+
+
+def set_detect_deep(template_pdf, on=True):
+    if on:
+        ensure_data_dir()
+        _write_json(detect_deep_file(), {'version': 1, 'sha1': _file_sha1(template_pdf),
+                                         'saved': datetime.datetime.now().isoformat(timespec='seconds')})
+    else:
+        try:
+            os.remove(detect_deep_file())
+        except FileNotFoundError:
+            pass
+
+
+def _overall_score(conf):
+    fields = (conf or {}).get('fields') or {}
+    return sum(f['score'] for f in fields.values()) / len(fields) if fields else 0.0
+
+
+def _merge_detections(bl, br, dl, dr):
+    """Field by field, whichever pass is surer wins - so the deep pass can only raise the confidence."""
+    wanted = [f[0] for f in MANUAL_FIELDS]
+    bf, df = br['confidence']['fields'], dr['confidence']['fields']
+    deep_rows = dr['rows']['found'] > br['rows']['found']
+    rows_rep = dr if deep_rows else br
+    items, fields, boxes, improved = {}, {}, {}, []
+    for fid in wanted:
+        b, d = bf[fid], df[fid]
+        if fid.startswith('rows'):
+            take = deep_rows
+        else:
+            take = d['score'] > b['score'] + 1e-9
+        src_l, src_f, src_r = (dl, df, dr) if take else (bl, bf, br)
+        items[fid], fields[fid] = src_l['items'][fid], src_f[fid]
+        if fid in src_r['boxes']:
+            boxes[fid] = src_r['boxes'][fid]
+        if fields[fid]['score'] > b['score'] + 1e-9:
+            improved.append({'fid': fid, 'before': b['score'], 'after': fields[fid]['score'],
+                             'why': b.get('why', ''), 'now': fields[fid].get('why', '')})
+    rep = dict(br)
+    rep['found'] = [f for f in wanted if fields[f].get('why') != 'missing']
+    rep['missing'] = [f for f in wanted if fields[f].get('why') == 'missing']
+    rep['row_ys'], rep['rows'], rep['boxes'] = rows_rep['row_ys'], rows_rep['rows'], boxes
+    rep['confidence'] = {'fields': fields, 'sections': conf_sections({f: v['score'] for f, v in fields.items()})}
+    rep['deep'] = {'before': _overall_score(br['confidence']), 'after': _overall_score(rep['confidence']),
+                   'improved': improved}
+    return {'version': 1, 'items': items, 'known': wanted}, rep
+
+
+def detect_template_fields(template_pdf, deep=None):
+    """Smart Field Detection of a blank template -> (layout, report).
+    The standard pass is always made.  When `deep` is true (None = the person pressed Rerun Auto-Detection for this
+    template before) a second pass looks for extra evidence - the writing line that really belongs to a repeated label,
+    printed cell borders, a wider search for lines, the printed number of digit boxes, the ruling of total rows,
+    looser matching of country names - and the surer result of the two is kept for every field."""
+    if deep is None:
+        deep = detect_deep_saved(template_pdf)
+    geo = _read_geometry(template_pdf)
+    try:
+        bl, br = _detect_core(template_pdf, geo, False)
+    except DetectError:
+        if not deep:
+            raise
+        bl = br = None
+        first_error = sys.exc_info()[1]
+    if not deep:
+        return bl, br
+    try:
+        dl, dr = _detect_core(template_pdf, geo, True)
+    except DetectError:
+        if br is None:
+            raise first_error
+        br['deep'] = {'before': _overall_score(br['confidence']), 'after': _overall_score(br['confidence']), 'improved': []}
+        return bl, br
+    if br is None:
+        dr['deep'] = {'before': 0.0, 'after': _overall_score(dr['confidence']), 'improved': []}
+        return dl, dr
+    return _merge_detections(bl, br, dl, dr)
 
 
 def describe_detect_report(rep, tuned=False):
@@ -2641,6 +3496,10 @@ def describe_detect_report(rep, tuned=False):
     if rows['missing']:
         lines.append(T("⚠ Χώρες χωρίς γραμμή στο template: ", "⚠ Countries without a row in the template: ")
                      + ", ".join(_pretty_target(t) for t in rows['missing']))
+    deep = rep.get('deep')
+    if deep:
+        a, b = conf_percent(deep['before']), conf_percent(deep['after'])
+        lines.append(T(f"⚡ Βαθιά ανίχνευση: εμπιστοσύνη {a}% → {b}%.", f"⚡ Deep detection: confidence {a}% → {b}%."))
     if tuned:
         lines.append(T("✎ Χρησιμοποιούνται οι προσαρμογές σας από τον επεξεργαστή.",
                        "✎ Your fine-tuning from the editor is in use."))
@@ -3036,6 +3895,28 @@ def manual_sample_values():
     return manual_field_values(sample, mon, totals)
 
 
+def real_report_inputs():
+    """Saved hotel details, own fields and the latest saved month -> (settings, mon, rows, has_data).
+    has_data is False when nothing has been saved yet (then there is nothing real to show)."""
+    settings = load_hotel_settings()
+    has_details = any(str(settings.get(k, '')).strip() for k in SETTING_KEYS)
+    for cf in load_custom_fields():
+        settings[CF_PREFIX + cf['id']] = cf['value']
+        has_details = has_details or bool(str(cf['value']).strip())
+    hist = load_history()
+    latest = max(((y, m) for y, ms in hist.items() for m in ms), default=None)
+    today = datetime.date.today()
+    y, m = latest if latest else (today.year, today.month)
+    rows = list(hist.get(y, {}).get(m, [])) if latest else []
+    rec = load_month_records().get((y, m), {})
+    last = calendar.monthrange(y, m)[1]
+    mon = dict(year=str(y), month=str(m), date_to=f"{last:02d}/{m:02d}/{y}",
+               days_of_month=str(rec.get('days') or last),
+               employees=str(rec.get('employees') or settings.get('last_employees') or '0'),
+               sign_date=today.strftime('%d/%m/%Y'))
+    return settings, mon, rows, bool(has_details or latest)
+
+
 # ---- drawing
 def _hex_rgb(color):
     try:
@@ -3375,6 +4256,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
 
     # "Smart Shift": find out where everything sits on THIS template; any failure -> default method
     layout, layout_warning, layout_info = None, None, None
+    confidence = None               # per-section / per-field recognition confidence (Smart Shift and Smart Field Detection)
     if pdf_mode == 'smart':
         layout, layout_report = analyze_template(template_pdf)
         if layout is None:
@@ -3382,6 +4264,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
                                 "Smart Shift was not applied - the default method was used.\n")
                               + describe_report(layout_report))
         else:
+            confidence = layout_report.get('confidence')
             shifts = layout_report['pages']
             biggest = max(p['max_shift'] for p in shifts)
             layout_info = T(f"Έξυπνη μετατόπιση: μέγιστη μετατόπιση {biggest:.1f} pt.",
@@ -3403,6 +4286,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
                                 "Smart Field Detection was not applied - the Legacy method (fixed coordinates) was used.\n") + str(e))
         else:
             detect_rows = detect_report['row_ys']
+            confidence = detect_report.get('confidence')
             tuned = detect_layout if detect_layout is not None else load_detect_cache()
             detect_used = tuned if tuned is not None else fresh
             n_found = len(detect_report['found'])
@@ -3597,6 +4481,20 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     if save_history:
         commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode)
 
+    if confidence:
+        view = confidence_view(confidence, manual)
+        flagged = view['flags'] if view else []
+        if flagged:
+            tail = T(f"{len(flagged)} προς έλεγχο", f"{len(flagged)} to check")
+            layout_info = (layout_info + " · " if layout_info else "") + tail
+        low = [f for f in flagged if f['level'] == 'low']       # 'missing' ones are already reported above
+        if low:
+            note = T(f"Χαμηλή βεβαιότητα αναγνώρισης ({len(low)}): " + ", ".join(f['label'] for f in low[:6])
+                     + ". Δείτε τις επισημασμένες περιοχές στην προεπισκόπηση.",
+                     f"Low recognition confidence ({len(low)}): " + ", ".join(f['label'] for f in low[:6])
+                     + ". See the highlighted areas in the preview.")
+            layout_warning = (layout_warning + "\n" if layout_warning else "") + note
+
     computed = (totals['9']['clients'], totals['9']['nights'])
     try:        # the real values of every field (used by the temporary layout editor of the preview)
         live_values = manual_field_values(settings_data, monthly_data, totals)
@@ -3620,7 +4518,7 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary,
             'layout_warning': layout_warning, 'layout_info': layout_info, 'pdf_data': pdf_data,
             'live_values': live_values, 'layout_used': copy.deepcopy(manual) if manual is not None else None,
-            'detect_report': detect_report, 'pdf_mode_used': pdf_mode}
+            'detect_report': detect_report, 'pdf_mode_used': pdf_mode, 'confidence': confidence}
 
 
 # ----------------------------------------------------------------- look & feel
@@ -3925,6 +4823,7 @@ class HistoryChart(tk.Canvas):
         self.prev, self.prev_label, self.hover = None, "", None
         self.on_pick = on_pick
         self._slots = []
+        self._pos = {}
         self.bind('<Configure>', lambda e: self.draw())
         self.bind('<Button-1>', self._click)
         self.bind('<Motion>', self._motion)
@@ -3950,6 +4849,14 @@ class HistoryChart(tk.Canvas):
     def _fmt(v):
         return fmt_int(round(v))
 
+    @staticmethod
+    def _axis(v):
+        if v >= 1_000_000:
+            return f"{v / 1_000_000:g}M"
+        if v >= 10_000:
+            return f"{v / 1000:g}k"
+        return fmt_int(round(v)) if v >= 100 else f"{v:g}"
+
     def draw(self):
         self.delete('all')
         self._slots = []
@@ -3963,35 +4870,40 @@ class HistoryChart(tk.Canvas):
         if self.prev:     # legend
             self.create_line(w - right - 150, 14, w - right - 134, 14, fill='#f59e0b', width=3)
             self.create_text(w - right - 128, 14, text=self.prev_label, anchor="w", fill=MUTED, font=(FONT, 8))
-        for frac in (0, .5, 1):
+        for frac in ((0, .25, .5, .75, 1) if plot_h >= 150 else (0, .5, 1)):
             y = top + plot_h * (1 - frac)
             self.create_line(left, y, w - right, y, fill=GRID)
-            self.create_text(left - 8, y, text=self._fmt(top_val * frac), anchor="e", fill=MUTED, font=(FONT, 8))
-        slot = (w - left - right) / 12
-        bw = slot * 0.6
-        for i, v in enumerate(self.values):
-            cx = left + slot * (i + .5)
+            self.create_text(left - 8, y, text=self._axis(top_val * frac), anchor="e", fill=MUTED, font=(FONT, 8))
+        shown = [i for i in range(12) if self.values[i] > 0 or (self.prev and self.prev[i] > 0)]
+        if not shown:
+            self.create_text((left + w - right) / 2, top + plot_h / 2, text=T("Δεν υπάρχουν δεδομένα", "No data"),
+                             fill=MUTED, font=(FONT, 10))
+            return
+        slot = (w - left - right) / len(shown)
+        bw = min(slot * 0.6, 56)
+        self._pos = {}
+        small = slot < 44                                    # too narrow for a label on every bar
+        for k, i in enumerate(shown):
+            cx = left + slot * (k + .5)
+            self._pos[i + 1] = (cx, slot)
+            v = self.values[i]
             if self.hover == i + 1:
-                self.create_rectangle(cx - slot / 2 + 2, top - 6, cx + slot / 2 - 2, top + plot_h + 2,
-                                      fill=TRACK, outline='')
-        for i, v in enumerate(self.values):
-            cx = left + slot * (i + .5)
+                hw = bw / 2 + 4
+                self.create_rectangle(cx - hw, top - 6, cx + hw, top + plot_h + 2, fill=TRACK, outline='')
             if v > 0:
                 y0 = top + plot_h * (1 - v / top_val)
-                fill = NAVY if self.selected == i + 1 else self.color
+                fill = ACCENT_DARK if self.selected == i + 1 else self.color
                 self.create_rectangle(cx - bw / 2, y0, cx + bw / 2, top + plot_h, fill=fill, outline='')
-                self.create_text(cx, y0 - 8, text=self._fmt(v), fill=TEXT, font=(FONT, 8))
-            else:
-                self.create_line(cx - bw / 2, top + plot_h - 1, cx + bw / 2, top + plot_h - 1,
-                                 fill=TICK, width=2)
+                if not small or self.hover == i + 1:
+                    self.create_text(cx, y0 - 8, text=self._fmt(v), fill=TEXT, font=(FONT, 8))
             pv = self.prev[i] if self.prev else 0
             if pv > 0:
                 yp = top + plot_h * (1 - pv / top_val)
                 self.create_line(cx - bw / 2 - 3, yp, cx + bw / 2 + 3, yp, fill='#f59e0b', width=3)
-            if v > 0 or pv > 0:
-                self._slots.append((cx - slot / 2, cx + slot / 2, i + 1))
+            hw = min(slot / 2, bw / 2 + 6)
+            self._slots.append((cx - hw, cx + hw, i + 1))
             self.create_text(cx, h - 12, text=month_short(i + 1), fill=MUTED, font=(FONT, 8))
-        if self.hover:
+        if self.hover and self.hover in self._pos and self.prev:   # only worth a tooltip when it adds the comparison
             self._tooltip(self.hover, left, slot, top)
 
     def _tooltip(self, month, left, slot, top):
@@ -4002,15 +4914,17 @@ class HistoryChart(tk.Canvas):
             lines.append(f"{self.prev_label}: {self._fmt(pv)}")
             if pv > 0:
                 lines.append(f"{fmt_dec((v - pv) / pv * 100, signed=True)}%")
-        cx = left + slot * (month - .5)
+        cx, slot = self._pos[month]
         w = self.winfo_width()
-        tw = 150
-        x = cx + slot / 2 + 4
+        tw = max(110, 8 * max(len(l) for l in lines) + 20)
+        half = min(slot / 2, 40)
+        x = cx + half + 4
         if x + tw > w - 4:
-            x = cx - slot / 2 - 4 - tw
+            x = cx - half - 4 - tw
+        x = max(4, min(x, w - tw - 4))
         y = top - 4
-        self.create_rectangle(x, y, x + tw, y + 14 * len(lines) + 10, fill=TIP_BG, outline='')
-        self.create_text(x + 8, y + 6, text="\n".join(lines), anchor="nw", fill=TIP_FG,
+        self.create_rectangle(x, y, x + tw, y + 14 * len(lines) + 10, fill=HEAD_BG, outline=ACCENT)
+        self.create_text(x + 8, y + 6, text="\n".join(lines), anchor="nw", fill=TEXT,
                          font=(FONT, 9), justify="left")
 
     def _month_at(self, x):
@@ -4204,18 +5118,18 @@ def setup_styles(root):
 #              tip / warn callout, go link  ('tab:<name>' opens a tab, 'sec:<id>' another section).
 MANUAL = [
     dict(id='start', title=("Γρήγορη εκκίνηση", "Quick start"), blocks=[
-        ('p', ("Το πρόγραμμα παίρνει το αρχείο Excel που βγάζει το Protel και συμπληρώνει αυτόματα το μηνιαίο "
+        ('p', ("Το πρόγραμμα παίρνει το αρχείο Excel (ή CSV) που βγάζει το Protel και συμπληρώνει αυτόματα το μηνιαίο "
                "δελτίο της ΕΛΣΤΑΤ σε PDF. Ο μήνας ολοκληρώνεται σε πέντε βήματα:",
-               "The program takes the Excel file that Protel produces and fills in the monthly ELSTAT form as a PDF "
+               "The program takes the Excel (or CSV) file that Protel produces and fills in the monthly ELSTAT form as a PDF "
                "automatically. A month takes five steps:")),
         ('live', 'next'),
         ('step', ("Την πρώτη φορά, ανοίξτε την καρτέλα **Στοιχεία ξενοδοχείου** και συμπληρώστε τα στοιχεία σας. "
                   "Γίνεται μία φορά και το πρόγραμμα τα θυμάται.",
                   "The first time, open the **Hotel details** tab and fill in your details. You do this once; "
                   "the program remembers them.")),
-        ('step', ("Στην καρτέλα **Δελτίο μήνα**, σύρτε το Excel του μήνα μέσα στο πλαίσιο του Βήματος 1 ή πατήστε "
+        ('step', ("Στην καρτέλα **Δελτίο μήνα**, σύρτε το Excel ή CSV του μήνα μέσα στο πλαίσιο του Βήματος 1 ή πατήστε "
                   "πάνω του για να το διαλέξετε.",
-                  "In the **Monthly form** tab, drop the month's Excel into the box in Step 1, or click it to choose the file.")),
+                  "In the **Monthly form** tab, drop the month's Excel or CSV into the box in Step 1, or click it to choose the file.")),
         ('step', ("Ελέγξτε τα **Στοιχεία του μήνα** (Βήμα 2). Τα περισσότερα συμπληρώνονται μόνα τους - εσείς "
                   "πληκτρολογείτε μόνο το **Σύνολο εργαζομένων**.",
                   "Check the **Month details** (Step 2). Most are filled in for you - you only type the **Total employees**.")),
@@ -4236,7 +5150,7 @@ MANUAL = [
         ('h', ("Έλεγχοι", "Checks")),
         ('live', 'status'),
         ('h', ("Γρήγορες ενέργειες", "Quick actions")),
-        ('act', ("Επιλογή Excel του μήνα", "Choose the month's Excel"), 'choose_excel'),
+        ('act', ("Επιλογή Excel / CSV του μήνα", "Choose the month's Excel / CSV"), 'choose_excel'),
         ('act', ("Άνοιγμα του επεξεργαστή διάταξης", "Open the layout editor"), 'open_editor'),
         ('act', ("Άνοιγμα του φακέλου δεδομένων", "Open the data folder"), 'open_data'),
         ('act', ("Αντίγραφο ασφαλείας (.zip)…", "Backup (.zip)…"), 'backup'),
@@ -4255,16 +5169,16 @@ MANUAL = [
         ('p', ("Η καρτέλα που θα χρησιμοποιείτε κάθε μήνα. Έχει τρία βήματα και, κάτω, τα κουμπιά δημιουργίας.",
                "The tab you will use every month. It has three steps and, at the bottom, the create buttons.")),
         ('h', ("Βήμα 1 - Αρχείο από το Protel", "Step 1 - File from Protel")),
-        ('p', ("Το αρχείο που χρειάζεται λέγεται «Nationalities Statistics» και βγαίνει από το Protel ως .xls ή .xlsx. "
+        ('p', ("Το αρχείο που χρειάζεται λέγεται «Nationalities Statistics» και βγαίνει από το Protel ως .xls, .xlsx ή .csv. "
                "Μπορείτε να το διαλέξετε με όποιον τρόπο σας βολεύει:",
-               "The file you need is called “Nationalities Statistics” and comes from Protel as .xls or .xlsx. "
+               "The file you need is called “Nationalities Statistics” and comes from Protel as .xls, .xlsx or .csv. "
                "Choose it whichever way suits you:")),
         ('li', ("Σύρτε το πάνω στο διακεκομμένο πλαίσιο (ή πάνω σε ολόκληρη την κάρτα).",
                 "Drop it onto the dashed box (or anywhere on the card).")),
-        ('li', ("Πατήστε το πλαίσιο ή το κουμπί **Επιλογή Excel…** (`Ctrl+O`).",
-                "Click the box or the **Choose Excel…** button (`Ctrl+O`).")),
-        ('li', ("Πατήστε **Πιο πρόσφατο** για να διαλέξει το πρόγραμμα το νεότερο Excel από τον φάκελο που χρησιμοποιήσατε τελευταία.",
-                "Click **Latest** and the program picks the newest Excel in the folder you used last.")),
+        ('li', ("Πατήστε το πλαίσιο ή το κουμπί **Επιλογή Excel / CSV…** (`Ctrl+O`).",
+                "Click the box or the **Choose Excel / CSV…** button (`Ctrl+O`).")),
+        ('li', ("Πατήστε **Πιο πρόσφατο** για να διαλέξει το πρόγραμμα το νεότερο Excel ή CSV από τον φάκελο που χρησιμοποιήσατε τελευταία.",
+                "Click **Latest** and the program picks the newest Excel or CSV in the folder you used last.")),
         ('li', ("Ή γράψτε / επικολλήστε τη διαδρομή του αρχείου στο πεδίο.",
                 "Or type / paste the file path into the field.")),
         ('p', ("Μόλις διαλέξετε αρχείο, το πρόγραμμα το διαβάζει: δείχνει την περίοδο που βρήκε και έναν πίνακα με τις χώρες. "
@@ -4392,9 +5306,9 @@ MANUAL = [
                 "**Backup (.zip)…** saves all the data into one file.")),
         ('tip', ("Διαλέξτε έναν φάκελο μέσα στο OneDrive ή σε άλλη υπηρεσία συγχρονισμού και θα έχετε αυτόματο αντίγραφο ασφαλείας.",
                  "Pick a folder inside OneDrive or another sync service and you get an automatic backup.")),
-        ('h', ("Αρχεία Excel από το Protel", "Excel files from Protel")),
-        ('p', ("Από ποιον φάκελο ξεκινούν τα **Επιλογή Excel…** και **Πιο πρόσφατο**. Κενό σημαίνει ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
-               "The folder where **Choose Excel…** and **Latest** start. Empty means the folder of the last Excel you used.")),
+        ('h', ("Αρχεία Excel / CSV από το Protel", "Excel / CSV files from Protel")),
+        ('p', ("Από ποιον φάκελο ξεκινούν τα **Επιλογή Excel / CSV…** και **Πιο πρόσφατο**. Κενό σημαίνει ο φάκελος του τελευταίου αρχείου που χρησιμοποιήσατε.",
+               "The folder where **Choose Excel / CSV…** and **Latest** start. Empty means the folder of the last file you used.")),
         ('h', ("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in")),
         ('p', ("Υπάρχουν τέσσερις τρόποι. Η **Παλιά μέθοδος** είναι η δοκιμασμένη· η **Έξυπνη μετατόπιση** και η **Έξυπνη "
                "ανίχνευση πεδίων** μπορεί περιστασιακά να αποτύχουν, οπότε το δελτίο φτιάχνεται με την παλιά μέθοδο και "
@@ -4443,6 +5357,16 @@ MANUAL = [
                 "γιατί η ανίχνευση αυτού του δελτίου είναι ήδη οριστική.",
                 "**Final verification preview** (when you press “Create PDF” and the preview is on): a last look at the filled form. "
                 "It has **Edit layout…** (temporary, for this form only) but NOT rerun detection, because the detection of this form is already final.")),
+        ('h', ("Βεβαιότητα αναγνώρισης", "Recognition confidence")),
+        ('p', ("Η Έξυπνη μετατόπιση και η Έξυπνη ανίχνευση πεδίων δείχνουν πόσο σίγουρο είναι το πρόγραμμα για κάθε ενότητα του δελτίου "
+               "(Στοιχεία καταλύματος, Πεδία ημερομηνιών, Πίνακας χωρών, Σύνολα). Οι θέσεις που αξίζει να ελέγξετε εμφανίζονται σε λίστα και "
+               "σημειώνονται στη σελίδα με πορτοκαλί (έλεγχος) ή κόκκινο (χαμηλή βεβαιότητα) περίγραμμα και το ποσοστό τους. "
+               "Αν μετακινήσετε μια θέση στον επεξεργαστή διάταξης, θεωρείται ελεγμένη και η βεβαιότητα ανεβαίνει. Το 100% εμφανίζεται μόνο "
+               "όταν τίποτα δεν αμφισβητείται.",
+               "Smart Shift and Smart Field Detection show how sure the program is about each section of the form (Hotel information, "
+               "Date fields, Country table, Totals). The positions worth checking are listed and outlined on the page - amber (check) or "
+               "red (low confidence) - together with their percentage. If you move a position in the layout editor it counts as checked "
+               "and the confidence goes up. 100% is only shown when nothing at all is in doubt.")),
         ('h', ("Αυτόματη προσυμπλήρωση του προτύπου χειροκίνητης διάταξης", "Auto-populate manual layout template")),
         ('p', ("Ενεργό (προεπιλογή): ο επεξεργαστής διάταξης ανοίγει με τα στοιχεία τοποθετημένα όπως θα τα έβαζε ο επιλεγμένος τρόπος "
                "(παλιά μέθοδος, Έξυπνη μετατόπιση ή Έξυπνη ανίχνευση). Ανενεργό: ανοίγει εντελώς κενός καμβάς. Μια χειροκίνητη διάταξη "
@@ -4636,8 +5560,8 @@ MANUAL = [
     dict(id='dnd', title=("Μεταφορά αρχείων (drag & drop)", "Drag and drop"), blocks=[
         ('p', ("Μπορείτε να σέρνετε αρχεία και φακέλους από τον Εξερευνητή μέσα στο πρόγραμμα. Ένα αρχείο κάθε φορά.",
                "You can drag files and folders from the file explorer into the program. One file at a time.")),
-        ('li', ("**Excel** (.xls / .xlsx) → το πλαίσιο ή η κάρτα του Βήματος 1.",
-                "**Excel** (.xls / .xlsx) → the box or card in Step 1.")),
+        ('li', ("**Excel / CSV** (.xls / .xlsx / .csv) → το πλαίσιο ή η κάρτα του Βήματος 1.",
+                "**Excel / CSV** (.xls / .xlsx / .csv) → the box or card in Step 1.")),
         ('li', ("**PDF** → η κάρτα του template (Στοιχεία ξενοδοχείου) ή η κάρτα του Βήματος 3 (ορίζει αυτό το υπάρχον αρχείο ως έξοδο).",
                 "**PDF** → the template card (Hotel details) or the Step 3 card (sets that existing file as the output).")),
         ('li', ("**Φάκελος** → τα πεδία φακέλων στις Ρυθμίσεις (φάκελος PDF, φάκελος Excel, φάκελος δεδομένων).",
@@ -4650,7 +5574,7 @@ MANUAL = [
     dict(id='shortcuts', title=("Συντομεύσεις", "Shortcuts"), blocks=[
         ('p', ("Γρήγοροι τρόποι για τα πιο συχνά βήματα.", "Quick ways to do the most common steps.")),
         ('h', ("Παντού", "Everywhere")),
-        ('kb', ("{sc:open_excel}", ("Επιλογή αρχείου Excel", "Choose the Excel file"))),
+        ('kb', ("{sc:open_excel}", ("Επιλογή αρχείου Excel ή CSV", "Choose the Excel or CSV file"))),
         ('kb', ("{sc:generate}", ("Δημιουργία PDF", "Create PDF"))),
         ('kb', ("{sc:generate_print}", ("Δημιουργία & Εκτύπωση", "Create & Print"))),
         ('kb', ("{sc:help}", ("Άνοιγμα του οδηγού στην ενότητα της τρέχουσας καρτέλας", "Open this guide at the section for the current tab"))),
@@ -5556,6 +6480,99 @@ class ShortcutDialog(tk.Toplevel):
         self.destroy()
 
 
+class ConfidencePanel(tk.Frame):
+    """Side panel of the previews: a bar and a percentage for every section of the form, then the list of positions
+    that need checking.  Picking one in the list (or clicking a section) shows it on the page, outlined."""
+    WIDTH = 256
+
+    def __init__(self, parent, on_pick, on_toggle=None, list_height=6):
+        super().__init__(parent, bg=CARD)
+        self.on_pick, self.on_toggle = on_pick, on_toggle
+        self._view = None
+        self._busy = False
+        self.show_var = tk.BooleanVar(value=True)
+        tk.Label(self, text=T("Βεβαιότητα αναγνώρισης", "Recognition confidence"), bg=CARD, fg=NAVY,
+                 font=(FONT, 10, 'bold')).pack(anchor="w", padx=12, pady=(12, 4))
+        self.rows = tk.Frame(self, bg=CARD)
+        self.rows.pack(fill="x", padx=12)
+        self.hint = tk.Label(self, text="", bg=CARD, fg=MUTED, font=(FONT, 9), justify="left", wraplength=self.WIDTH + 20)
+        self.hint.pack(anchor="w", padx=12, pady=(8, 2))
+        tk.Checkbutton(self, text=T("Επισήμανση στη σελίδα", "Highlight on the page"), variable=self.show_var,
+                       command=self._toggled, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT,
+                       selectcolor=FIELD, font=(FONT, 9), anchor="w").pack(anchor="w", padx=8)
+        box = tk.Frame(self, bg=CARD)
+        box.pack(fill="both", expand=True, padx=8, pady=(2, 6))
+        self.tree = ttk.Treeview(box, show='tree', selectmode='browse', height=list_height)
+        self.tree.column('#0', width=self.WIDTH, minwidth=200, stretch=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure('check', foreground=WARN)
+        self.tree.tag_configure('low', foreground=BAD)
+        self.tree.bind('<<TreeviewSelect>>', self._selected)
+        self.detail = tk.Label(self, text="", bg=CARD, fg=TEXT, font=(FONT, 9), justify="left", wraplength=self.WIDTH + 20)
+        self.detail.pack(anchor="w", padx=12, pady=(0, 8))
+
+    @staticmethod
+    def level_color(level):
+        return {'ok': GOOD, 'check': WARN, 'low': BAD, 'missing': BAD}.get(level, MUTED)
+
+    def update_view(self, view):
+        self._view = view
+        for child in self.rows.winfo_children():
+            child.destroy()
+        self._busy = True
+        self.tree.delete(*self.tree.get_children())
+        self.detail.configure(text="")
+        if not view:
+            self.hint.configure(text=T("Η διάταξη ορίστηκε χειροκίνητα - δεν υπάρχει αυτόματη αναγνώριση να αξιολογηθεί.",
+                                       "The layout was set by hand - there is no automatic recognition to rate."))
+            self._busy = False
+            return
+        for sec in view['sections']:
+            color = self.level_color(sec['level'])
+            row = tk.Frame(self.rows, bg=CARD, cursor='hand2' if sec['weak'] else '')
+            row.pack(fill="x", pady=(0, 5))
+            top = tk.Frame(row, bg=CARD)
+            top.pack(fill="x")
+            tk.Label(top, text=T(*sec['name']), bg=CARD, fg=TEXT, font=(FONT, 9)).pack(side="left")
+            weak = ("  ⚠ " + str(len(sec['weak']))) if sec['weak'] else ""
+            tk.Label(top, text=f"{sec['pct']}%{weak}", bg=CARD, fg=color, font=(FONT, 9, 'bold')).pack(side="right")
+            bar = tk.Canvas(row, width=self.WIDTH, height=6, bg=TRACK, highlightthickness=0)
+            bar.pack(fill="x")
+            bar.create_rectangle(0, 0, int(self.WIDTH * sec['pct'] / 100.0), 6, fill=color, outline="")
+            if sec['weak']:
+                for w in (row, top, bar) + tuple(top.winfo_children()):
+                    w.bind('<Button-1>', lambda e, s=sec: self.on_pick(s['weak'][0]) or self._select(s['weak'][0]))
+        for f in view['flags']:
+            icon = '✗' if f['level'] in ('low', 'missing') else '⚠'
+            self.tree.insert('', 'end', iid=f['fid'], text=f"{icon}  {f['label']} · {f['pct']}%",
+                             tags=('low' if f['level'] in ('low', 'missing') else 'check',))
+        self.hint.configure(text=T("Κάντε κλικ σε μια θέση για να τη δείτε στη σελίδα.", "Click a position to see it on the page.")
+                            if view['flags'] else T("✓ Τίποτα δεν χρειάζεται έλεγχο.", "✓ Nothing needs checking."))
+        self._busy = False
+
+    def _select(self, fid):
+        if self.tree.exists(fid):
+            self._busy = True
+            self.tree.selection_set(fid)
+            self.tree.see(fid)
+            self._busy = False
+
+    def _selected(self, _event=None):
+        sel = self.tree.selection()
+        if sel and not self._busy:
+            self.on_pick(sel[0])
+
+    def set_detail(self, flag):
+        self.detail.configure(text=f"{flag['label']}: {conf_why(flag['why'])}")
+
+    def _toggled(self):
+        if self.on_toggle:
+            self.on_toggle(self.show_var.get())
+
+
 class PDFPreviewDialog(tk.Toplevel):
     """In-app preview of the PDF that is about to be made. Nothing has been saved yet:
 
@@ -5574,9 +6591,14 @@ class PDFPreviewDialog(tk.Toplevel):
     MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
 
     def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None, get_live=None,
-                 base_layout=None):
+                 base_layout=None, get_confidence=None):
         super().__init__(parent)
         self._base_layout = base_layout     # -> the layout "Edit layout" starts from (what this PDF was made with)
+        self._get_conf = get_confidence     # -> confidence_view(...) of what is shown, or None (no recognition involved)
+        self._conf_view = None
+        self._conf_sel = None               # the uncertain item picked in the side list
+        self._conf_show = True              # draw the highlights
+        self.conf_panel = None
         self.app = parent
         self.pdf_path = pdf_path
         self.template = template_path
@@ -5754,7 +6776,95 @@ class PDFPreviewDialog(tk.Toplevel):
                    command=self._close).pack(side="right", padx=8)
 
     def _build_side(self):
-        pass
+        # Recognition confidence per section + the positions that need a look (only when a way of filling
+        # that recognises the template was used)
+        if not self._get_conf:
+            return
+        self._conf_view = self._safe_conf()
+        if self._conf_view is None:
+            return
+        side = tk.Frame(self, bg=BORDER)
+        side.pack(side="left", fill="y", padx=(14, 0), pady=(4, 10))
+        inner = tk.Frame(side, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self.conf_panel = ConfidencePanel(inner, self._conf_pick, self._conf_toggle)
+        self.conf_panel.pack(fill="both", expand=True)
+        self.conf_panel.update_view(self._conf_view)
+
+    # ---- recognition confidence: list, highlights
+    def _safe_conf(self):
+        if not self._get_conf:
+            return None
+        try:
+            return self._get_conf()
+        except Exception:
+            return None
+
+    def _refresh_confidence(self):
+        self._conf_view = self._safe_conf()
+        if self._conf_sel and not any(f['fid'] == self._conf_sel for f in (self._conf_view or {}).get('flags', [])):
+            self._conf_sel = None
+        if self.conf_panel is not None:
+            self.conf_panel.update_view(self._conf_view)
+
+    def _conf_toggle(self, on):
+        self._conf_show = bool(on)
+        self._draw()
+
+    def _conf_pick(self, fid):
+        """An uncertain item was chosen in the list: show it on the page."""
+        flag = next((f for f in (self._conf_view or {}).get('flags', []) if f['fid'] == fid), None)
+        if not flag:
+            return
+        self._conf_sel = fid
+        if self.conf_panel is not None:
+            self.conf_panel.set_detail(flag)
+        page = flag.get('page')
+        if page is None:                                    # not found at all: nothing to point at
+            self._draw()
+            return
+        if self.page_seg is not None and page != self.page:
+            self.page_seg.set(page, True)
+        else:
+            self._draw()
+        self.after(40, lambda f=flag: self._conf_scroll_to(f))
+
+    def _conf_scroll_to(self, flag):
+        box = flag.get('box') or flag.get('band')
+        try:
+            if not box or flag.get('page') != self.page:
+                return
+            z, ph = self.zoom, self.sizes[self.page][1]
+            cx = self.ox + (box[0] + box[2]) / 2.0 * z
+            cy = self.oy + (ph - (box[1] + box[3]) / 2.0) * z
+            self.cv.xview_moveto(max(0.0, (cx - self.cv.winfo_width() / 2.0) / self._sw))
+            self.cv.yview_moveto(max(0.0, (cy - self.cv.winfo_height() / 2.0) / self._sh))
+        except tk.TclError:
+            pass
+
+    def _draw_confidence(self):
+        """Outlines (amber = please check, red = low) with the percentage, around every uncertain position."""
+        view = self._conf_view
+        if not view or not self._conf_show:
+            return
+        cv, z, ph = self.cv, self.zoom, self.sizes[self.page][1]
+        for f in view['flags']:
+            if f.get('page') != self.page:
+                continue
+            geo = f.get('box') or f.get('band')
+            if not geo:
+                continue
+            color = '#dc2626' if f['level'] in ('low', 'missing') else '#f59e0b'
+            x0, y0, x1, y1 = geo
+            cx0, cx1 = self.ox + x0 * z - 3, self.ox + x1 * z + 3
+            cy0, cy1 = self.oy + (ph - y1) * z - 3, self.oy + (ph - y0) * z + 3
+            sel = f['fid'] == self._conf_sel
+            cv.create_rectangle(cx0, cy0, cx1, cy1, outline=color, width=4 if sel else 2,
+                                dash=() if f.get('box') else (6, 4), tags='conf')
+            text = f"{f['pct']}%"
+            tw = 10 + 6 * len(text)
+            cv.create_rectangle(cx1 - tw, cy0 - 14, cx1, cy0, fill=color, outline=color, tags='conf')
+            cv.create_text(cx1 - tw / 2.0, cy0 - 7, text=text, fill='white', font=(FONT, 8, 'bold'), tags='conf')
 
     def _resolve_base_layout(self):
         if self._base_layout:
@@ -5816,6 +6926,7 @@ class PDFPreviewDialog(tk.Toplevel):
                                   "You can open the PDF externally and then continue."))
         cv.create_rectangle(self.ox, self.oy, self.ox + w, self.oy + h, outline=ZONE_IDLE_LINE)
         self.zoom_lbl.configure(text=f"{round(z * 100)}%")
+        self._draw_confidence()
 
     def _on_canvas_configure(self, event):
         if self._fit_pending and event.width > 300 and event.height > 200:
@@ -5969,6 +7080,7 @@ class PDFPreviewDialog(tk.Toplevel):
         self._pages.clear()
         self._read_pdf()
         self._update_edit_state()
+        self._refresh_confidence()
         self._draw()
         return True
 
@@ -6021,6 +7133,8 @@ class DetectInspectDialog(PDFPreviewDialog):
         self.tuned = detect_cache_saved()
         self._marker_fid = None
         self._detect_editor = None
+        self.data_mode = 'sample'              # 'sample' (made-up) | 'real' (saved details + latest month)
+        self.real_month = None
         self.tmp_dir = tempfile.mkdtemp(prefix='elstat_detect_')
         pdf_path = os.path.join(self.tmp_dir, "ELSTAT_detection_test.pdf")
         try:
@@ -6028,15 +7142,29 @@ class DetectInspectDialog(PDFPreviewDialog):
         except Exception:
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
             raise
-        super().__init__(app, pdf_path, template_path, None, on_close=self._cleanup)
+        super().__init__(app, pdf_path, template_path, None, on_close=self._cleanup,
+                         get_confidence=self._conf_for_detect)
         self.title(T("Έξυπνη ανίχνευση πεδίων - έλεγχος", "Smart Field Detection - inspect"))
-        self.render_note.configure(text=T("● Δείγμα δεδομένων - δεν είναι πραγματικό δελτίο", "● Sample data - not a real report"))
+        self._update_note()
         self._fill_list()
 
-    # ---- the test render (made-up hotel and month, every country row filled)
+    def _update_note(self):
+        if self.data_mode == 'real':
+            m = self.real_month
+            when = f" ({m[1]:02d}/{m[0]})" if m else ""
+            self.render_note.configure(text=T(f"● Πραγματικά δεδομένα{when} - δεν δημιουργείται δελτίο",
+                                              f"● Real saved data{when} - no report is made"))
+        else:
+            self.render_note.configure(text=T("● Δείγμα δεδομένων - δεν είναι πραγματικό δελτίο", "● Sample data - not a real report"))
+
+    # ---- the test render (made-up data, or the saved hotel details and latest month)
     def _render(self, template_path, pdf_path, override):
-        sample, mon = manual_sample_inputs()
-        rows = [(name, 1234, 5678) for name in sorted(MAPPED_TARGETS)]
+        if self.data_mode == 'real':
+            sample, mon, rows, _has = real_report_inputs()
+            self.real_month = (int(mon['year']), int(mon['month']))
+        else:
+            sample, mon = manual_sample_inputs()
+            rows = [(name, 1234, 5678) for name in sorted(MAPPED_TARGETS)]
         res = process_elstat_report(None, template_path, pdf_path, sample, mon, rows_override=rows,
                                     save_history=False, pdf_mode='detect', detect_layout=override)
         if res.get('pdf_mode_used') != 'detect':
@@ -6046,16 +7174,24 @@ class DetectInspectDialog(PDFPreviewDialog):
     def _cleanup(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
+    def _conf_for_detect(self):
+        return confidence_view((self.report or {}).get('confidence'), self.work_layout) if self.report else None
+
     # ---- parts of the base dialog that differ here
     def _header_texts(self):
         return (T("Έξυπνη ανίχνευση πεδίων - έλεγχος", "Smart Field Detection - inspect"),
-                T("Δείτε τι βρέθηκε στο άδειο template και πώς χωράνε δείγματα δεδομένων · δεν δημιουργείται πραγματικό δελτίο",
-                  "See what was found on the blank template and how sample data fits · no real report is made here"))
+                T("Δείτε τι βρέθηκε στο άδειο template και πώς χωράνε δείγματα ή πραγματικά δεδομένα · δεν δημιουργείται πραγματικό δελτίο",
+                  "See what was found on the blank template and how sample or real data fits · no real report is made here"))
 
     def _build_toolbar_right(self, bar):
         right = ttk.Frame(bar)
         right.pack(side="right")
         self.edit_chip = self.discard_btn = self.edit_btn = None
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=14)
+        ttk.Label(bar, text=T("Δεδομένα:", "Data:")).pack(side="left", padx=(0, 6))
+        self.data_seg = Segmented(bar, (('sample', T("Δείγμα", "Sample")), ('real', T("Πραγματικά", "Real"))),
+                                  self._on_data_mode, self.data_mode)
+        self.data_seg.pack(side="left")
         self.rerun_btn = ttk.Button(right, text=T("🔄 Επανάληψη ανίχνευσης", "🔄 Rerun Auto-Detection"), command=self._rerun)
         self.rerun_btn.pack(side="left", padx=(0, 8))
         self.open_editor_btn = ttk.Button(right, text=T("Άνοιγμα στον επεξεργαστή διάταξης…", "Open in Layout Editor…"),
@@ -6075,13 +7211,15 @@ class DetectInspectDialog(PDFPreviewDialog):
         side.pack(side="left", fill="y", padx=(14, 0), pady=(4, 10))
         inner = ttk.Frame(side, style='Card.TFrame')
         inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self.conf_panel = ConfidencePanel(inner, self._conf_pick, self._conf_toggle, list_height=4)
+        self.conf_panel.pack(fill="x")
         self.summary_var = tk.StringVar()
         ttk.Label(inner, textvariable=self.summary_var, style='CardHint.TLabel', justify="left",
                   wraplength=290).pack(anchor="w", padx=12, pady=(12, 6))
         box = ttk.Frame(inner, style='Card.TFrame')
         box.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         ttk.Style(self).configure('Detect.Treeview', rowheight=24)
-        self.tree = ttk.Treeview(box, show='tree', selectmode='browse', height=16, style='Detect.Treeview')
+        self.tree = ttk.Treeview(box, show='tree', selectmode='browse', height=8, style='Detect.Treeview')
         self.tree.column('#0', width=300, minwidth=220, stretch=True)
         sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -6095,6 +7233,7 @@ class DetectInspectDialog(PDFPreviewDialog):
                   wraplength=290).pack(anchor="w", padx=12, pady=(0, 12))
 
     def _fill_list(self):
+        self._refresh_confidence()
         self.tree.delete(*self.tree.get_children())
         items = self.work_layout['items']
         placed = {}
@@ -6112,6 +7251,7 @@ class DetectInspectDialog(PDFPreviewDialog):
         text_ = describe_detect_report(self.report, self.tuned)
         if self.warning:
             text_ += "\n" + self.warning
+        text_ += getattr(self, '_rerun_detail', '')
         self.summary_var.set(text_)
 
     def _on_pick(self, _event=None):
@@ -6168,11 +7308,15 @@ class DetectInspectDialog(PDFPreviewDialog):
         except OSError:
             pass
         delete_detect_cache()
+        was_deep = detect_deep_saved(self.template)
+        set_detect_deep(self.template, True)        # from now on this template is scanned with the deep pass
         self.config(cursor='watch')
         self.update_idletasks()
         try:
             self._render(self.template, self.pdf_path, None)
         except Exception as e:
+            if not was_deep:
+                set_detect_deep(self.template, False)
             if backup is not None:          # nothing was lost: put the fine-tuning back
                 try:
                     with open(detect_layout_file(), 'wb') as f:
@@ -6186,6 +7330,46 @@ class DetectInspectDialog(PDFPreviewDialog):
         self.tuned = False
         self._marker_fid = None
         self._refresh_pdf()
+        self._report_rerun(title)
+
+    def _report_rerun(self, title):
+        """Quiet feedback: a short note in the status bar that fades by itself - no pop-up to close."""
+        deep = (self.report or {}).get('deep')
+        if not deep:
+            return
+        a, b = conf_percent(deep['before']), conf_percent(deep['after'])
+        n = len(deep['improved'])
+        view = confidence_view(self.report.get('confidence'), self.work_layout) or {'flags': []}
+        left = len(view['flags'])
+        if n:
+            msg = T(f"✓ Εμπιστοσύνη {a}% → {b}% · βελτιώθηκαν {n} πεδία", f"✓ Confidence {a}% → {b}% · {n} field{'s' if n != 1 else ''} improved")
+        else:
+            msg = T(f"✓ Εμπιστοσύνη {b}% - δεν υπάρχει κάτι ακόμα να βελτιωθεί αυτόματα",
+                    f"✓ Confidence {b}% - nothing more to improve automatically")
+        if left:
+            msg += T(f" · {left} προς έλεγχο", f" · {left} to check")
+        # the details stay in the left panel, for anyone who wants them
+        detail = [f"{manual_label(f['fid'], {}, None)}: {conf_percent(f['before'])}% → {conf_percent(f['after'])}%"
+                  for f in sorted(deep['improved'], key=lambda f: f['before'])[:6]]
+        self._rerun_detail = ("\n" + T("Βελτιώθηκαν: ", "Improved: ") + " · ".join(detail)) if detail else ""
+        self._fill_list()
+        self._toast(msg)
+
+    def _toast(self, text, ms=6000):
+        try:
+            if getattr(self, '_toast_job', None):
+                self.after_cancel(self._toast_job)
+            self.render_note.configure(text=text)
+            self._toast_job = self.after(ms, self._toast_done)
+        except tk.TclError:
+            pass
+
+    def _toast_done(self):
+        self._toast_job = None
+        try:
+            self._update_note()
+        except tk.TclError:
+            pass
 
     def _open_editor(self):
         ed = self._detect_editor
@@ -6202,6 +7386,38 @@ class DetectInspectDialog(PDFPreviewDialog):
         editor.lift()
         editor.focus_force()
         editor.bind('<Destroy>', lambda e, ed=editor: e.widget is ed and self.after(60, self._regrab))
+
+    def _on_data_mode(self, value):
+        if value == self.data_mode:
+            return
+        title = T("Πραγματικά δεδομένα", "Real data")
+        if value == 'real':
+            try:
+                has = real_report_inputs()[3]
+            except Exception:
+                has = False
+            if not has:
+                self.data_seg.set(self.data_mode)
+                messagebox.showinfo(title, T("Δεν υπάρχουν ακόμα αποθηκευμένα δεδομένα (στοιχεία ξενοδοχείου ή μήνας). "
+                                             "Θα εμφανιστούν εδώ μόλις δημιουργήσετε ένα δελτίο.",
+                                             "There is no saved data yet (hotel details or a month). "
+                                             "It will show up here once you have made a report."), parent=self)
+                return
+        previous = self.data_mode
+        self.data_mode = value
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            self._render(self.template, self.pdf_path, None)
+            self._refresh_pdf()
+        except Exception as e:
+            self.data_mode = previous
+            self.data_seg.set(previous)
+            messagebox.showerror(title, T(f"Δεν ήταν δυνατή η εμφάνιση των δεδομένων:\n{e}",
+                                          f"Could not show the data:\n{e}"), parent=self)
+        finally:
+            self.config(cursor='')
+        self._update_note()
 
     def _editor_saved(self):
         """The editor saved its fine-tuning to the detection cache: draw the sample again with it."""
@@ -6334,6 +7550,19 @@ class Segmented(tk.Frame):
             lbl.bind('<Button-1>', lambda e, v=val: self.set(v, True))
             self._labels[val] = lbl
         self.set(value, False)
+
+    def show_option(self, val, visible):
+        lbl = self._labels.get(val)
+        if lbl is None:
+            return
+        if visible and not lbl.winfo_manager():
+            lbl.pack(side="left", padx=(1, 1), pady=1)
+            for v, l in self._labels.items():      # keep the original order
+                if l.winfo_manager():
+                    l.pack_forget()
+                    l.pack(side="left", padx=(1, 1), pady=1)
+        elif not visible and lbl.winfo_manager():
+            lbl.pack_forget()
 
     def set(self, value, notify=False):
         self.value = value
@@ -8485,10 +9714,10 @@ class ElstatApp(TkBase):
         saved_tpl = self.prefs.get('template_pdf', '')
         self.pdf_var = tk.StringVar(value=saved_tpl if saved_tpl and os.path.isfile(saved_tpl) else DEFAULT_TEMPLATE)
         self.period_var = tk.StringVar()
-        self._period_msg = (lambda: T("Πατήστε «Επιλογή Excel…» και διαλέξτε το αρχείο «Nationalities Statistics» "
-                                      "που βγάζει το Protel (.xls ή .xlsx).",
-                                      "Click “Choose Excel…” and select the “Nationalities Statistics” file "
-                                      "produced by Protel (.xls or .xlsx)."), 'CardHint.TLabel')
+        self._period_msg = (lambda: T("Πατήστε «Επιλογή Excel / CSV…» και διαλέξτε το αρχείο «Nationalities Statistics» "
+                                      "που βγάζει το Protel (.xls, .xlsx ή .csv).",
+                                      "Click “Choose Excel / CSV…” and select the “Nationalities Statistics” file "
+                                      "produced by Protel (.xls, .xlsx or .csv)."), 'CardHint.TLabel')
         self.month_name_var = tk.StringVar()
         self.afm_counter_var = tk.StringVar()
         self.check_var = tk.StringVar()
@@ -8536,9 +9765,9 @@ class ElstatApp(TkBase):
                                        "Monthly Tourist Accommodation Movement Report"), bg=HEADER_BG, fg=HEADER_FG,
                          font=(FONT, 16, 'bold'), justify="left")
         title.pack(anchor="w")
-        sub = tk.Label(texts, text=T("Διαλέξτε το Excel από το Protel και το πρόγραμμα συμπληρώνει και "
+        sub = tk.Label(texts, text=T("Διαλέξτε το Excel ή CSV από το Protel και το πρόγραμμα συμπληρώνει και "
                                      "εκτυπώνει το δελτίο της ΕΛΣΤΑΤ.",
-                                     "Choose the Excel from Protel and the program fills in and "
+                                     "Choose the Excel or CSV from Protel and the program fills in and "
                                      "prints the ELSTAT form."), bg=HEADER_BG, fg=HEADER_MUTED,
                        font=(FONT, 10), justify="left")
         sub.pack(anchor="w", pady=(2, 0))
@@ -8603,7 +9832,7 @@ class ElstatApp(TkBase):
         ent.grid(row=1, column=0, sticky="ew")
         ent.bind('<FocusOut>', self._excel_typed)
         ent.bind('<Return>', self._excel_typed)
-        self.excel_btn = ttk.Button(c1, text=T("Επιλογή Excel…", "Choose Excel…"), command=self.browse_excel)
+        self.excel_btn = ttk.Button(c1, text=T("Επιλογή Excel / CSV…", "Choose Excel / CSV…"), command=self.browse_excel)
         self.excel_btn.grid(row=1, column=1, padx=(8, 0))
         ttk.Button(c1, text=T("Πιο πρόσφατο", "Latest"), command=self.use_recent_excel).grid(row=1, column=2, padx=(6, 0))
         self.period_label = ttk.Label(c1, textvariable=self.period_var, style='CardHint.TLabel', justify="left")
@@ -8736,9 +9965,9 @@ class ElstatApp(TkBase):
         self.print_btn = ttk.Button(btnrow, text=T("Δημιουργία & Εκτύπωση", "Create & Print"), style='Print.TButton',
                                     command=lambda: self.generate(print_after=True))
         self.print_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        ttk.Label(bottom, text=T("Συντομεύσεις:  Ctrl+O = επιλογή Excel  ·  Ctrl+Enter = δημιουργία  ·  "
+        ttk.Label(bottom, text=T("Συντομεύσεις:  Ctrl+O = επιλογή Excel / CSV  ·  Ctrl+Enter = δημιουργία  ·  "
                                  "Ctrl+P = δημιουργία & εκτύπωση  ·  F1 = οδηγός",
-                                 "Shortcuts:  Ctrl+O = choose Excel  ·  Ctrl+Enter = create  ·  "
+                                 "Shortcuts:  Ctrl+O = choose Excel / CSV  ·  Ctrl+Enter = create  ·  "
                                  "Ctrl+P = create & print  ·  F1 = guide"),
                   style='CardHint.TLabel').pack(anchor="e", padx=16, pady=(4, 10))
 
@@ -9128,8 +10357,8 @@ class ElstatApp(TkBase):
         f = c1.body
         f.columnconfigure(0, weight=1)
         for r, (text, value) in enumerate(((T("Στον φάκελο του προγράμματος", "In the program folder"), 'program'),
-                                           (T("Στον φάκελο του αρχείου Excel (από το Protel)",
-                                              "In the folder of the Excel file (from Protel)"), 'excel'),
+                                           (T("Στον φάκελο του αρχείου Excel / CSV (από το Protel)",
+                                              "In the folder of the Excel / CSV file (from Protel)"), 'excel'),
                                            (T("Σε συγκεκριμένο φάκελο:", "In a specific folder:"), 'custom'))):
             ttk.Radiobutton(f, text=text, value=value, variable=pv['output_mode'], style='Card.TRadiobutton',
                             command=self._pref_changed).grid(row=r, column=0, columnspan=2, sticky="w",
@@ -9175,7 +10404,7 @@ class ElstatApp(TkBase):
         ttk.Button(row2, text=T("Αντίγραφο ασφαλείας (.zip)…", "Backup (.zip)…"), command=self.backup_data).pack(side="left", padx=8)
 
         # ---- 3. Excel folder
-        c3 = Card(body, None, T("Αρχεία Excel από το Protel", "Excel files from Protel"))
+        c3 = Card(body, None, T("Αρχεία Excel / CSV από το Protel", "Excel / CSV files from Protel"))
         c3.grid(row=3, column=0, sticky="ew", padx=4, pady=6)
         polish_settings_card(c3)
         f3 = c3.body
@@ -9186,10 +10415,10 @@ class ElstatApp(TkBase):
         commit_on(ex_entry)
         ttk.Button(f3, text=T("Αναζήτηση…", "Browse…"), command=self.browse_excel_dir).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(f3, text=T("Καθαρισμός", "Clear"), command=self.clear_excel_dir).grid(row=0, column=2, padx=(6, 0))
-        hint(f3, T("Από ποιον φάκελο ξεκινούν τα «Επιλογή Excel…» και «Πιο πρόσφατο». "
-                   "Κενό = ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
-                   "The folder where “Choose Excel…” and “Latest” start. "
-                   "Empty = the folder of the last Excel you used."), 1, columnspan=3)
+        hint(f3, T("Από ποιον φάκελο ξεκινούν τα «Επιλογή Excel / CSV…» και «Πιο πρόσφατο». "
+                   "Κενό = ο φάκελος του τελευταίου αρχείου που χρησιμοποιήσατε.",
+                   "The folder where “Choose Excel / CSV…” and “Latest” start. "
+                   "Empty = the folder of the last file you used."), 1, columnspan=3)
 
         # ---- 3b. how the PDF is filled in: 1) who sets the positions  2) which method / starting point
         cp = Card(body, None, T("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in"))
@@ -9253,6 +10482,7 @@ class ElstatApp(TkBase):
         ttk.Button(lrow, text=T("Αποθήκευση ως αναφορά…", "Save as reference…"),
                    command=self.layout_save_reference).pack(side="left", padx=8)
         ttk.Button(lrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left")
+        ttk.Button(lrow, text=T("Επαναφορά αναφοράς", "Reset reference"), command=self.layout_reset_reference).pack(side="left", padx=(8, 0))
 
         # Smart Field Detection options (only while it is selected)
         self.detect_frame = df = ttk.Frame(af, style='Card.TFrame')
@@ -9659,7 +10889,34 @@ class ElstatApp(TkBase):
             return
         finally:
             self.config(cursor='')
-        (messagebox.showinfo if report['ok'] else messagebox.showwarning)(title, describe_report(report))
+        text = describe_report(report)
+        if not report['ok']:                    # a problem is worth a dialog
+            messagebox.showwarning(title, text)
+            return
+        # all fine: one quiet line in the note under the method, back to normal after a few seconds
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        try:
+            if getattr(self, '_check_job', None):
+                self.after_cancel(self._check_job)
+            self.layout_note_var.set(first)
+            self.layout_note.configure(style='CardGood.TLabel')
+            self._check_job = self.after(8000, self._update_layout_note)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def layout_reset_reference(self):
+        title = T("Επαναφορά αναφοράς", "Reset reference")
+        if load_layout_reference() is None:
+            self._update_layout_note()
+            return
+        if not messagebox.askyesno(
+                title, T("Η αποθηκευμένη διάταξη αναφοράς θα διαγραφεί. Η έξυπνη μετατόπιση δεν θα λειτουργεί μέχρι να "
+                         "αποθηκεύσετε νέα.\n\nΣυνέχεια;",
+                         "The saved reference layout will be deleted. Smart Shift will not work until you save a new one.\n\n"
+                         "Continue?"), default='no'):
+            return
+        delete_layout_reference()
+        self._update_layout_note()
 
     def layout_save_reference(self):
         title = T("Αποθήκευση ως αναφορά", "Save as reference")
@@ -9813,7 +11070,7 @@ class ElstatApp(TkBase):
                         T(f"λείπει ο {month_name(rem[1])} {rem[0]}", f"{month_name(rem[1])} {rem[0]} is missing"), 'tab:report'))
         excel = self.excel_var.get().strip()
         excel_ok = bool(excel) and os.path.isfile(excel)
-        out.append(('ok' if excel_ok else 'warn', T("Excel του μήνα", "Month's Excel"),
+        out.append(('ok' if excel_ok else 'warn', T("Excel / CSV του μήνα", "Month's Excel / CSV"),
                     os.path.basename(excel) if excel_ok else T("δεν έχει επιλεγεί ακόμη", "not chosen yet"), 'tab:report'))
         bad = self._unknown_country_count()
         if bad:
@@ -9852,9 +11109,9 @@ class ElstatApp(TkBase):
         if not (excel and os.path.isfile(excel)):
             rem = missing_month_reminder(self._hist or {})
             if rem:
-                return (T(f"Φτιάξτε το δελτίο {month_name(rem[1])} {rem[0]}: διαλέξτε το Excel του",
-                          f"Make the form for {month_name(rem[1])} {rem[0]}: choose its Excel"), 'tab:report')
-            return T("Διαλέξτε το Excel του μήνα", "Choose the month's Excel"), 'tab:report'
+                return (T(f"Φτιάξτε το δελτίο {month_name(rem[1])} {rem[0]}: διαλέξτε το Excel / CSV του",
+                          f"Make the form for {month_name(rem[1])} {rem[0]}: choose its Excel / CSV"), 'tab:report')
+            return T("Διαλέξτε το Excel / CSV του μήνα", "Choose the month's Excel / CSV"), 'tab:report'
         if self._unknown_country_count():
             return T("Αντιστοιχίστε τις άγνωστες χώρες", "Map the unknown countries"), 'sec:countries'
         if not self.mon_vars['employees'].get().strip():
@@ -10480,13 +11737,13 @@ class ElstatApp(TkBase):
                           T("Πατήστε ή σύρετε εδώ άλλο αρχείο για να το αλλάξετε",
                             "Click or drop another file here to change it"), done=True)
         elif DND_AVAILABLE:
-            zone.set_text(T("Σύρετε εδώ το αρχείο Excel", "Drop the Excel file here"),
-                          T("ή πατήστε για να το διαλέξετε από τον υπολογιστή",
-                            "or click to choose it from your computer"))
+            zone.set_text(T("Σύρετε εδώ το αρχείο Excel ή CSV", "Drop the Excel or CSV file here"),
+                          T("ή πατήστε για να το διαλέξετε από τον υπολογιστή (.xls, .xlsx, .csv)",
+                            "or click to choose it from your computer (.xls, .xlsx, .csv)"))
         else:
-            zone.set_text(T("Πατήστε για να διαλέξετε το αρχείο Excel", "Click to choose the Excel file"),
-                          T("το αρχείο «Nationalities Statistics» από το Protel (.xls ή .xlsx)",
-                            "the “Nationalities Statistics” file from Protel (.xls or .xlsx)"))
+            zone.set_text(T("Πατήστε για να διαλέξετε το αρχείο Excel ή CSV", "Click to choose the Excel or CSV file"),
+                          T("το αρχείο «Nationalities Statistics» από το Protel (.xls, .xlsx ή .csv)",
+                            "the “Nationalities Statistics” file from Protel (.xls, .xlsx or .csv)"))
 
     def refresh_validation(self, *_):
         if self._rebuilding or not hasattr(self, 'print_btn'):
@@ -10519,8 +11776,8 @@ class ElstatApp(TkBase):
         if excel_ok:
             errors = validate_inputs(s, m, excel, template, out)
         else:   # month fields cannot be judged before the Excel is chosen
-            errors = [T("Επιλέξτε πρώτα το αρχείο Excel από το Protel (Βήμα 1).",
-                        "First choose the Excel file from Protel (Step 1).")] + validate_hotel(s)
+            errors = [T("Επιλέξτε πρώτα το αρχείο Excel ή CSV από το Protel (Βήμα 1).",
+                        "First choose the Excel or CSV file from Protel (Step 1).")] + validate_hotel(s)
         if errors:
             shown = errors[:5]
             more = T(f"\n… και {len(errors) - 5} ακόμη", f"\n… and {len(errors) - 5} more") if len(errors) > 5 else ""
@@ -10617,7 +11874,7 @@ class ElstatApp(TkBase):
         zone = getattr(self, 'excel_zone', None)
         if zone is not None:
             zone.set_drag(False)
-        return self._drop_one(event, "Excel (.xls/.xlsx)", {'.xls', '.xlsx'}, self._accept_dropped_excel)
+        return self._drop_one(event, "Excel / CSV (.xls/.xlsx/.csv)", {'.xls', '.xlsx', '.csv'}, self._accept_dropped_excel)
 
     def _accept_dropped_excel(self, path):
         self.excel_var.set(path)
@@ -10677,9 +11934,9 @@ class ElstatApp(TkBase):
         return d if d and os.path.isdir(d) else BASE_DIR
 
     def browse_excel(self):
-        fp = filedialog.askopenfilename(title=T("Διαλέξτε το Excel από το Protel",
-                                                "Choose the Excel file from Protel"), initialdir=self._excel_start_dir(),
-                                        filetypes=[("Excel Files", "*.xls *.xlsx")])
+        fp = filedialog.askopenfilename(title=T("Διαλέξτε το Excel ή CSV από το Protel",
+                                                "Choose the Excel or CSV file from Protel"), initialdir=self._excel_start_dir(),
+                                        filetypes=[("Excel / CSV", "*.xls *.xlsx *.csv"), ("Excel Files", "*.xls *.xlsx"), ("CSV", "*.csv")])
         if fp:
             self._accept_dropped_excel(fp)
 
@@ -10763,10 +12020,10 @@ class ElstatApp(TkBase):
         fp = find_recent_excel(self._excel_start_dir())
         if not fp:
             messagebox.showinfo(T("Δεν βρέθηκε αρχείο", "File not found"),
-                                T(f"Δεν υπάρχει αρχείο Excel στον φάκελο:\n{self._excel_start_dir()}\n\n"
-                                  "Πατήστε «Επιλογή Excel…» για να το διαλέξετε.",
-                                  f"There is no Excel file in the folder:\n{self._excel_start_dir()}\n\n"
-                                  "Click “Choose Excel…” to select one."))
+                                T(f"Δεν υπάρχει αρχείο Excel ή CSV στον φάκελο:\n{self._excel_start_dir()}\n\n"
+                                  "Πατήστε «Επιλογή Excel / CSV…» για να το διαλέξετε.",
+                                  f"There is no Excel or CSV file in the folder:\n{self._excel_start_dir()}\n\n"
+                                  "Click “Choose Excel / CSV…” to select one."))
             return
         self.excel_var.set(fp)
         self.load_period(fp)
@@ -11083,12 +12340,14 @@ class ElstatApp(TkBase):
         self._econ_metric = getattr(self, '_econ_metric', 'revenue')
 
         # four headline numbers
-        kp = ttk.Frame(parent)
+        kp = self.econ_kp = ttk.Frame(parent)
         kp.grid(row=0, column=0, sticky="ew", padx=6, pady=(0, 8))
+        parent.bind('<Configure>', self._econ_relayout)
+        self.winfo_toplevel().bind('<Configure>', lambda e: self._econ_fit_height() if e.widget is self.winfo_toplevel() else None, add='+')
         for i in range(4):
             kp.columnconfigure(i, weight=1, uniform='ekpi')
-        titles = (T("ΣΥΝΟΛΙΚΑ ΕΣΟΔΑ", "TOTAL REVENUE"), T("ΜΕΣΗ ΤΙΜΗ ΔΩΜΑΤΙΟΥ", "AVG ROOM RATE"),
-                  T("ΕΣΟΔΑ ΑΝΑ ΔΙΑΝΥΚΤΕΡΕΥΣΗ", "REVENUE PER NIGHT"), T("ΕΣΟΔΑ ΑΝΑ ΠΕΛΑΤΗ", "REVENUE PER GUEST"))
+        titles = (T("ΣΥΝΟΛΙΚΑ ΕΣΟΔΑ", "TOTAL REVENUE"), T("ΕΣΟΔΑ ΑΝΑ ΔΙΑΝΥΚΤ. ΔΩΜΑΤΙΟΥ", "REVENUE PER ROOM NIGHT"),
+                  T("ΕΣΟΔΑ ΑΝΑ ΔΙΑΝΥΚΤ. ΠΕΛΑΤΗ", "REVENUE PER GUEST NIGHT"), T("ΣΥΝΘΕΣΗ ΕΣΟΔΩΝ", "REVENUE MIX"))
         self.econ_cards = []
         for i, title in enumerate(titles):
             card = StatCard(kp, title)
@@ -11102,8 +12361,8 @@ class ElstatApp(TkBase):
         head = ttk.Frame(box)
         head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         self.econ_seg = Segmented(head, (('revenue', T("Έσοδα", "Revenue")),
-                                         ('adr', T("Τιμή δωματίου", "Room rate")),
-                                         ('pernight', T("Ανά διανυκτέρευση", "Per night"))),
+                                         ('adr', T("Ανά διανυκτ. δωματίου", "Per room night")),
+                                         ('pernight', T("Ανά διανυκτ. πελάτη", "Per guest night"))),
                                   self._econ_metric_changed, self._econ_metric)
         self.econ_seg.pack(side="left")
         self.econ_fill = ttk.Button(head, text=T("Προσθήκη εσόδων παλιών μηνών…", "Add revenue for older months…"),
@@ -11120,27 +12379,171 @@ class ElstatApp(TkBase):
         lower = ttk.Frame(parent)
         lower.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 12))
         lower.columnconfigure(0, weight=1)
-        lower.rowconfigure(0, weight=1)
+        lower.rowconfigure(1, weight=1)
+        self._econ_view = getattr(self, '_econ_view', 'months')
+        self._econ_sort = getattr(self, '_econ_sort', ('r', True))
+        self._econ_rows = []
+        vbar = ttk.Frame(lower)
+        vbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self.econ_view_seg = Segmented(vbar, (('months', T("Ανά μήνα", "By month")),
+                                              ('countries', T("Ανά χώρα", "By country"))),
+                                       self._econ_view_changed, self._econ_view)
+        self.econ_view_seg.pack(side="left")
         cols = ('n', 'r', 'rm', 'fb', 'ex', 'pn', 'd')
-        self.econ_tree = ttk.Treeview(lower, columns=cols, show='tree headings', height=6)
+        self.econ_tree = ttk.Treeview(lower, columns=cols, show='tree headings', height=5)
         self.econ_tree.heading('#0', text=T('Μήνας', 'Month'), anchor='w')
         for key, text in (('n', T('Διανυκτ.', 'Nights')), ('r', T('Έσοδα', 'Revenue')),
                           ('rm', T('Δωμάτια', 'Rooms')), ('fb', 'F&B'), ('ex', T('Έξτρα', 'Extras')),
                           ('pn', T('€/διανυκτ.', '€/night')), ('d', T('έναντι προηγ. έτους', 'vs prev. year'))):
             self.econ_tree.heading(key, text=text)
-            self.econ_tree.column(key, width=95, minwidth=70, anchor='e', stretch=(key == 'd'))
+            self.econ_tree.column(key, width=84, minwidth=64, anchor='e', stretch=True)
         self.econ_tree.column('#0', width=130, minwidth=90, stretch=True)
         self.econ_tree.tag_configure('total', font=(FONT, 10, 'bold'), background=HEAD_BG)
         self.econ_tree.tag_configure('row', background=CARD)
+        self.econ_tree.tag_configure('alt', background=ROW_MONTH)
         esb = ttk.Scrollbar(lower, orient="vertical", command=self.econ_tree.yview)
         self.econ_tree.configure(yscrollcommand=esb.set)
-        self.econ_tree.grid(row=0, column=0, sticky="nsew")
-        esb.grid(row=0, column=1, sticky="ns")
+        self.econ_tree.grid(row=1, column=0, sticky="nsew")
+        esb.grid(row=1, column=1, sticky="ns")
+        self.econ_esb = esb
+        self._fit_cols(self.econ_tree, cols, ('r', 'n', 'pn', 'd', 'rm', 'fb', 'ex'))
+
+        # by country: the columns of the Protel sheet (revenue per room night / per guest night are its own two ratios)
+        ccols = ('g', 'n', 'rm', 'fb', 'ex', 'r', 'sh', 'rn', 'pn')
+        self.econ_ctree = ttk.Treeview(lower, columns=ccols, show='tree headings', height=6)
+        self.econ_ctree.column('#0', width=150, minwidth=100, stretch=True)
+        self._econ_cnames = {'c': T('Χώρα', 'Country'), 'g': T('Πελάτες', 'Guests'), 'n': T('Διανυκτ.', 'Nights'),
+                             'rm': T('Δωμάτια', 'Rooms'), 'fb': 'F&B', 'ex': T('Έξτρα', 'Extras'),
+                             'r': T('Σύνολο', 'Total'), 'sh': T('% εσόδων', '% share'),
+                             'rn': T('€/διανυκτ. δωμ.', '€/room night'), 'pn': T('€/διανυκτ. πελ.', '€/guest night')}
+        self.econ_ctree.heading('#0', command=lambda: self._econ_sort_by('c'))
+        for key in ccols:
+            self.econ_ctree.heading(key, command=lambda k=key: self._econ_sort_by(k))
+            self.econ_ctree.column(key, width=84, minwidth=64, anchor='e', stretch=True)
+        self.econ_ctree.tag_configure('total', font=(FONT, 10, 'bold'), background=HEAD_BG)
+        self.econ_ctree.tag_configure('row', background=CARD)
+        self.econ_ctree.tag_configure('alt', background=ROW_MONTH)
+        csb = ttk.Scrollbar(lower, orient="vertical", command=self.econ_ctree.yview)
+        self.econ_ctree.configure(yscrollcommand=csb.set)
+        self.econ_ctree.grid(row=1, column=0, sticky="nsew")
+        csb.grid(row=1, column=1, sticky="ns")
+        self.econ_csb = csb
+        self._fit_cols(self.econ_ctree, ccols, ('r', 'sh', 'g', 'n', 'pn', 'rn', 'rm', 'fb', 'ex'))
+        self._econ_view_changed(self._econ_view)
+
+    def _fit_cols(self, tree, cols, priority):
+        """Shows as many columns as fit the width (most important first), so the table scales with the window."""
+        import tkinter.font as tkfont
+        fnt = tkfont.Font(family=FONT, size=9, weight='bold')
+
+        def need(c):
+            txt = str(tree.heading(c, 'text')) + "  ▼"
+            return max(64, fnt.measure(txt) + 22)
+
+        def fit(_e=None):
+            avail = tree.winfo_width() - 150
+            usable = [c for c in priority if c in cols and c not in getattr(tree, '_hidden_cols', ())]
+            keep, used = [], 0
+            for c in usable:
+                w = need(c)
+                if len(keep) >= 3 or used + w <= avail:
+                    keep.append(c)
+                    used += w
+            for c in keep:
+                tree.column(c, width=need(c), minwidth=need(c))
+            want = [c for c in cols if c in keep]
+            if list(tree.cget('displaycolumns')) != want:
+                tree.configure(displaycolumns=want)
+        tree._refit = fit
+        tree.bind('<Configure>', fit, add='+')
+
+    def _econ_fit_height(self, _e=None):
+        """Chart and table share the window's spare height, measured from where they actually sit."""
+        try:
+            top = self.winfo_toplevel()
+            lower = self.econ_tree.master
+            if not lower.winfo_ismapped() or top.winfo_height() < 200:
+                return
+            lower_y = lower.winfo_rooty() - top.winfo_rooty()
+            fixed = lower_y - self.econ_chart.winfo_height() + 44 + 70   # stuff above chart + view switch + bottom bar
+            avail = top.winfo_height() - fixed
+            n_rows = len(self.econ_tree.get_children()) if self._econ_view != 'countries' \
+                else len(self.econ_ctree.get_children())
+        except tk.TclError:
+            return
+        chart_h = int(max(130, min(320, avail * 0.38)))
+        rows = int((avail - chart_h - 30) // 26)
+        rows = max(3, min(rows, max(n_rows, 3), 28))
+        if abs(chart_h - int(self.econ_chart.cget('height'))) >= 6:
+            self.econ_chart.configure(height=chart_h)
+        for t in (self.econ_tree, self.econ_ctree):
+            if int(t.cget('height')) != rows:
+                t.configure(height=rows)
+
+    def _econ_relayout(self, event):
+        """Four headline cards in one row when there is room, two by two when the window is narrow."""
+        self._econ_width = event.width
+        self._econ_fit_height()
+        self._econ_layout_cards()
+
+    def _econ_layout_cards(self):
+        vis = [c for i, c in enumerate(self.econ_cards) if i not in getattr(self, '_econ_hidden_cards', ())]
+        width = getattr(self, '_econ_width', 900)
+        per_row = max(1, min(len(vis), width // 190, 4))
+        if len(vis) == 4 and per_row == 3:
+            per_row = 2
+        key = (per_row, tuple(id(c) for c in vis))
+        if key == getattr(self, '_econ_kkey', None):
+            return
+        self._econ_kkey = key
+        for c in self.econ_cards:
+            c.grid_remove()
+        for i in range(4):
+            self.econ_kp.columnconfigure(i, weight=1 if i < per_row else 0, uniform='ekpi' if i < per_row else '')
+        rows = -(-len(vis) // per_row) if vis else 0
+        for i, card in enumerate(vis):
+            card.grid(row=i // per_row, column=i % per_row, sticky="ew", padx=4,
+                      pady=(0, 6 if i // per_row < rows - 1 else 0))
+
+    def _econ_view_changed(self, value):
+        self._econ_view = value
+        months = value != 'countries'
+        for w, show in ((self.econ_tree, months), (self.econ_esb, months),
+                        (self.econ_ctree, not months), (self.econ_csb, not months)):
+            (w.grid if show else w.grid_remove)()
+
+    def _econ_sort_by(self, key):
+        cur, desc = self._econ_sort
+        self._econ_sort = (key, (not desc) if key == cur else key != 'c')
+        self._econ_render_countries()
+
+    def _econ_render_countries(self):
+        tree = self.econ_ctree
+        tree.delete(*tree.get_children())
+        key, desc = self._econ_sort
+        for k, name in self._econ_cnames.items():             # arrow on the sorted column
+            mark = (" ▼" if desc else " ▲") if k == key else ""
+            (tree.heading('#0', text=name + mark) if k == 'c' else tree.heading(k, text=name + mark))
+        rows = sorted(self._econ_rows, key=lambda r: r[key] if key != 'c' else r['c'].lower(), reverse=desc)
+        dash = "–"
+        eur = lambda v: f"{fmt_int(v)} €"
+        ratio = lambda v: f"{fmt_dec(v)} €" if v else dash
+        tree._hidden_cols = {k for k in ('rn', 'pn', 'fb', 'ex', 'g') if not any(r[k] for r in rows)}
+        tree._refit()
+        for n_, r in enumerate(rows):
+            tree.insert('', 'end', text=r['c'], tags=('alt' if n_ % 2 else 'row',), values=(
+                fmt_int(r['g']), fmt_int(r['n']), eur(r['rm']), eur(r['fb']), eur(r['ex']), eur(r['r']),
+                f"{fmt_dec(r['sh'])}%", ratio(r['rn']), ratio(r['pn'])))
+        if rows:
+            sm = lambda k: sum(r[k] for r in rows)
+            tree.insert('', 'end', text=T("ΣΥΝΟΛΟ", "TOTAL"), tags=('total',), values=(
+                fmt_int(sm('g')), fmt_int(sm('n')), eur(sm('rm')), eur(sm('fb')), eur(sm('ex')), eur(sm('r')), "100%",
+                ratio(sm('r') / sm('roomn') if sm('roomn') else 0), ratio(sm('r') / sm('n') if sm('n') else 0)))
 
     def _econ_add_revenue(self):
         paths = filedialog.askopenfilenames(title=T("Επιλέξτε το «Nationalities Statistics» (ένα ή περισσότερους μήνες)",
                                                     "Choose the “Nationalities Statistics” file(s) (one or more months)"),
-                                            filetypes=[("Excel Files", "*.xls *.xlsx")])
+                                            filetypes=[("Excel / CSV", "*.xls *.xlsx *.csv"), ("Excel Files", "*.xls *.xlsx"), ("CSV", "*.csv")])
         if not paths:
             return
         done, errors = [], []
@@ -11169,8 +12572,13 @@ class ElstatApp(TkBase):
         except ValueError:
             year = None
         self.econ_tree.delete(*self.econ_tree.get_children())
+        self._econ_rows = []
+        self._econ_render_countries()
         for c in self.econ_cards:
             c.set(dash, "")
+        self._econ_hidden_cards = ()
+        self._econ_layout_cards()
+        self.econ_seg.show_option('adr', True)
         if year is None or year not in self._hist:
             self.econ_chart.set_data([0] * 12, T("Δεν υπάρχουν δεδομένα ακόμη", "No data yet"))
             self.econ_insight.set("")
@@ -11207,7 +12615,8 @@ class ElstatApp(TkBase):
         guests = sum(guests_of(year, m) for m in with_rev)
 
         # headline cards
-        sub, col = T(f"{len(with_rev)} μήνες", f"{len(with_rev)} months"), None
+        nm = len(with_rev)
+        sub, col = (T("1 μήνας", "1 month") if nm == 1 else T(f"{nm} μήνες", f"{nm} months")), None
         both = [m for m in with_rev if rev(year - 1, m)]
         if both:
             a = sum(rev(year, m)['total'] for m in both)
@@ -11218,12 +12627,18 @@ class ElstatApp(TkBase):
                       T(f"έναντι {year - 1}", f"vs {year - 1}")
                 col = GOOD if pct > 0.05 else BAD if pct < -0.05 else None
         self.econ_cards[0].set(f"{fmt_int(tot)} €", sub, col)
-        self.econ_cards[1].set(f"{fmt_dec(rooms / roomn)} €" if roomn else dash,
-                               T("έσοδα δωματίων ÷ διανυκτ. δωματίων", "room revenue ÷ room nights"))
+        self._econ_hidden_cards = () if roomn else (1,)
+        self.econ_seg.show_option('adr', bool(roomn))
+        if not roomn and getattr(self, '_econ_metric', '') == 'adr':
+            self._econ_metric = 'revenue'
+            self.econ_seg.set('revenue')
+        self._econ_layout_cards()
+        self.econ_cards[1].set(f"{fmt_dec(tot / roomn)} €" if roomn else dash,
+                               T("συνολικά έσοδα ÷ διανυκτ. δωματίων", "total revenue ÷ room nights"))
         self.econ_cards[2].set(f"{fmt_dec(tot / nights)} €" if nights else dash,
-                               T("συνολικά έσοδα ÷ διανυκτ.", "total revenue ÷ nights"))
-        self.econ_cards[3].set(f"{fmt_dec(tot / guests)} €" if guests else dash,
-                               T("συνολικά έσοδα ÷ πελάτες", "total revenue ÷ guests"))
+                               T("συνολικά έσοδα ÷ διανυκτ. πελατών", "total revenue ÷ guest nights"))
+        self.econ_cards[3].set(f"{fmt_dec(rooms / tot * 100)}% " + T("δωμάτια", "rooms") if tot else dash,
+                               f"F&B {fmt_dec(fb / tot * 100)}% · " + T("έξτρα", "extras") + f" {fmt_dec(extras / tot * 100)}%" if tot else "")
 
         # chart
         metric = getattr(self, '_econ_metric', 'revenue')
@@ -11235,33 +12650,61 @@ class ElstatApp(TkBase):
             if metric == 'revenue':
                 return r['total']
             if metric == 'adr':
-                return r['rooms'] / r['roomn'] if r['roomn'] else 0
+                return r['total'] / r['roomn'] if r['roomn'] else 0
             n = nights_of(y, m)
             return r['total'] / n if n else 0
-        names = {'revenue': T("Έσοδα (€)", "Revenue (€)"), 'adr': T("Μέση τιμή δωματίου (€)", "Average room rate (€)"),
-                 'pernight': T("Έσοδα ανά διανυκτέρευση (€)", "Revenue per night (€)")}
+        names = {'revenue': T("Έσοδα (€)", "Revenue (€)"), 'adr': T("Έσοδα ανά διανυκτ. δωματίου (€)", "Revenue per room night (€)"),
+                 'pernight': T("Έσοδα ανά διανυκτ. πελάτη (€)", "Revenue per guest night (€)")}
         prev = [value(year - 1, m) for m in range(1, 13)] if any(rev(year - 1, m) for m in range(1, 13)) else None
         self.econ_chart.set_data([value(year, m) for m in range(1, 13)], f"{names[metric]} · {year}",
                                  color={'revenue': ACCENT, 'adr': TEAL}.get(metric, NAVY),
                                  prev=prev, prev_label=str(year - 1))
 
         # table
-        for m in months:
+        for m in [x for x in months if rev(year, x)]:
             r = rev(year, m)
             n = nights_of(year, m)
-            if not r:
-                self.econ_tree.insert('', 'end', text=month_name(m), tags=('row',),
-                                      values=(fmt_int(n), dash, dash, dash, dash, dash, ""))
-                continue
+            zb = 'alt' if len(self.econ_tree.get_children()) % 2 else 'row'
             old = rev(year - 1, m)
             delta = f"{fmt_dec((r['total'] - old['total']) / old['total'] * 100, signed=True)}%" if old else ""
-            self.econ_tree.insert('', 'end', text=month_name(m), tags=('row',),
+            self.econ_tree.insert('', 'end', text=month_name(m), tags=(zb,),
                                   values=(fmt_int(n), f"{fmt_int(r['total'])} €", f"{fmt_int(r['rooms'])} €",
                                           f"{fmt_int(r['fb'])} €", f"{fmt_int(r['extras'])} €",
                                           f"{fmt_dec(r['total'] / n)} €" if n else dash, delta))
+        hid = set()
+        if not any(rev(year, m)['fb'] for m in with_rev):
+            hid.add('fb')
+        if not any(rev(year, m)['extras'] for m in with_rev):
+            hid.add('ex')
+        if not nights:
+            hid.update(('n', 'pn'))
+        if not any(rev(year - 1, m) for m in with_rev):
+            hid.add('d')
+        if not any(rev(year, m)['rooms'] for m in with_rev):
+            hid.add('rm')
+        self.econ_tree._hidden_cols = hid
+        self.econ_tree._refit()
         self.econ_tree.insert('', 'end', text=T(f"ΣΥΝΟΛΟ {year}", f"TOTAL {year}"), tags=('total',),
                               values=(fmt_int(nights), f"{fmt_int(tot)} €", f"{fmt_int(rooms)} €", f"{fmt_int(fb)} €",
                                       f"{fmt_int(extras)} €", f"{fmt_dec(tot / nights)} €" if nights else dash, ""))
+
+        # by country: guests and nights of the months that have revenue, next to what each country spent
+        gn = {}
+        for m in with_rev:
+            for c, g, n in hist.get(year, {}).get(m, []):
+                d = gn.setdefault(c, [0, 0])
+                d[0] += g
+                d[1] += n
+        for c, d in load_revenue_detail(year).items():
+            if d['total'] <= 0:
+                continue
+            g, n = gn.get(c, (0, 0))
+            self._econ_rows.append({'c': c, 'g': g, 'n': n, 'rm': d['rooms'], 'fb': d['fb'], 'ex': d['extras'],
+                                    'r': d['total'], 'roomn': d['roomn'], 'sh': d['total'] / tot * 100 if tot else 0.0,
+                                    'rn': d['total'] / d['roomn'] if d['roomn'] else 0.0,
+                                    'pn': d['total'] / n if n else 0.0})
+        self._econ_render_countries()
+        self._econ_fit_height()
 
         # short summary: best month, revenue mix, best-earning markets
         parts = []
@@ -11570,9 +13013,9 @@ class ElstatApp(TkBase):
         if r:
             self.reminder_label.configure(
                 text=T(f"Υπενθύμιση: δεν υπάρχει ακόμη δελτίο για τον {month_name(r[1])} {r[0]}. "
-                       "Διαλέξτε το Excel του μήνα στο Βήμα 1 για να το δημιουργήσετε.",
+                       "Διαλέξτε το Excel / CSV του μήνα στο Βήμα 1 για να το δημιουργήσετε.",
                        f"Reminder: there is no form yet for {month_name(r[1])} {r[0]}. "
-                       "Choose the month's Excel in Step 1 to create it."))
+                       "Choose the month's Excel / CSV in Step 1 to create it."))
             self.reminder_frame.grid()
         else:
             self.reminder_frame.grid_remove()
@@ -11903,7 +13346,12 @@ class ElstatApp(TkBase):
             """What "Edit layout…" starts from: the layout this report was made with (or a blank canvas, see Settings)."""
             return self._editor_start_layout(mode, template, state['result'])[0]
 
-        PDFPreviewDialog(self, target, template, proceed, closed, regenerate, live_data, base_layout)
+        def confidence():
+            """Recognition confidence of what the preview shows (None once the layout was edited by hand)."""
+            res = state['result']
+            return confidence_view(res.get('confidence'), res.get('layout_used'))
+
+        PDFPreviewDialog(self, target, template, proceed, closed, regenerate, live_data, base_layout, confidence)
 
     def _confirm_replace(self, out, parent=None):
         """The "file already exists" question (when it is turned on in Settings). True = go ahead."""
