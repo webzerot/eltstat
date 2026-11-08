@@ -98,12 +98,30 @@ def install_edit_shortcuts(root):
         record(widget)
         return 'break'
 
+    # Tk already copies / cuts / pastes by itself on Ctrl+C / Ctrl+X / Ctrl+V when the keyboard is on an
+    # English layout. This handler (bound to "all", so it runs AFTER Tk's own binding, and cannot cancel it)
+    # only has to step in for keys Tk does not understand: another layout such as Greek, or a shortcut the
+    # user changed in Settings. Without this check the action ran twice and a paste landed twice.
+    native_keys = {'copy': ('c', 'C'), 'cut': ('x', 'X'), 'paste': ('v', 'V')}
+
+    def handled_by_tk(event, action):
+        keys = native_keys.get(action)
+        if not keys or sys.platform == 'darwin':          # macOS uses Command, not Control
+            return False
+        state = getattr(event, 'state', 0)
+        state = state if isinstance(state, int) else 0
+        ctrl = bool(state & 0x4)
+        alt = bool(state & (0x20000 if sys.platform.startswith('win') else 0x8))
+        return ctrl and not alt and str(getattr(event, 'keysym', '') or '') in keys
+
     def on_shortcut(event, action):
         widget = event.widget
         if not editable_widget(widget):
             return None
         if action == 'select_all':
             return select_all(widget)
+        if handled_by_tk(event, action):
+            return None                                   # Tk has already done it once
         return clipboard_action(widget, {'copy': '<<Copy>>', 'cut': '<<Cut>>', 'paste': '<<Paste>>'}[action])
 
     def popup(event):
@@ -224,7 +242,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "elstat_config.json")
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "ELSTAT_Data")
 DEFAULT_TEMPLATE = os.path.join(BASE_DIR, "template_elstat_report.pdf")
 ARCHIVE_NAME = "ELSTAT_Archive"
-DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json", "elstat_country_mappings.json", "elstat_template_layout.json", "elstat_manual_layout.json", "elstat_custom_fields.json")
+DATA_FILES = ("hotel_settings.csv", "elstat_history.csv", "elstat_months.csv", "elstat_preferences.json", "elstat_country_mappings.json", "elstat_template_layout.json", "elstat_manual_layout.json", "elstat_detected_layout.json", "elstat_custom_fields.json")
 
 DATA_DIR = SETTINGS_CSV = HISTORY_CSV = MONTHS_CSV = PREFS_JSON = ARCHIVE_DIR = COUNTRY_MAPPINGS_FILE = ""
 
@@ -333,7 +351,7 @@ def init_storage():
 
 
 # ------------------------------------------------------------- preferences
-BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading')
+BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading', 'auto_populate_layout')
 DEFAULT_PREFS = {
     'language': 'el',                          # 'el' | 'en'  (interface language)
     'theme': 'light',                          # 'light' | 'dark' | 'auto'  (follow the system)
@@ -342,8 +360,10 @@ DEFAULT_PREFS = {
     'filename_pattern': 'ELSTAT_{year}_{month}',
     'excel_dir': '',                           # '' = remember the last folder
     'template_pdf': '',                        # '' = template_elstat_report.pdf next to the program
-    'smart_ack': False,                        # the 'experimental' notice of smart layout was accepted
-    'pdf_mode': 'overlay',                     # 'overlay' (fixed positions) | 'smart' (layout read from the template) | 'manual' (layout editor)
+    'smart_ack': False,                        # the 'experimental' notice of Smart Shift was accepted
+    'detect_ack': False,                       # the 'experimental' notice of Smart Field Detection was accepted
+    'pdf_mode': 'overlay',                     # 'overlay' (Legacy: fixed coordinates) | 'smart' (Smart Shift) | 'detect' (Smart Field Detection) | 'manual' (layout editor)
+    'auto_populate_layout': True,              # the layout editor starts from what the selected PDF method would do (off = blank canvas)
     'open_after': False,
     'confirm_overwrite': True,
     'keep_archive': True,
@@ -406,7 +426,7 @@ def load_prefs():
         prefs['output_mode'] = 'program'
     if prefs['language'] not in LANGUAGES:
         prefs['language'] = DEFAULT_PREFS['language']
-    if prefs['pdf_mode'] not in ('overlay', 'smart', 'manual'):
+    if prefs['pdf_mode'] not in ('overlay', 'smart', 'detect', 'manual'):
         prefs['pdf_mode'] = DEFAULT_PREFS['pdf_mode']
     if prefs['theme'] not in ('light', 'dark', 'auto'):
         prefs['theme'] = DEFAULT_PREFS['theme']
@@ -1491,8 +1511,8 @@ def make_year_summary_pdf(year, hist, hotel, out_path):
     c.save()
 
 
-# ------------------------------------------------------- template layout ("smart layout" mode)
-# Default mode writes every value at fixed positions on top of the blank PDF.  "Smart layout" mode
+# ------------------------------------------------------- template layout ("Smart Shift" mode)
+# Default mode writes every value at fixed positions on top of the blank PDF.  "Smart Shift" mode
 # first READS the template (every piece of text and where it sits), compares it with a saved
 # snapshot of the template the fixed positions were made for (the "reference layout") and moves
 # every value by exactly as much as that part of the form has moved.
@@ -1869,52 +1889,73 @@ def _merge_manual_item(base, saved):
             base[key] = saved[key]
     if isinstance(saved.get('index'), int) and not isinstance(saved.get('index'), bool):
         base['index'] = saved['index']
+    try:
+        width = float(saved['maxw'])
+        if math.isfinite(width) and width > 0:
+            base['maxw'] = width
+    except (KeyError, TypeError, ValueError):
+        pass
     if isinstance(saved.get('split'), bool):
         base['split'] = saved['split']
     if isinstance(saved.get('tail'), bool):
         base['tail'] = saved['tail']
 
 
-def load_manual_layout():
-    """The saved manual layout merged over the program's own positions (so new fields always exist)."""
-    layout = manual_default_layout()
-    try:
-        with open(manual_layout_file(), encoding='utf-8') as f:
-            data = json.load(f)
-        saved = data.get('items', {}) if isinstance(data, dict) else {}
-    except Exception:
-        saved = {}
+def _layout_from_saved(data):
+    """A layout made of saved data, or None when the data is not a layout.  Layouts saved by this version carry
+    'known' (the program's own fields at the time): an own field that is not in them stays out - a blank canvas stays
+    blank - and only fields added to the program later are filled in with their default position.  Older files
+    (no 'known') are merged over the program's own positions, as before."""
+    if not isinstance(data, dict):
+        return None
+    saved = data.get('items', {})
     if not isinstance(saved, dict):
         saved = {}
+    defaults = manual_default_layout()
+    known = data.get('known')
+    if isinstance(known, list):
+        layout = {'version': 1, 'items': {fid: it for fid, it in defaults['items'].items() if fid not in known}}
+    else:
+        layout = defaults
+    items = layout['items']
     for fid, it in saved.items():
-        if not isinstance(it, dict):
+        if not isinstance(it, dict) or not isinstance(fid, str):
             continue
-        if fid in layout['items']:
-            _merge_manual_item(layout['items'][fid], it)
-        elif not isinstance(fid, str):
-            continue
+        if fid in defaults['items']:
+            _merge_manual_item(items.setdefault(fid, copy.deepcopy(defaults['items'][fid])), it)
         elif it.get('custom') and fid.startswith('custom_'):
-            layout['items'][fid] = base = manual_new_item(custom=True)
+            items[fid] = base = manual_new_item(custom=True)
             _merge_manual_item(base, it)
         elif it.get('source') and fid.startswith('extra_'):
-            layout['items'][fid] = base = manual_new_item(size=10.0)
+            items[fid] = base = manual_new_item(size=10.0)
             _merge_manual_item(base, it)
         elif it.get('parent') and '@' in fid:
-            layout['items'][fid] = base = manual_new_item()
+            items[fid] = base = manual_new_item()
             _merge_manual_item(base, it)
-    items = layout['items']
     for fid in [f for f, i in items.items() if i.get('parent') and not items.get(i['parent'], {}).get('split')]:
         del items[fid]                      # a piece whose whole is not split any more
     for fid, i in items.items():
         if i.get('split') and not any(c.get('parent') == fid for c in items.values()):
             i['split'] = False
+    layout['known'] = [f[0] for f in MANUAL_FIELDS]
     return layout
+
+
+def load_manual_layout():
+    """The saved manual layout (or the program's own positions when nothing was saved)."""
+    try:
+        with open(manual_layout_file(), encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    return _layout_from_saved(data) or manual_default_layout()
 
 
 def save_manual_layout(layout):
     ensure_data_dir()
     with open(manual_layout_file(), 'w', encoding='utf-8') as f:
-        json.dump({'version': 1, 'items': layout['items']}, f, ensure_ascii=False, indent=1)
+        json.dump({'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS]},
+                  f, ensure_ascii=False, indent=1)
 
 
 def delete_manual_layout():
@@ -1922,6 +1963,548 @@ def delete_manual_layout():
         os.remove(manual_layout_file())
     except FileNotFoundError:
         pass
+
+
+# ------------------------------------------------------- Smart Field Detection ("AI / Auto-Detect")
+# The third way of filling the form.  Nothing is hardcoded for the program's own fields: the blank template is
+# scanned on the fly (every word with its exact box, every drawn line), the printed labels are recognised, the
+# table grid is aligned and a layout with a position for every field is computed from it.  The result is a
+# normal layout (the same kind the layout editor works with), so it is drawn by the same code as "Set manually".
+# Only what the user adds himself (own texts, variables, extra items) stays manual - it is made in the editor.
+DETECT_LAYOUT_NAME = "elstat_detected_layout.json"
+DETECT_MIN_FIELDS = 0.55        # share of the fields that must be found, otherwise the template is not recognised
+DETECT_MIN_ROWS = 0.6           # ...and the same for the country rows
+DETECT_GAP = 4.0                # points between a printed label and the value written after it
+DETECT_LIFT = 2.5               # points a value sits above the line it is written on
+DETECT_TOTAL_CODES = {'2.1': '05', '2.2': '10', '2.3': '20', '2': '25', '3': '35', '4': '45', '5': '55',
+                      '6': '60', '8': '65', '9': '70'}      # the printed code of every total row of the form
+
+
+class DetectError(Exception):
+    """The template could not be scanned or recognised."""
+
+
+def detect_layout_file():
+    return os.path.join(DATA_DIR, DETECT_LAYOUT_NAME)
+
+
+def detect_cache_saved():
+    return os.path.isfile(detect_layout_file())
+
+
+def _dn(s):
+    """Comparison form of a printed text: normalised, without colons and dots."""
+    return norm(s).replace(':', '').replace('.', '')
+
+
+def _page_words(page):
+    """[{'s','x0','x1','y0','y1','by'}] - every word of a page. y0/y1 = box of the word, by = baseline of its first letter."""
+    tp = page.get_textpage()
+    count = tp.count_chars()
+    text = tp.get_text_range()
+    words, cur = [], None
+    for i in range(count):
+        ch = text[i] if i < len(text) else ' '
+        try:
+            l, b, r, t = tp.get_charbox(i)
+        except Exception:
+            continue
+        if ch.isspace() or r <= l:
+            if cur:
+                words.append(cur)
+                cur = None
+            continue
+        if cur and (l - cur['x1'] > 0.9 * max(t - b, 2.0) or abs(b - cur['by']) > 2.6 or l < cur['x0'] - 1):
+            words.append(cur)
+            cur = None
+        if cur is None:
+            cur = {'s': ch, 'x0': l, 'x1': r, 'y0': b, 'y1': t, 'by': b}
+        else:
+            cur['s'] += ch
+            cur['x1'] = max(cur['x1'], r)
+            cur['y0'] = min(cur['y0'], b)
+            cur['y1'] = max(cur['y1'], t)
+    if cur:
+        words.append(cur)
+    return words
+
+
+def _page_lines(page, pdfium_raw):
+    """([{'y','x0','x1'}], [{'x','y0','y1'}]) - the straight horizontal and vertical lines drawn on a page."""
+    hl, vl = [], []
+    for obj in page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_PATH]):
+        try:
+            l, b, r, t = obj.get_bounds()
+        except Exception:
+            continue
+        if t - b < 1.7 and r - l > 3:
+            hl.append({'y': (b + t) / 2, 'x0': l + 0.5, 'x1': r - 0.5})
+        elif r - l < 1.7 and t - b > 3:
+            vl.append({'x': (l + r) / 2, 'y0': b + 0.5, 'y1': t - 0.5})
+    return hl, vl
+
+
+def _read_geometry(template_pdf):
+    """Words and lines of the first 2 pages of a template."""
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_raw
+    except Exception:
+        raise DetectError(T("Η αυτόματη ανίχνευση χρειάζεται το pypdfium2 (pip install pypdfium2).",
+                            "Auto-detection needs pypdfium2 (pip install pypdfium2)."))
+    pages = []
+    with _PDFIUM_LOCK:
+        try:
+            doc = _open_pdfium(pdfium, template_pdf)
+        except Exception as e:
+            raise DetectError(T(f"Δεν μπόρεσα να διαβάσω το template: {e}", f"I could not read the template: {e}"))
+        try:
+            if len(doc) < 2:
+                raise DetectError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
+            for pi in range(2):
+                page = doc[pi]
+                width, height = page.get_size()
+                hl, vl = _page_lines(page, pdfium_raw)
+                pages.append({'size': (float(width), float(height)), 'words': _page_words(page), 'h': hl, 'v': vl})
+        except DetectError:
+            raise
+        except Exception as e:
+            raise DetectError(T(f"Δεν μπόρεσα να σαρώσω το template: {e}", f"I could not scan the template: {e}"))
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+    return pages
+
+
+def _find_phrase(page, phrase, max_y=None, min_y=None, near_y=None):
+    """The first run of consecutive words of one text line that spells `phrase` (compared in a normalised form).
+    -> {'x0','x1','y','words'} or None.  max_y/min_y limit where the phrase may be, near_y prefers the closest one."""
+    target = _dn(phrase)
+    words = sorted(page['words'], key=lambda w: (-round(w['by'] / 2.0), w['x0']))
+    found = []
+    for i, w in enumerate(words):
+        acc = ''
+        for j in range(i, len(words)):
+            wj = words[j]
+            if abs(wj['by'] - w['by']) > 2.6 or (j > i and wj['x0'] < words[j - 1]['x0']):
+                break
+            acc += _dn(wj['s'])
+            if acc == target:
+                y = w['by']
+                if (max_y is None or y < max_y) and (min_y is None or y > min_y):
+                    found.append({'x0': w['x0'], 'x1': wj['x1'], 'y': y, 'words': words[i:j + 1]})
+                break
+            if not target.startswith(acc):
+                break
+    if not found:
+        return None
+    if near_y is not None:
+        return min(found, key=lambda m: abs(m['y'] - near_y))
+    return found[0]
+
+
+def _find_word_starting(page, prefix):
+    """First word whose normalised text starts with `prefix` -> the word dict, or None."""
+    p = _dn(prefix)
+    for w in sorted(page['words'], key=lambda w: (-round(w['by'] / 2.0), w['x0'])):
+        if _dn(w['s']).startswith(p):
+            return w
+    return None
+
+
+def _underlines(page, y, x_from, x_to=None, tol=4.5):
+    """Horizontal lines at height `y` (+-tol) that start at or after x_from, left to right."""
+    out = [h for h in page['h'] if abs(h['y'] - y) <= tol and h['x1'] > x_from + 2 and (x_to is None or h['x0'] < x_to)]
+    return sorted(out, key=lambda h: h['x0'])
+
+
+def _box_groups(page):
+    """Rows of equally spaced vertical lines of the same height (the digit boxes of the form).
+    -> [{'x0': first line, 'pitch', 'n': number of boxes, 'y0', 'y1'}]"""
+    short = [v for v in page['v'] if 5 < v['y1'] - v['y0'] < 30]
+    short.sort(key=lambda v: (round(v['y0'] / 1.5), v['x']))
+    clusters = []
+    for v in short:
+        for c in clusters:
+            if abs(c[0]['y0'] - v['y0']) < 1.2 and abs(c[0]['y1'] - v['y1']) < 1.2:
+                c.append(v)
+                break
+        else:
+            clusters.append([v])
+    groups = []
+    for c in clusters:
+        c.sort(key=lambda v: v['x'])
+        run = [c[0]]
+        for v in c[1:]:
+            if len(run) < 2 or abs((v['x'] - run[-1]['x']) - (run[1]['x'] - run[0]['x'])) < 1.2:
+                if len(run) == 1 and not 6 < v['x'] - run[0]['x'] < 30:
+                    run = [v]
+                    continue
+                run.append(v)
+            else:
+                if len(run) >= 2:
+                    groups.append(run)
+                run = [v]
+        if len(run) >= 2:
+            groups.append(run)
+    return [{'x0': r[0]['x'], 'pitch': (r[-1]['x'] - r[0]['x']) / (len(r) - 1), 'n': len(r) - 1,
+             'y0': r[0]['y0'], 'y1': r[0]['y1']} for r in groups]
+
+
+def _table_columns(page):
+    """The columns of the country table of one page: {'name': (x0,x1), 'code': ..., 'clients': ..., 'nights': ...}
+    taken from the long vertical lines and from where the headers PELATON / DIANYKTEREYSEON are printed."""
+    xs = sorted({round(v['x'], 1) for v in page['v'] if v['y1'] - v['y0'] > 150})
+    merged = []
+    for x in xs:
+        if not merged or x - merged[-1] > 2.0:
+            merged.append(x)
+    cols = list(zip(merged, merged[1:]))
+    cp, cn = _find_word_starting(page, 'ΠΕΛΑΤΩΝ'), _find_word_starting(page, 'ΔΙΑΝΥΚΤΕΡΕΥ')
+    if not cols or cp is None or cn is None:
+        return None
+
+    def holding(word):
+        mid = (word['x0'] + word['x1']) / 2.0
+        return next((i for i, (a, b) in enumerate(cols) if a <= mid <= b), None)
+    ic, inn = holding(cp), holding(cn)
+    if ic is None or inn is None or ic < 2 or inn <= ic:
+        return None
+    return {'name': cols[ic - 2], 'code': cols[ic - 1], 'clients': cols[ic], 'nights': cols[inn]}
+
+
+def _page_rows(page, columns, targets):
+    """{target: baseline} of every country row found in the name column of a page."""
+    x0, x1 = columns['name']
+    inside = [w for w in page['words'] if w['x0'] >= x0 - 2 and w['x1'] <= x1 + 6]
+    inside.sort(key=lambda w: (-round(w['by'] / 2.0), w['x0']))
+    lines, cur = [], []
+    for w in inside:
+        if cur and abs(w['by'] - cur[0]['by']) > 2.6:
+            lines.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        lines.append(cur)
+    rows = {}
+    for line in lines:
+        line.sort(key=lambda w: w['x0'])
+        text = ''.join(norm(w['s']) for w in line)
+        hit = text if text in targets else next((t for t in sorted(targets, key=len, reverse=True)
+                                                 if text.startswith(t)), None)
+        if hit and hit not in rows:
+            rows[hit] = round(line[0]['by'], 2)
+    return rows
+
+
+def _item(page, x, y, size, align='left', step=0.0, maxw=None):
+    it = manual_new_item(page, round(float(x), 2), round(float(y), 2), size, step)
+    it['align'] = align
+    if maxw:
+        it['maxw'] = round(float(maxw), 1)
+    return it
+
+
+def _after_label(page_geo, page, label, size, fields_out, fid, gap=DETECT_GAP):
+    """A value written after a printed label (and on its line, if one is drawn there)."""
+    start = label['x1'] + gap
+    limit = None
+    under = [h for h in _underlines(page_geo, label['y'], label['x1'], tol=3.5)]
+    if under:
+        first = under[0]
+        if first['x0'] > start and first['x0'] - label['x1'] <= 25:
+            start = first['x0'] + 3.0
+        if first['x0'] <= start + 6:
+            limit = first['x1']
+    rivals = [w['x0'] for w in page_geo['words'] if abs(w['by'] - label['y']) < 3 and w['x0'] > start + 8]
+    if rivals:
+        limit = min(limit, min(rivals) - 6) if limit else min(rivals) - 6
+    limit = limit or min(page_geo['size'][0] - 40, start + 200)
+    fields_out[fid] = _item(page, start, label['y'] + DETECT_LIFT, size, maxw=max(limit - start, 20))
+    return True
+
+
+def _slot_item(page, slot, y, size):
+    return _item(page, (slot[0] + slot[1]) / 2.0, y, size, align='center', maxw=max(slot[1] - slot[0] - 1, 8))
+
+
+def _date_slots(page_geo, label):
+    """Three writing slots (day / month / year) of a date row: the drawn underlines, else the gaps between the slashes."""
+    under = _underlines(page_geo, label['y'], label['x1'], tol=4.5)
+    under = [u for u in under if u['x1'] - u['x0'] < 90][:3]
+    if len(under) == 3:
+        return [(u['x0'], u['x1']) for u in under], under[0]['y']
+    slashes = sorted([w for w in page_geo['words'] if w['s'] == '/' and abs(w['by'] - label['y']) < 3
+                      and w['x0'] > label['x1']], key=lambda w: w['x0'])[:2]
+    if len(slashes) == 2:
+        return [(label['x1'] + 3, slashes[0]['x0'] - 2), (slashes[0]['x1'] + 2, slashes[1]['x0'] - 2),
+                (slashes[1]['x1'] + 2, slashes[1]['x1'] + 34)], label['y'] - 0.6
+    return None, None
+
+
+def detect_template_fields(template_pdf):
+    """Scans the blank template and computes a position for every field of the form.
+    -> (layout, report).  Raises DetectError when the template cannot be read or is not recognised safely.
+    report = {'ok', 'found': [ids], 'missing': [ids], 'rows': {'found', 'expected', 'missing': [targets]},
+              'row_ys': [{target: y}, {target: y}], 'sha1', 'sizes'}"""
+    geo = _read_geometry(template_pdf)
+    with open(template_pdf, 'rb') as f:
+        sha1 = hashlib.sha1(f.read()).hexdigest()
+    p0, p1 = geo[0], geo[1]
+    out, how = {}, {}
+
+    def got(fid):
+        how[fid] = True
+
+    # ---- survey year and month: written on the line after their labels
+    year = _find_phrase(p0, 'Έτος έρευνας')
+    month = _find_phrase(p0, 'Μήνας', near_y=year['y'] if year else None)
+    for fid, label in (('year', year), ('month', month)):
+        if label:
+            under = [u for u in _underlines(p0, label['y'], label['x1'] - 1, tol=4.5) if u['x0'] - label['x1'] < 45]
+            if under:
+                out[fid] = _slot_item(0, (under[0]['x0'], under[0]['x1']), under[0]['y'] + DETECT_LIFT - 0.3, 11.0)
+                got(fid)
+            else:
+                out[fid] = _item(0, label['x1'] + 12, label['y'] + DETECT_LIFT, 11.0)
+                got(fid)
+
+    # ---- the hotel lines: a value after each printed label
+    type_label = _find_phrase(p0, 'Είδος καταλύματος')
+    ceiling = type_label['y'] + 2 if type_label else None
+    for fid, phrase, size in (('type', 'Είδος καταλύματος', 11.0), ('category', 'Κατηγορία', 11.0),
+                              ('name', 'Τίτλος καταλύματος', 11.0), ('nomos', 'Νομός', 10.0),
+                              ('dimotiki', 'Δημοτική ενότητα', 10.0), ('odos', 'Οδός', 10.0),
+                              ('arithmos', 'Αριθμός', 10.0), ('tk', 'ΤΚ', 10.0),
+                              ('phone', 'Τηλέφωνα', 11.0)):
+        label = _find_phrase(p0, phrase, max_y=ceiling + 1 if fid != 'type' and ceiling else None,
+                             near_y=type_label['y'] if (type_label and fid in ('type', 'category')) else None)
+        if fid == 'phone':
+            label = _find_phrase(p0, phrase, max_y=type_label['y'] - 1 if type_label else None)
+        if label and _after_label(p0, 0, label, size, out, fid):
+            got(fid)
+    mail = None
+    for w in p0['words']:
+        if 'mail' in w['s'].lower() or _dn(w['s']).endswith('ΜΑΙΛ'):
+            if type_label is None or w['by'] < type_label['y']:
+                mail = {'x0': w['x0'], 'x1': w['x1'], 'y': w['by']}
+                break
+    if mail and _after_label(p0, 0, mail, 11.0, out, 'email'):
+        got('email')
+
+    # ---- the company: written under its printed label, inside the panel that is drawn there
+    comp = _find_phrase(p0, 'Επωνυμία επιχείρησης')
+    if comp:
+        cx = (comp['x0'] + comp['x1']) / 2.0
+        below = sorted([h for h in p0['h'] if h['y'] < comp['y'] - 8 and h['x0'] <= cx <= h['x1']
+                        and h['x1'] - h['x0'] < 250], key=lambda h: -h['y'])
+        if below:
+            panel = below[0]
+            out['company'] = _item(0, (panel['x0'] + panel['x1']) / 2.0, panel['y'] + 0.3 * (comp['y'] - panel['y']),
+                                   11.0, align='center', maxw=panel['x1'] - panel['x0'] - 14)
+            got('company')
+
+    # ---- digit boxes: VAT number, operating days, employees
+    groups = _box_groups(p0)
+
+    def put_boxes(fid, group, size=11.0):
+        h = group['y1'] - group['y0']
+        y = group['y0'] + (h - 0.72 * size) / 2.0 + 0.6
+        out[fid] = _item(0, group['x0'] + group['pitch'] / 2.0, y, size, align='center', step=group['pitch'])
+        got(fid)
+        how[fid] = group['n']
+
+    afm = _find_phrase(p0, 'ΑΦΜ')
+    if afm:
+        cand = [g for g in groups if g['y0'] - 4 <= afm['y'] <= g['y1'] + 4 and g['x0'] >= afm['x1'] - 2]
+        if cand:
+            put_boxes('afm', min(cand, key=lambda g: g['x0']))
+    for fid, phrase in (('days', 'Ημέρες λειτουργίας'), ('employees', 'Σύνολο εργαζομένων')):
+        label = _find_phrase(p0, phrase)
+        if label:
+            cx = (label['x0'] + label['x1']) / 2.0
+            cand = [g for g in groups if g['y1'] < label['y'] and abs(g['x0'] + g['pitch'] * g['n'] / 2.0 - cx) < 80]
+            if cand:
+                put_boxes(fid, max(cand, key=lambda g: g['y1']))
+
+    # ---- the period of operation: day / month / year slots of the "From" and "To" rows
+    period = _find_phrase(p0, 'Περίοδος λειτουργίας')
+    for prefix, phrase in (('date_from', 'Από'), ('date_to', 'Έως')):
+        label = _find_phrase(p0, phrase, max_y=period['y'] if period else None, near_y=(period['y'] - 50) if period else None)
+        slots, base = _date_slots(p0, label) if label else (None, None)
+        if slots:
+            for suffix, slot in zip(('d', 'm', 'y'), slots):
+                out[f'{prefix}_{suffix}'] = _slot_item(0, slot, base + 1.7, 11.0)
+                got(f'{prefix}_{suffix}')
+
+    # ---- signature date (page 2)
+    sign = _find_phrase(p1, 'Ημερομηνία')
+    slots, base = _date_slots(p1, sign) if sign else (None, None)
+    if slots:
+        for suffix, slot in zip(('d', 'm', 'y'), slots):
+            out[f'sign_{suffix}'] = _slot_item(1, slot, base + 1.4, 10.0)
+            got(f'sign_{suffix}')
+
+    # ---- the country table: columns, total rows, country rows
+    cols = [_table_columns(p0), _table_columns(p1)]
+    targets = set(MAPPED_TARGETS) | {norm('ΕΛΛΑΔΑ')}
+    row_ys = [{}, {}]
+    for pi, (pg, col) in enumerate(zip(geo, cols)):
+        if col is None:
+            continue
+        for kind, size, tag in (('clients', 9.0, 'c'), ('nights', 9.0, 'n')):
+            mid = (col[kind][0] + col[kind][1]) / 2.0
+            out[f'rows{pi}_{tag}'] = _item(pi, mid, 0.0, size, align='center')
+            got(f'rows{pi}_{tag}')
+        row_ys[pi] = _page_rows(pg, col, targets)
+        cx0, cx1 = col['code']
+        for key, code in DETECT_TOTAL_CODES.items():
+            if (key == '2.1') != (pi == 0):
+                continue
+            cand = [w for w in pg['words'] if w['s'] == code and cx0 - 1 <= w['x0'] and w['x1'] <= cx1 + 1]
+            if not cand:
+                continue
+            ys = round(cand[0]['by'], 2)
+            for kind, tag in (('clients', 'c'), ('nights', 'n')):
+                mid = (col[kind][0] + col[kind][1]) / 2.0
+                out[f'tot_{key}_{tag}'] = _item(pi, mid, ys, 10.0, align='center')
+                got(f'tot_{key}_{tag}')
+
+    # ---- what was found, what was not
+    wanted = [f[0] for f in MANUAL_FIELDS]
+    found = [f for f in wanted if f in out]
+    missing = [f for f in wanted if f not in out]
+    expected_rows = len(targets)
+    found_rows = sum(len(r) for r in row_ys)
+    rows_missing = sorted(t for t in targets if not any(t in r for r in row_ys))
+    report = {'ok': True, 'found': found, 'missing': missing, 'sha1': sha1, 'row_ys': row_ys,
+              'rows': {'found': found_rows, 'expected': expected_rows, 'missing': rows_missing},
+              'sizes': [g['size'] for g in geo], 'boxes': {k: v for k, v in how.items() if isinstance(v, int) and v is not True}}
+    if len(found) < DETECT_MIN_FIELDS * len(wanted) or found_rows < DETECT_MIN_ROWS * expected_rows:
+        report['ok'] = False
+        raise DetectError(T("Το template δεν αναγνωρίζεται με ασφάλεια: βρέθηκαν "
+                            f"{len(found)} από {len(wanted)} πεδία και {found_rows} από {expected_rows} γραμμές χωρών. "
+                            "Ίσως δεν είναι το σωστό έντυπο.",
+                            "The template cannot be recognised safely: "
+                            f"{len(found)} of {len(wanted)} fields and {found_rows} of {expected_rows} country rows were found. "
+                            "It may not be the right form."))
+    layout = manual_default_layout()
+    items = {}
+    for fid in wanted:
+        if fid in out:
+            items[fid] = out[fid]
+        else:                                           # not found: parked and hidden, to be placed by hand
+            base = layout['items'][fid]
+            parked = manual_new_item(base['page'], geo[base['page']]['size'][0] / 2.0, geo[base['page']]['size'][1] / 2.0,
+                                     base['size'], base['step'])
+            parked['visible'] = False
+            items[fid] = parked
+    layout = {'version': 1, 'items': items, 'known': wanted}
+    return layout, report
+
+
+def describe_detect_report(rep, tuned=False):
+    """The report of detect_template_fields() in words (current language)."""
+    n_found, n_missing = len(rep['found']), len(rep['missing'])
+    lines = [T(f"✓ Βρέθηκαν {n_found} από {n_found + n_missing} πεδία του δελτίου.",
+               f"✓ {n_found} of {n_found + n_missing} fields of the form were found.")]
+    rows = rep['rows']
+    lines.append(T(f"Γραμμές χωρών: {rows['found']} από {rows['expected']}.",
+                   f"Country rows: {rows['found']} of {rows['expected']}."))
+    if rep['missing']:
+        names = ", ".join(manual_label(f, {}, None) for f in rep['missing'])
+        lines.append(T(f"⚠ Δεν βρέθηκαν (κρύφτηκαν - τοποθετήστε τα στον επεξεργαστή): {names}",
+                       f"⚠ Not found (hidden - place them in the editor): {names}"))
+    if rows['missing']:
+        lines.append(T("⚠ Χώρες χωρίς γραμμή στο template: ", "⚠ Countries without a row in the template: ")
+                     + ", ".join(_pretty_target(t) for t in rows['missing']))
+    if tuned:
+        lines.append(T("✎ Χρησιμοποιούνται οι προσαρμογές σας από τον επεξεργαστή.",
+                       "✎ Your fine-tuning from the editor is in use."))
+    return "\n".join(lines)
+
+
+# ---- the cache of a fine-tuned detected layout (it lives only while Smart Field Detection stays selected)
+def load_detect_cache():
+    """The fine-tuned detected layout, or None."""
+    try:
+        with open(detect_layout_file(), encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    layout = _layout_from_saved(data)
+    if layout is not None:
+        layout['sha1'] = data.get('sha1', '')
+    return layout
+
+
+def save_detect_cache(layout, template_pdf=None):
+    ensure_data_dir()
+    sha1 = ''
+    if template_pdf:
+        try:
+            with open(template_pdf, 'rb') as f:
+                sha1 = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            pass
+    with open(detect_layout_file(), 'w', encoding='utf-8') as f:
+        json.dump({'version': 1, 'items': layout['items'], 'known': [fid for fid, *_r in MANUAL_FIELDS],
+                   'sha1': sha1, 'saved': datetime.datetime.now().isoformat(timespec='seconds')},
+                  f, ensure_ascii=False, indent=1)
+
+
+def delete_detect_cache():
+    try:
+        os.remove(detect_layout_file())
+    except FileNotFoundError:
+        pass
+
+
+# ---- the starting layout of the editor: whatever the selected way of filling the form would do
+def blank_layout():
+    return {'version': 1, 'items': {}, 'known': [fid for fid, *_r in MANUAL_FIELDS]}
+
+
+def smart_shift_layout(template_pdf):
+    """The fixed positions moved the way Smart Shift would move them on this template. -> (layout, note or None)"""
+    base = manual_default_layout()
+    layout, report = analyze_template(template_pdf)
+    if layout is None:
+        return base, T("Η Έξυπνη μετατόπιση δεν εφαρμόστηκε - χρησιμοποιήθηκαν οι σταθερές θέσεις.\n",
+                       "Smart Shift was not applied - the fixed positions were used.\n") + describe_report(report)
+    try:
+        rows = detect_template_rows(template_pdf)
+    except Exception:
+        rows = [{}, {}]
+    for fid, it in base['items'].items():
+        page = it['page']
+        if fid.startswith('rows'):
+            ys = sorted(rows[page].values()) if page < len(rows) else []
+            ry = ys[len(ys) // 2] if ys else 400.0
+            it['x'] = round(it['x'] + layout.offset(page, it['x'], ry)[0], 2)
+        else:
+            x, y = layout.place(page, it['x'], it['y'])
+            it['x'], it['y'] = round(x, 2), round(y, 2)
+    return base, None
+
+
+def build_mode_layout(mode, template_pdf):
+    """The layout that a way of filling the form produces on this template, as the editor's starting point.
+    -> (layout, note or None).  Smart Field Detection always scans again (it never reads the fine-tuned cache)."""
+    if mode == 'smart':
+        return smart_shift_layout(template_pdf)
+    if mode == 'detect':
+        try:
+            layout, _rep = detect_template_fields(template_pdf)
+            return layout, None
+        except DetectError as e:
+            return manual_default_layout(), str(e) + "\n" + T("Χρησιμοποιήθηκαν οι σταθερές θέσεις.",
+                                                              "The fixed positions were used.")
+    if mode == 'manual':
+        return load_manual_layout(), None
+    return manual_default_layout(), None
 
 
 def _pretty_target(key):
@@ -2216,6 +2799,13 @@ def _hex_rgb(color):
 
 def _manual_put(can, it, x, y, text):
     step = it.get('step') or 0
+    maxw = it.get('maxw')
+    if maxw and not step and text:          # a long value shrinks instead of running into the next label
+        font, size = can._fontname, it['size']
+        while size > 6.0 and pdfmetrics.stringWidth(text, font, size) > maxw:
+            size -= 0.5
+        if size != it['size']:
+            can.setFont(font, size)
     draw = {'center': can.drawCentredString, 'right': can.drawRightString}.get(it.get('align'), can.drawString)
     if step:
         for i, ch in enumerate(text):
@@ -2449,7 +3039,8 @@ def commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode='overla
 
 
 def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, monthly_data,
-                         rows_override=None, save_history=True, pdf_mode='overlay', manual_layout=None):
+                         rows_override=None, save_history=True, pdf_mode='overlay', manual_layout=None,
+                         detect_layout=None):
     # 1. Φόρτωση Γραμματοσειράς
     font_name = "Helvetica"
     font_paths = [
@@ -2528,24 +3119,58 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     if len(reader.pages) < 2:
         raise ValueError(T("Το template PDF πρέπει να έχει 2 σελίδες.", "The template PDF must have 2 pages."))
 
-    # "Smart layout": find out where everything sits on THIS template; any failure -> default method
+    # "Smart Shift": find out where everything sits on THIS template; any failure -> default method
     layout, layout_warning, layout_info = None, None, None
     if pdf_mode == 'smart':
         layout, layout_report = analyze_template(template_pdf)
         if layout is None:
-            layout_warning = (T("Η έξυπνη διάταξη δεν εφαρμόστηκε - χρησιμοποιήθηκε η προεπιλεγμένη μέθοδος.\n",
-                                "Smart layout was not applied - the default method was used.\n")
+            layout_warning = (T("Η έξυπνη μετατόπιση δεν εφαρμόστηκε - χρησιμοποιήθηκε η προεπιλεγμένη μέθοδος.\n",
+                                "Smart Shift was not applied - the default method was used.\n")
                               + describe_report(layout_report))
         else:
             shifts = layout_report['pages']
             biggest = max(p['max_shift'] for p in shifts)
-            layout_info = T(f"Έξυπνη διάταξη: μέγιστη μετατόπιση {biggest:.1f} pt.",
-                            f"Smart layout: largest shift {biggest:.1f} pt.")
+            layout_info = T(f"Έξυπνη μετατόπιση: μέγιστη μετατόπιση {biggest:.1f} pt.",
+                            f"Smart Shift: largest shift {biggest:.1f} pt.")
             if biggest > LARGE_SHIFT:
-                layout_warning = T(f"Η έξυπνη διάταξη εφαρμόστηκε, αλλά το template έχει μετακινηθεί πολύ ({biggest:.0f} pt). "
+                layout_warning = T(f"Η έξυπνη μετατόπιση εφαρμόστηκε, αλλά το template έχει μετακινηθεί πολύ ({biggest:.0f} pt). "
                                    "Ελέγξτε προσεκτικά το δελτίο πριν το υποβάλετε.",
-                                   f"Smart layout was applied, but the template moved a lot ({biggest:.0f} pt). "
+                                   f"Smart Shift was applied, but the template moved a lot ({biggest:.0f} pt). "
                                    "Check the form carefully before submitting.")
+
+    # "Smart Field Detection": scan the blank template, then fill it with the detected (or fine-tuned) layout
+    detect_rows = detect_report = detect_used = None
+    if pdf_mode == 'detect':
+        try:
+            fresh, detect_report = detect_template_fields(template_pdf)
+        except DetectError as e:
+            pdf_mode = 'overlay'
+            layout_warning = (T("Η Έξυπνη ανίχνευση πεδίων δεν εφαρμόστηκε - χρησιμοποιήθηκε η παλιά μέθοδος (σταθερές συντεταγμένες).\n",
+                                "Smart Field Detection was not applied - the Legacy method (fixed coordinates) was used.\n") + str(e))
+        else:
+            detect_rows = detect_report['row_ys']
+            tuned = detect_layout if detect_layout is not None else load_detect_cache()
+            detect_used = tuned if tuned is not None else fresh
+            n_found = len(detect_report['found'])
+            layout_info = T(f"Έξυπνη ανίχνευση: {n_found} από {n_found + len(detect_report['missing'])} πεδία",
+                            f"Smart Field Detection: {n_found} of {n_found + len(detect_report['missing'])} fields")
+            notes = []
+            if tuned is None and detect_report['missing']:
+                notes.append(T("Δεν βρέθηκαν και δεν γράφτηκαν: ", "Not found and not written: ")
+                             + ", ".join(manual_label(f, {}, None) for f in detect_report['missing']))
+            if tuned is not None and detect_layout is None and tuned.get('sha1') and tuned['sha1'] != detect_report['sha1']:
+                notes.append(T("Το template άλλαξε μετά τις προσαρμογές σας στον επεξεργαστή. Ελέγξτε το δελτίο ή ξανατρέξτε "
+                               "την ανίχνευση από τις Ρυθμίσεις.",
+                               "The template changed after your fine-tuning in the editor. Check the form or rerun the "
+                               "detection from Settings."))
+            if detect_report['rows']['missing']:
+                notes.append(T("Δεν βρέθηκε γραμμή στο template για: ", "No row found in the template for: ")
+                             + ", ".join(_pretty_target(t) for t in detect_report['rows']['missing']
+                                         if t in {norm(c) for c in pdf_data}))
+                if notes[-1].endswith(": "):
+                    notes.pop()
+            if notes:
+                layout_warning = T("Έξυπνη ανίχνευση πεδίων:\n", "Smart Field Detection:\n") + "\n".join(notes)
 
     def place(page_num, x, y):
         return layout.place(page_num, x, y) if layout else (x, y)
@@ -2566,6 +3191,12 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
 
     if norm('ΤΟΥΡΚΙΑ') in pdf_data and norm('ΤΟΥΡΚΙΑ') not in coord_map[1]:
         coord_map[1][norm('ΤΟΥΡΚΙΑ')] = place(1, 265, 555.2222)[1]
+
+    if detect_rows:                         # rows read from the template by the detection win over the plain text scan
+        for i in range(2):
+            for target, y in detect_rows[i].items():
+                if target in pdf_data:
+                    coord_map[i][target] = y
 
     fixed_y = {
         '2.1': 46.5, '2.2': 699.5, '2.3': 520.0, '2': 500.1,
@@ -2680,6 +3311,9 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     manual = manual_values = None
     if pdf_mode == 'manual':
         manual = manual_layout if manual_layout is not None else load_manual_layout()
+    elif pdf_mode == 'detect':
+        manual = copy.deepcopy(detect_used)
+    if manual is not None:
         manual_values = manual_field_values(settings_data, monthly_data, totals)
 
     def create_manual_overlay(page_num):
@@ -2726,7 +3360,8 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     ]
     return {'unmapped': unmapped, 'excel_total': excel_total, 'computed_total': computed, 'summary': summary,
             'layout_warning': layout_warning, 'layout_info': layout_info, 'pdf_data': pdf_data,
-            'live_values': live_values}
+            'live_values': live_values, 'layout_used': copy.deepcopy(manual) if manual is not None else None,
+            'detect_report': detect_report, 'pdf_mode_used': pdf_mode}
 
 
 # ----------------------------------------------------------------- look & feel
@@ -3375,32 +4010,72 @@ MANUAL = [
         ('h', ("Αρχεία Excel από το Protel", "Excel files from Protel")),
         ('p', ("Από ποιον φάκελο ξεκινούν τα **Επιλογή Excel…** και **Πιο πρόσφατο**. Κενό σημαίνει ο φάκελος του τελευταίου Excel που χρησιμοποιήσατε.",
                "The folder where **Choose Excel…** and **Latest** start. Empty means the folder of the last Excel you used.")),
-        ('h', ("Τρόπος συμπλήρωσης του PDF (η έξυπνη διάταξη είναι πειραματική)",
-               "How the PDF is filled in (smart layout is experimental)")),
-        ('p', ("**Πάνω στο template** (προεπιλογή) γράφει τις τιμές σε σταθερές θέσεις πάνω στο άδειο PDF. "
-               "**Έξυπνη διάταξη** (πειραματική) διαβάζει το template, βρίσκει πού βρίσκεται τώρα κάθε τμήμα του και "
-               "τοποθετεί τις τιμές αναλόγως - χρήσιμο αν η ΕΛΣΤΑΤ αλλάξει λίγο το έντυπο (μετατοπισμένες γραμμές, περιθώρια, αποστάσεις).",
-               "**On top of the template** (default) writes the values at fixed positions on the blank PDF. "
-               "**Smart layout** (experimental) reads the template, finds where each part of it now sits and places "
-               "the values accordingly - useful if ELSTAT changes the form slightly (shifted lines, margins, spacing).")),
-        ('warn', ("Η έξυπνη διάταξη είναι πειραματική λειτουργία. Ελέγχετε πάντα το δελτίο πριν το υποβάλετε. "
-                  "Αν κάτι δεν πάει καλά, επιλέξτε ξανά «Πάνω στο template».",
-                  "Smart layout is an experimental feature. Always check the form before submitting it. "
-                  "If anything looks wrong, select “On top of the template” again.")),
-        ('step', ("Επιλέξτε «Έξυπνη διάταξη». Τα πρόσθετα κουμπιά εμφανίζονται μόνο όταν είναι επιλεγμένη.",
-                  "Select “Smart layout”. The extra buttons appear only while it is selected.")),
+        ('h', ("Τρόπος συμπλήρωσης του PDF", "How the PDF is filled in")),
+        ('p', ("Υπάρχουν τέσσερις τρόποι. Η **Παλιά μέθοδος** είναι η δοκιμασμένη· η **Έξυπνη μετατόπιση** και η **Έξυπνη "
+               "ανίχνευση πεδίων** είναι πειραματικές και μπορούν να αποτύχουν, οπότε το δελτίο φτιάχνεται με την παλιά μέθοδο και "
+               "εμφανίζεται προειδοποίηση.",
+               "There are four ways. The **Legacy** method is the proven one; **Smart Shift** and **Smart Field Detection** are "
+               "experimental and can fail, in which case the form is made with the Legacy method and a warning is shown.")),
+        ('li', ("**Παλιά μέθοδος (σταθερές συντεταγμένες) · LEGACY**: οι τιμές γράφονται σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
+                "**Legacy (Fixed Coordinates)**: the values are written at fixed positions on the blank PDF. This is how the program has always worked.")),
+        ('li', ("**Έξυπνη μετατόπιση (Smart Shift) · πειραματική**: διαβάζει σημεία-άγκυρες του template, μετρά πόσο μετακινήθηκαν σε "
+                "σχέση με τη διάταξη αναφοράς (διανύσματα μετατόπισης και χωρική παρεμβολή IDW) και μετατοπίζει ανάλογα τις σταθερές "
+                "συντεταγμένες. Χρειάζεται διάταξη αναφοράς.",
+                "**Smart Shift · experimental**: reads anchor texts of the template, measures how far they moved against the reference "
+                "layout (delta vectors and IDW spatial interpolation) and shifts the fixed coordinates accordingly. It needs a reference layout.")),
+        ('li', ("**Έξυπνη ανίχνευση πεδίων (AI / αυτόματη ανίχνευση) · πειραματική**: πλήρως αυτόνομη. Σαρώνει το άδειο PDF εκείνη τη "
+                "στιγμή, διαβάζει τις ετικέτες, ευθυγραμμίζει τον πίνακα και υπολογίζει τις συντεταγμένες χωρίς καμία σταθερή τιμή για "
+                "τα πεδία του προγράμματος. Δεν χρειάζεται αναφορά. Χρειάζεται το pypdfium2. Δικά σας πεδία και κείμενα μένουν χειροκίνητα (επεξεργαστής διάταξης).",
+                "**Smart Field Detection (AI / Auto-Detect) · experimental**: fully autonomous. It scans the blank PDF on the fly, reads "
+                "the labels, aligns the table grid and computes the coordinates with nothing hardcoded for the program's own fields. "
+                "No reference is needed. It requires pypdfium2. Your own fields and texts stay manual (layout editor).")),
+        ('li', ("**Χειροκίνητη τοποθέτηση**: τα βάζετε όλα εσείς στον επεξεργαστή διάταξης.",
+                "**Set manually**: you place everything yourself in the layout editor.")),
+        ('warn', ("Οι πειραματικές μέθοδοι δεν αντικαθιστούν τον έλεγχο: κοιτάξτε πάντα το δελτίο πριν το υποβάλετε.",
+                  "The experimental methods do not replace checking: always look at the form before submitting it.")),
+        ('h', ("Έξυπνη ανίχνευση πεδίων: ρύθμιση και έλεγχος", "Smart Field Detection: configure and inspect")),
+        ('step', ("Επιλέξτε «Έξυπνη ανίχνευση πεδίων». Από κάτω εμφανίζεται το κουμπί **👉 Ρύθμιση & έλεγχος ανίχνευσης…**.",
+                  "Select “Smart Field Detection”. The button **👉 Configure & Inspect Auto-Detection…** appears right beneath it.")),
+        ('step', ("Στο παράθυρο ελέγχου βλέπετε τη λίστα των πεδίων που βρέθηκαν (✓) ή όχι (○, κρυμμένα) και ένα δείγμα συμπληρωμένου "
+                  "δελτίου με πλασματικά δεδομένα. Πατώντας ένα πεδίο, σημειώνεται η θέση του στη σελίδα.",
+                  "The inspection window lists the fields that were found (✓) or not (○, hidden) and shows a sample form filled with "
+                  "made-up data. Click a field and its position is marked on the page.")),
+        ('step', ("**🔄 Επανάληψη ανίχνευσης** σαρώνει ξανά το template (και διαγράφει τις προσαρμογές σας, με ερώτηση). "
+                  "**Άνοιγμα στον επεξεργαστή διάταξης…** ανοίγει τον επεξεργαστή για λεπτομερή ρύθμιση.",
+                  "**🔄 Rerun Auto-Detection** scans the template again (and discards your fine-tuning, after asking). "
+                  "**Open in Layout Editor…** opens the editor for fine-tuning.")),
+        ('p', ("Οι προσαρμογές που αποθηκεύετε στον επεξεργαστή θυμούνται στα επόμενα δελτία όσο μένετε στην Έξυπνη ανίχνευση πεδίων. "
+               "Αν επιλέξετε άλλον τρόπο και ξαναγυρίσετε, οι προσαρμογές διαγράφονται και η ανίχνευση ξεκινά από την αρχή.",
+               "The fine-tuning you save in the editor is remembered for the following forms as long as you stay on Smart Field Detection. "
+               "If you pick another method and come back, the fine-tuning is discarded and the detection starts from scratch.")),
+        ('h', ("Δύο διαφορετικές προεπισκοπήσεις", "Two different previews")),
+        ('li', ("**Παράθυρο ελέγχου ανίχνευσης** (από τις Ρυθμίσεις): για να ελέγξετε τα πεδία και να δοκιμάσετε δείγμα δεδομένων πριν "
+                "φτιάξετε πραγματικό δελτίο. Έχει **Επανάληψη ανίχνευσης** και **Άνοιγμα στον επεξεργαστή διάταξης…**.",
+                "**Detection inspection window** (from Settings): to check the fields and try sample data before any real report. "
+                "It has **Rerun Auto-Detection** and **Open in Layout Editor…**.")),
+        ('li', ("**Προεπισκόπηση τελικού ελέγχου** (όταν πατάτε «Δημιουργία PDF» και είναι ενεργή η προεπισκόπηση): τελευταία ματιά στο "
+                "συμπληρωμένο δελτίο. Έχει **Επεξεργασία διάταξης…** (προσωρινά, μόνο για αυτό το δελτίο) αλλά ΟΧΙ επανάληψη ανίχνευσης, "
+                "γιατί η ανίχνευση αυτού του δελτίου είναι ήδη οριστική.",
+                "**Final verification preview** (when you press “Create PDF” and the preview is on): a last look at the filled form. "
+                "It has **Edit layout…** (temporary, for this form only) but NOT rerun detection, because the detection of this form is already final.")),
+        ('h', ("Αυτόματη προσυμπλήρωση του προτύπου χειροκίνητης διάταξης", "Auto-populate manual layout template")),
+        ('p', ("Ενεργό (προεπιλογή): ο επεξεργαστής διάταξης ανοίγει με τα στοιχεία τοποθετημένα όπως θα τα έβαζε ο επιλεγμένος τρόπος "
+               "(παλιά μέθοδος, Έξυπνη μετατόπιση ή Έξυπνη ανίχνευση). Ανενεργό: ανοίγει εντελώς κενός καμβάς. Μια χειροκίνητη διάταξη "
+               "που έχετε ήδη αποθηκεύσει ανοίγει πάντα όπως την αφήσατε.",
+               "On (default): the layout editor opens with the items placed the way the selected method (Legacy, Smart Shift or Smart Field "
+               "Detection) would place them. Off: it opens a completely blank canvas. A manual layout you already saved always opens as you left it.")),
+        ('p', ("Μέσα στον επεξεργαστή: **Εκκαθάριση όλων** αδειάζει τον καμβά και **Αυτόματη τοποθέτηση** τοποθετεί ξανά όλα τα στοιχεία "
+               "με τον τρόπο που έχετε επιλέξει.",
+               "Inside the editor: **Clear all** empties the canvas and **Auto-place items** places every item again with the method you selected.")),
+        ('h', ("Έξυπνη μετατόπιση: βήματα", "Smart Shift: steps")),
+        ('step', ("Επιλέξτε «Έξυπνη μετατόπιση». Τα πρόσθετα κουμπιά εμφανίζονται μόνο όταν είναι επιλεγμένη.",
+                  "Select “Smart Shift”. The extra buttons appear only while it is selected.")),
         ('step', ("Αποθηκεύστε το σημείο σύγκρισης: το πρόγραμμα το κάνει μόνο του με το πρώτο δελτίο που φτιάχνετε με την "
-                  "προεπιλεγμένη μέθοδο, ή πατήστε **Αποθήκευση ως αναφορά…** όταν το δελτίο συμπληρώνεται σωστά.",
-                  "Save the point of comparison: the program does it by itself with the first form you make in the default "
-                  "mode, or press **Save as reference…** when the form fills in correctly.")),
-        ('step', ("Όταν αλλάξει το template, πατήστε **Έλεγχος template** (δείχνει αν αναγνωρίζεται και πόσο μετακινήθηκε) "
-                  "και **Δοκιμαστικό δελτίο** (PDF με πλασματικά στοιχεία για οπτικό έλεγχο - μην το υποβάλετε).",
-                  "When the template changes, press **Check template** (shows whether it is recognised and how far it moved) "
-                  "and **Test form** (a PDF with made-up data for a visual check - do not submit it).")),
-        ('tip', ("Αν το template δεν αναγνωριστεί με ασφάλεια ή έχει μετακινηθεί πάρα πολύ, το δελτίο φτιάχνεται με την "
-                 "προεπιλεγμένη μέθοδο ή εμφανίζεται προειδοποίηση και δεν γίνεται αυτόματη εκτύπωση.",
-                 "If the template is not recognised safely or has moved a lot, the form is made with the default method "
-                 "or a warning appears and nothing is printed automatically.")),
+                  "παλιά μέθοδο, ή πατήστε **Αποθήκευση ως αναφορά…** όταν το δελτίο συμπληρώνεται σωστά.",
+                  "Save the point of comparison: the program does it by itself with the first form you make with the Legacy "
+                  "method, or press **Save as reference…** when the form fills in correctly.")),
+        ('step', ("Όταν αλλάξει το template, πατήστε **Έλεγχος template** και **Δοκιμαστικό δελτίο** (PDF με πλασματικά στοιχεία - μην το υποβάλετε).",
+                  "When the template changes, press **Check template** and **Test form** (a PDF with made-up data - do not submit it).")),
         ('p', ("**Χειροκίνητη τοποθέτηση**: επιλέξτε την και ανοίγει ο **επεξεργαστής διάταξης**. Βλέπετε το έντυπο ως σελίδα· "
                "κάθε στοιχείο (ΑΦΜ, ημερομηνίες, σύνολα, στήλες χωρών…) είναι ένα κείμενο που το σέρνετε εκεί που ανήκει.",
                "**Set manually**: select it and the **layout editor** opens. You see the form as a page; "
@@ -3482,7 +4157,7 @@ MANUAL = [
         ('li', ("**Δεδομένα**: **Δείγμα** δείχνει πλασματικές τιμές, **Πραγματικά** τα αποθηκευμένα στοιχεία σας (ξενοδοχείο, δικά σας πεδία, τελευταίος μήνας) και **Ονόματα** μόνο τα ονόματα των στοιχείων.", "**Data**: **Sample** shows made-up values, **Real** shows your saved details (hotel, own fields, latest month) and **Names** shows only the item names.")),
         ('li', ("**↶ / ↷** (`Ctrl+Z` / `Ctrl+Y`) αναιρούν και επαναλαμβάνουν μέχρι 60 αλλαγές.", "**↶ / ↷** (`Ctrl+Z` / `Ctrl+Y`) undo and redo up to 60 changes.")),
         ('li', ("**Αποθήκευση** (`Ctrl+S`) κρατά τη διάταξη. Αν κλείσετε με μη αποθηκευμένες αλλαγές, το πρόγραμμα ρωτά.", "**Save** (`Ctrl+S`) keeps the layout. If you close with unsaved changes, the program asks.")),
-        ('li', ("**Επαναφορά αυτού του στοιχείου** και **Επαναφορά όλων** γυρίζουν στις προεπιλεγμένες θέσεις.", "**Reset this item** and **Reset all** go back to the default positions.")),
+        ('li', ("**Επαναφορά αυτού του στοιχείου** γυρίζει στη θέση που θα έβαζε ο επιλεγμένος τρόπος. **Εκκαθάριση όλων** αδειάζει τον καμβά· **Αυτόματη τοποθέτηση** τοποθετεί ξανά όλα με τον επιλεγμένο τρόπο.", "**Reset this item** goes back to where the selected method places it. **Clear all** empties the canvas; **Auto-place items** places everything again with the selected method.")),
         ('warn', ("Η διάταξη αποθηκεύεται στον φάκελο δεδομένων (`elstat_manual_layout.json`) και ισχύει για όλα τα επόμενα δελτία. Κάντε πάντα ένα δοκιμαστικό PDF μετά από αλλαγές.",
                   "The layout is saved in the data folder (`elstat_manual_layout.json`) and applies to every following form. Always make a test PDF after changes.")),
         ('p', ("Πατήστε `F1` μέσα στον επεξεργαστή για να ανοίξει αυτός ο οδηγός.", "Press `F1` inside the editor to open this guide.")),
@@ -3568,8 +4243,10 @@ MANUAL = [
         ('li', ("`elstat_history.csv` και `elstat_months.csv` - το ιστορικό.", "`elstat_history.csv` and `elstat_months.csv` - the history.")),
         ('li', ("`elstat_preferences.json` - οι ρυθμίσεις.", "`elstat_preferences.json` - the settings.")),
         ('li', ("`elstat_country_mappings.json` - οι δικές σας αντιστοιχίσεις χωρών.", "`elstat_country_mappings.json` - your own country mappings.")),
-        ('li', ("`elstat_manual_layout.json` και `elstat_template_layout.json` - οι διατάξεις του επεξεργαστή και της έξυπνης διάταξης.",
-                "`elstat_manual_layout.json` and `elstat_template_layout.json` - the layouts of the editor and of smart layout.")),
+        ('li', ("`elstat_detected_layout.json` - οι προσαρμογές της Έξυπνης ανίχνευσης πεδίων (υπάρχει μόνο όσο είναι επιλεγμένη).",
+                "`elstat_detected_layout.json` - the fine-tuning of Smart Field Detection (exists only while it is selected).")),
+        ('li', ("`elstat_manual_layout.json` και `elstat_template_layout.json` - οι διατάξεις του επεξεργαστή και της έξυπνης μετατόπισης.",
+                "`elstat_manual_layout.json` and `elstat_template_layout.json` - the layouts of the editor and of Smart Shift.")),
         ('li', ("`ELSTAT_Archive` - τα αρχειοθετημένα PDF κάθε μήνα.", "`ELSTAT_Archive` - the archived PDF of every month.")),
         ('p', ("Δίπλα στο πρόγραμμα υπάρχει και το `elstat_config.json`, που θυμάται μόνο **πού** είναι ο φάκελος δεδομένων.",
                "Next to the program there is also `elstat_config.json`, which only remembers **where** the data folder is.")),
@@ -3592,8 +4269,8 @@ MANUAL = [
         ('p', ("Ξανά-δημιουργήστε το δελτίο του μήνα με το σωστό αριθμό (το παλιό PDF αντικαθίσταται μετά από ερώτηση) ή διαγράψτε τον μήνα από το Ιστορικό και φτιάξτε τον από την αρχή.",
                "Create the month's form again with the right number (the old PDF is replaced after a question) or delete the month from History and make it again.")),
         ('h', ("Η ΕΛΣΤΑΤ άλλαξε το έντυπο. Τι κάνω;", "ELSTAT changed the form. What do I do?")),
-        ('p', ("Διαλέξτε το νέο PDF στην καρτέλα Στοιχεία ξενοδοχείου. Αν οι τιμές πέφτουν εκτός θέσης, δοκιμάστε την **Έξυπνη διάταξη** ή τοποθετήστε τα μόνοι σας με τον **επεξεργαστή διάταξης**. Κάντε πάντα δοκιμαστικό δελτίο πριν υποβάλετε.",
-               "Choose the new PDF in the Hotel details tab. If values land out of place, try **Smart layout** or place them yourself with the **layout editor**. Always make a test form before submitting.")),
+        ('p', ("Διαλέξτε το νέο PDF στην καρτέλα Στοιχεία ξενοδοχείου. Αν οι τιμές πέφτουν εκτός θέσης, δοκιμάστε την **Έξυπνη μετατόπιση** ή την **Έξυπνη ανίχνευση πεδίων**, ή τοποθετήστε τα μόνοι σας με τον **επεξεργαστή διάταξης**. Κάντε πάντα δοκιμαστικό δελτίο πριν υποβάλετε.",
+               "Choose the new PDF in the Hotel details tab. If values land out of place, try **Smart Shift** or **Smart Field Detection**, or place them yourself with the **layout editor**. Always make a test form before submitting.")),
         ('go', ("Άνοιγμα του επεξεργαστή διάταξης", "See the layout editor"), 'sec:editor'),
         ('h', ("Μπορώ να ξανατυπώσω παλιό μήνα;", "Can I reprint an old month?")),
         ('p', ("Ναι, από το Ιστορικό: επιλέξτε τον μήνα και πατήστε Εκτύπωση. Αν λείπει το αρχειοθετημένο PDF, το πρόγραμμα ξαναφτιάχνει το δελτίο από το ιστορικό.",
@@ -3609,7 +4286,7 @@ MANUAL = [
         ('kb', ("ΕΛΣΤΑΤ", ("Η Ελληνική Στατιστική Αρχή, στην οποία υποβάλλεται το δελτίο.", "The Hellenic Statistical Authority, to which the form is submitted."))),
         ('kb', ("Template", ("Το κενό δελτίο PDF πάνω στο οποίο γράφονται οι τιμές.", "The blank PDF form on which the values are written."))),
         ('kb', ("Αρχείο / Archive", ("Αντίγραφο κάθε δελτίου στον φάκελο δεδομένων, για να ξανανοίγεται από το Ιστορικό.", "A copy of every form in the data folder, so it can be reopened from History."))),
-        ('kb', ("Αναφορά", ("Το template όπως ήταν όταν το δελτίο συμπληρωνόταν σωστά - η έξυπνη διάταξη μετρά τις αλλαγές σε σχέση με αυτό.", "The template as it was when the form came out right - smart layout measures changes against it."))),
+        ('kb', ("Αναφορά", ("Το template όπως ήταν όταν το δελτίο συμπληρωνόταν σωστά - η έξυπνη μετατόπιση μετρά τις αλλαγές σε σχέση με αυτό.", "The template as it was when the form came out right - Smart Shift measures changes against it."))),
         ('kb', ("pt", ("Σημείο PDF, 1/72 της ίντσας. Οι θέσεις του επεξεργαστή μετριούνται σε pt.", "A PDF point, 1/72 of an inch. The editor's positions are measured in pt."))),
         ('kb', ("Α.Φ.Μ.", ("Ο 9ψήφιος Αριθμός Φορολογικού Μητρώου.", "The 9-digit tax number (AFM)."))),
         ('kb', ("Ε.Ζ.Ε.Σ.", ("Ευρωπαϊκή Ζώνη Ελεύθερων Συναλλαγών (EFTA).", "European Free Trade Association (EFTA)."))),
@@ -4375,8 +5052,10 @@ class PDFPreviewDialog(tk.Toplevel):
     PAD = 28
     MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
 
-    def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None, get_live=None):
+    def __init__(self, parent, pdf_path, template_path, on_continue, on_close=None, on_regenerate=None, get_live=None,
+                 base_layout=None):
         super().__init__(parent)
+        self._base_layout = base_layout     # -> the layout "Edit layout" starts from (what this PDF was made with)
         self.app = parent
         self.pdf_path = pdf_path
         self.template = template_path
@@ -4456,13 +5135,10 @@ class PDFPreviewDialog(tk.Toplevel):
     def _build(self):
         head = tk.Frame(self, bg=HEADER_BG)
         head.pack(fill="x")
-        tk.Label(head, text=T("Προεπισκόπηση PDF", "PDF preview"), bg=HEADER_BG, fg=HEADER_FG,
+        title, subtitle = self._header_texts()
+        tk.Label(head, text=title, bg=HEADER_BG, fg=HEADER_FG,
                  font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
-        tk.Label(head, text=T("Το αρχείο δεν έχει αποθηκευτεί ακόμα · ελέγξτε το, αλλάξτε τη διάταξη αν χρειάζεται "
-                               "και μετά πατήστε «Αποθήκευση & συνέχεια»",
-                               "The file is not saved yet · check it, change the layout if needed, "
-                               "then press “Save & continue”"),
-                 bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
+        tk.Label(head, text=subtitle, bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
 
         # ---- toolbar: pages, zoom (same controls as the layout editor), editing
         bar = ttk.Frame(self, padding=(14, 10, 14, 6))
@@ -4482,28 +5158,12 @@ class PDFPreviewDialog(tk.Toplevel):
         ttk.Button(bar, text=T("Προσαρμογή", "Fit"), command=self._fit).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="100%", width=6, command=lambda: self._set_zoom(1.0)).pack(side="left", padx=(8, 0))
 
-        right = ttk.Frame(bar)
-        right.pack(side="right")
-        self.edit_chip = tk.Label(right, text=T("✎ Προσωρινή διάταξη - μόνο για αυτό το PDF",
-                                                "✎ Temporary layout - this PDF only"),
-                                  bg=WARN_BG, fg=WARN_FG, font=(FONT, 9, 'bold'), padx=10, pady=4)
-        self.discard_btn = ttk.Button(right, text=T("Αναίρεση αλλαγών διάταξης", "Undo layout changes"),
-                                      command=self._discard_edits)
-        self.edit_btn = ttk.Button(right, text=T("Επεξεργασία διάταξης…", "Edit layout…"),
-                                   command=self._edit_layout)
-        self.edit_btn.pack(side="left")
+        self._build_toolbar_right(bar)
 
         # ---- bottom: buttons, then the status line above them
         footer = ttk.Frame(self, padding=(14, 8, 14, 12))
         footer.pack(side="bottom", fill="x")
-        ttk.Button(footer, text=T("Άνοιγμα PDF", "Open PDF"),
-                   command=lambda: open_file(self.pdf_path)).pack(side="left")
-        self.continue_btn = ttk.Button(footer, text=T("Αποθήκευση & συνέχεια στο αποτέλεσμα  →",
-                                                      "Save & continue to result  →"),
-                                       style='Primary.TButton', command=self._continue)
-        self.continue_btn.pack(side="right")
-        ttk.Button(footer, text=T("Κλείσιμο προεπισκόπησης", "Close preview"),
-                   command=self._close).pack(side="right", padx=8)
+        self._build_footer(footer)
 
         status = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         status.pack(side="bottom", fill="x")
@@ -4513,6 +5173,8 @@ class PDFPreviewDialog(tk.Toplevel):
         self.render_note = ttk.Label(status, text=T("● Δεν έχει αποθηκευτεί ακόμα", "● Not saved yet"),
                                      style='Status.TLabel')
         self.render_note.pack(side="right")
+
+        self._build_side()
 
         # ---- the page
         mid = tk.Frame(self, bg=BORDER)
@@ -4537,6 +5199,51 @@ class PDFPreviewDialog(tk.Toplevel):
         self.cv.bind('<MouseWheel>', self._on_wheel)
         self.cv.bind('<Button-4>', self._on_wheel)
         self.cv.bind('<Button-5>', self._on_wheel)
+
+    # ---- parts that the inspection dialog (Settings) builds differently
+    def _header_texts(self):
+        return (T("Προεπισκόπηση PDF", "PDF preview"),
+                T("Το αρχείο δεν έχει αποθηκευτεί ακόμα · ελέγξτε το, αλλάξτε τη διάταξη αν χρειάζεται "
+                  "και μετά πατήστε «Αποθήκευση & συνέχεια»",
+                  "The file is not saved yet · check it, change the layout if needed, "
+                  "then press “Save & continue”"))
+
+    def _build_toolbar_right(self, bar):
+        # Final verification preview: "Edit layout" only. There is deliberately NO "Rerun Auto-Detection" here -
+        # the detection of this report is already final; re-detecting belongs to the inspection dialog in Settings.
+        right = ttk.Frame(bar)
+        right.pack(side="right")
+        self.edit_chip = tk.Label(right, text=T("✎ Προσωρινή διάταξη - μόνο για αυτό το PDF",
+                                                "✎ Temporary layout - this PDF only"),
+                                  bg=WARN_BG, fg=WARN_FG, font=(FONT, 9, 'bold'), padx=10, pady=4)
+        self.discard_btn = ttk.Button(right, text=T("Αναίρεση αλλαγών διάταξης", "Undo layout changes"),
+                                      command=self._discard_edits)
+        self.edit_btn = ttk.Button(right, text=T("Επεξεργασία διάταξης…", "Edit layout…"),
+                                   command=self._edit_layout)
+        self.edit_btn.pack(side="left")
+
+    def _build_footer(self, footer):
+        ttk.Button(footer, text=T("Άνοιγμα PDF", "Open PDF"),
+                   command=lambda: open_file(self.pdf_path)).pack(side="left")
+        self.continue_btn = ttk.Button(footer, text=T("Αποθήκευση & συνέχεια στο αποτέλεσμα  →",
+                                                      "Save & continue to result  →"),
+                                       style='Primary.TButton', command=self._continue)
+        self.continue_btn.pack(side="right")
+        ttk.Button(footer, text=T("Κλείσιμο προεπισκόπησης", "Close preview"),
+                   command=self._close).pack(side="right", padx=8)
+
+    def _build_side(self):
+        pass
+
+    def _resolve_base_layout(self):
+        if self._base_layout:
+            try:
+                layout = self._base_layout()
+                if layout is not None:
+                    return layout
+            except Exception:
+                pass
+        return load_manual_layout()
 
     def _update_edit_state(self):
         edited = self.layout is not None
@@ -4702,7 +5409,7 @@ class PDFPreviewDialog(tk.Toplevel):
                     return
             except tk.TclError:
                 pass
-        base = self.layout if self.layout is not None else load_manual_layout()
+        base = self.layout if self.layout is not None else self._resolve_base_layout()
         live = None
         if self._get_live:
             try:
@@ -4779,6 +5486,214 @@ class PDFPreviewDialog(tk.Toplevel):
         self.destroy()
         if callback:
             callback()
+
+
+class DetectInspectDialog(PDFPreviewDialog):
+    """Context A - "Configure & Inspect Auto-Detection…" (opened from Settings, never while a report is made).
+    Shows what Smart Field Detection found on the blank template and how sample data fits, before any real report.
+    Its own actions: Rerun Auto-Detection, and Open in Layout Editor (fine-tuning that is remembered).
+    The final verification preview of a report (PDFPreviewDialog) has no Rerun: by then the detection is final."""
+
+    def __init__(self, app, template_path):
+        self.template = template_path
+        self.work_layout = self.report = self.warning = None
+        self.tuned = detect_cache_saved()
+        self._marker_fid = None
+        self._detect_editor = None
+        self.tmp_dir = tempfile.mkdtemp(prefix='elstat_detect_')
+        pdf_path = os.path.join(self.tmp_dir, "ELSTAT_detection_test.pdf")
+        try:
+            self._render(template_path, pdf_path, None)
+        except Exception:
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            raise
+        super().__init__(app, pdf_path, template_path, None, on_close=self._cleanup)
+        self.title(T("Έξυπνη ανίχνευση πεδίων - έλεγχος", "Smart Field Detection - inspect"))
+        self.render_note.configure(text=T("● Δείγμα δεδομένων - δεν είναι πραγματικό δελτίο", "● Sample data - not a real report"))
+        self._fill_list()
+
+    # ---- the test render (made-up hotel and month, every country row filled)
+    def _render(self, template_path, pdf_path, override):
+        sample, mon = manual_sample_inputs()
+        rows = [(name, 1234, 5678) for name in sorted(MAPPED_TARGETS)]
+        res = process_elstat_report(None, template_path, pdf_path, sample, mon, rows_override=rows,
+                                    save_history=False, pdf_mode='detect', detect_layout=override)
+        if res.get('pdf_mode_used') != 'detect':
+            raise DetectError(res.get('layout_warning') or T("Η ανίχνευση απέτυχε.", "The detection failed."))
+        self.work_layout, self.report, self.warning = res['layout_used'], res['detect_report'], res.get('layout_warning')
+
+    def _cleanup(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    # ---- parts of the base dialog that differ here
+    def _header_texts(self):
+        return (T("Έξυπνη ανίχνευση πεδίων - έλεγχος", "Smart Field Detection - inspect"),
+                T("Δείτε τι βρέθηκε στο άδειο template και πώς χωράνε δείγματα δεδομένων · δεν δημιουργείται πραγματικό δελτίο",
+                  "See what was found on the blank template and how sample data fits · no real report is made here"))
+
+    def _build_toolbar_right(self, bar):
+        right = ttk.Frame(bar)
+        right.pack(side="right")
+        self.edit_chip = self.discard_btn = self.edit_btn = None
+        self.rerun_btn = ttk.Button(right, text=T("🔄 Επανάληψη ανίχνευσης", "🔄 Rerun Auto-Detection"), command=self._rerun)
+        self.rerun_btn.pack(side="left", padx=(0, 8))
+        self.open_editor_btn = ttk.Button(right, text=T("Άνοιγμα στον επεξεργαστή διάταξης…", "Open in Layout Editor…"),
+                                          style='PrintSm.TButton', command=self._open_editor)
+        self.open_editor_btn.pack(side="left")
+
+    def _build_footer(self, footer):
+        ttk.Button(footer, text=T("Άνοιγμα PDF", "Open PDF"), command=lambda: open_file(self.pdf_path)).pack(side="left")
+        self.continue_btn = None
+        ttk.Button(footer, text=T("Κλείσιμο", "Close"), style='Primary.TButton', command=self._close).pack(side="right")
+
+    def _update_edit_state(self):
+        pass
+
+    def _build_side(self):
+        side = tk.Frame(self, bg=BORDER)
+        side.pack(side="left", fill="y", padx=(14, 0), pady=(4, 10))
+        inner = ttk.Frame(side, style='Card.TFrame')
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self.summary_var = tk.StringVar()
+        ttk.Label(inner, textvariable=self.summary_var, style='CardHint.TLabel', justify="left",
+                  wraplength=290).pack(anchor="w", padx=12, pady=(12, 6))
+        box = ttk.Frame(inner, style='Card.TFrame')
+        box.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        ttk.Style(self).configure('Detect.Treeview', rowheight=24)
+        self.tree = ttk.Treeview(box, show='tree', selectmode='browse', height=16, style='Detect.Treeview')
+        self.tree.column('#0', width=300, minwidth=220, stretch=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure('group', font=(FONT, 10, 'bold'), foreground=NAVY)
+        self.tree.tag_configure('hidden', foreground=MUTED)
+        self.tree.bind('<<TreeviewSelect>>', self._on_pick)
+        self.info_var = tk.StringVar(value=T("Επιλέξτε ένα πεδίο για να δείτε πού μπαίνει.", "Pick a field to see where it goes."))
+        ttk.Label(inner, textvariable=self.info_var, style='CardHint.TLabel', justify="left",
+                  wraplength=290).pack(anchor="w", padx=12, pady=(0, 12))
+
+    def _fill_list(self):
+        self.tree.delete(*self.tree.get_children())
+        items = self.work_layout['items']
+        placed = {}
+        for fid, it in items.items():
+            if not it.get('parent'):
+                placed.setdefault(manual_group(fid, it), []).append((fid, it))
+        for gid, (gel, gen) in MANUAL_GROUPS:
+            if gid not in placed:
+                continue
+            self.tree.insert('', 'end', iid='g:' + gid, text=T(gel, gen), open=gid not in ('rows', 'totals'), tags=('group',))
+            for fid, it in placed[gid]:
+                shown = it.get('visible', True)
+                self.tree.insert('g:' + gid, 'end', iid=fid, text=("✓  " if shown else "○  ") + manual_label(fid, it, items),
+                                 tags=() if shown else ('hidden',))
+        text_ = describe_detect_report(self.report, self.tuned)
+        if self.warning:
+            text_ += "\n" + self.warning
+        self.summary_var.set(text_)
+
+    def _on_pick(self, _event=None):
+        sel = self.tree.selection()
+        fid = sel[0] if sel else None
+        it = self.work_layout['items'].get(fid) if fid else None
+        if not it:
+            return
+        self._marker_fid = fid
+        align = {'left': T("αριστερά", "left"), 'center': T("κέντρο", "centre"), 'right': T("δεξιά", "right")}.get(it['align'], '')
+        self.info_var.set(T(f"Σελίδα {it['page'] + 1} · X {it['x']:.1f} · Y {it['y']:.1f} pt · {align} · μέγεθος {it['size']:g}",
+                            f"Page {it['page'] + 1} · X {it['x']:.1f} · Y {it['y']:.1f} pt · {align} · size {it['size']:g}")
+                          + ("" if it.get('visible', True) else T("\nΔεν βρέθηκε - κρυμμένο. Τοποθετήστε το στον επεξεργαστή.",
+                                                                  "\nNot found - hidden. Place it in the editor.")))
+        if self.page_seg is not None and it['page'] != self.page:
+            self.page_seg.set(it['page'], True)
+        else:
+            self._draw()
+
+    def _draw(self):
+        super()._draw()
+        it = self.work_layout['items'].get(self._marker_fid) if (self.work_layout and self._marker_fid) else None
+        if not it or it['page'] != self.page or not it.get('visible', True):
+            return
+        z, ph = self.zoom, self.sizes[self.page][1]
+        x = self.ox + it['x'] * z
+        if self._marker_fid.startswith('rows'):
+            self.cv.create_line(x, self.oy, x, self.oy + ph * z, fill=ACCENT, width=2, dash=(5, 3), tags='marker')
+            return
+        y, r = self.oy + (ph - it['y']) * z, 8
+        self.cv.create_oval(x - r, y - r, x + r, y + r, outline=ACCENT, width=2, tags='marker')
+        self.cv.create_line(x - r - 4, y, x + r + 4, y, fill=ACCENT, tags='marker')
+        self.cv.create_line(x, y - r - 4, x, y + r + 4, fill=ACCENT, tags='marker')
+
+    def _refresh_pdf(self):
+        self._version += 1
+        self._pages.clear()
+        self._read_pdf()
+        self._fill_list()
+        self._draw()
+
+    # ---- the two actions that belong only here
+    def _rerun(self):
+        title = T("Επανάληψη ανίχνευσης", "Rerun Auto-Detection")
+        if detect_cache_saved() and not messagebox.askyesno(
+                title, T("Οι προσαρμογές σας από τον επεξεργαστή θα διαγραφούν και η ανίχνευση θα ξεκινήσει από την αρχή.\n\nΣυνέχεια;",
+                         "Your fine-tuning from the editor will be discarded and the detection will start from scratch.\n\nContinue?"),
+                default='no', parent=self):
+            return
+        backup = None
+        try:
+            with open(detect_layout_file(), 'rb') as f:
+                backup = f.read()
+        except OSError:
+            pass
+        delete_detect_cache()
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            self._render(self.template, self.pdf_path, None)
+        except Exception as e:
+            if backup is not None:          # nothing was lost: put the fine-tuning back
+                try:
+                    with open(detect_layout_file(), 'wb') as f:
+                        f.write(backup)
+                except OSError:
+                    pass
+            messagebox.showerror(title, T(f"Η ανίχνευση δεν ολοκληρώθηκε:\n{e}", f"The detection did not finish:\n{e}"), parent=self)
+            return
+        finally:
+            self.config(cursor='')
+        self.tuned = False
+        self._marker_fid = None
+        self._refresh_pdf()
+
+    def _open_editor(self):
+        ed = self._detect_editor
+        try:
+            if ed is not None and ed.winfo_exists():
+                ed.lift()
+                ed.focus_force()
+                return
+        except tk.TclError:
+            pass
+        editor = LayoutEditor(self.app, self.template, on_save=self._editor_saved, layout=self.work_layout,
+                              parent=self, context='detect')
+        self._detect_editor = editor
+        editor.lift()
+        editor.focus_force()
+        editor.bind('<Destroy>', lambda e, ed=editor: e.widget is ed and self.after(60, self._regrab))
+
+    def _editor_saved(self):
+        """The editor saved its fine-tuning to the detection cache: draw the sample again with it."""
+        self.config(cursor='watch')
+        try:
+            self._render(self.template, self.pdf_path, None)
+            self.tuned = True
+            self._refresh_pdf()
+        except Exception as e:
+            messagebox.showerror(T("Έξυπνη ανίχνευση", "Smart Field Detection"),
+                                 T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"), parent=self)
+        finally:
+            self.config(cursor='')
 
 
 class ResultDialog(tk.Toplevel):
@@ -4916,13 +5831,16 @@ class LayoutEditor(tk.Toplevel):
     NUDGE_STEPS = ("0.1", "0.5", "1", "2", "5")
     QUICK_COLORS = ('#000000', '#1f2937', '#1d4ed8', '#047857', '#b91c1c', '#7c3aed')
 
-    def __init__(self, app, template_path, on_save=None, layout=None, temporary=False, parent=None, live=None):
+    def __init__(self, app, template_path, on_save=None, layout=None, temporary=False, parent=None, live=None,
+                 context='manual'):
         # temporary=True: opened from the PDF preview - "Save changes" hands the layout to the preview and
         # nothing is written to the saved manual layout
         host = parent or app
         super().__init__(host)
         self.app = app
         self.temporary = temporary
+        self.context = context       # 'manual' = saved as the manual layout | 'detect' = the fine-tuning of Smart Field Detection
+        self._mode_ref = None
         self.template = template_path
         self.on_save = on_save
         self.layout = copy.deepcopy(layout) if layout is not None else load_manual_layout()
@@ -5044,7 +5962,7 @@ class LayoutEditor(tk.Toplevel):
                  font=(FONT, 14, 'bold')).pack(side="left", padx=(18, 12), pady=12)
         tk.Label(head, text=(T("Αλλαγές μόνο για αυτό το PDF - οι αποθηκευμένες ρυθμίσεις δεν αλλάζουν · ",
                                "Changes for this PDF only - your saved settings stay unchanged · ")
-                             if self.temporary else "")
+                             if self.temporary else self._context_note())
                  + T("Σύρετε κάθε στοιχείο εκεί που ανήκει στο έντυπο · βελάκια = λεπτομερής μετακίνηση",
                      "Drag each item to where it belongs on the form · arrow keys = fine movement"),
                  bg=HEADER_BG, fg=HEADER_MUTED, font=(FONT, 10)).pack(side="left")
@@ -5073,8 +5991,10 @@ class LayoutEditor(tk.Toplevel):
         self.data_seg.pack(side="left")
         ttk.Button(bar, text=T("Αποθήκευση αλλαγών", "Save changes") if self.temporary else T("Αποθήκευση", "Save"),
                    style='PrintSm.TButton', command=self.save).pack(side="right")
-        ttk.Button(bar, text=T("Επαναφορά όλων", "Reset all"), style='Danger.TButton',
-                   command=self._reset_all).pack(side="right")
+        ttk.Button(bar, text=T("Εκκαθάριση όλων", "Clear all"), style='Danger.TButton',
+                   command=self._wipe_all).pack(side="right")
+        ttk.Button(bar, text=T("Αυτόματη τοποθέτηση", "Auto-place items"),
+                   command=self._auto_place).pack(side="right", padx=(0, 8))
 
         # ---- status line (bottom, packed before the body so it never disappears)
         status = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
@@ -5656,8 +6576,18 @@ class LayoutEditor(tk.Toplevel):
                     cv.create_text(self._px(x + i * step), self._py(y) + drop, text=ch, anchor=anchor, fill=color,
                                    font=(family, -px_size, style), tags=('item', tag))
             else:
+                size_px = px_size
+                if it.get('maxw'):                      # the same shrinking as in the PDF
+                    try:
+                        pdf_font = manual_pdf_font(it['font'], it['bold'], it['italic'])
+                        pdf_size = it['size']
+                        while pdf_size > 6.0 and pdfmetrics.stringWidth(txt, pdf_font, pdf_size) > it['maxw']:
+                            pdf_size -= 0.5
+                        size_px = max(3, int(round(pdf_size * z)))
+                    except Exception:
+                        pass
                 cv.create_text(self._px(x), self._py(y) + drop, text=txt, anchor=anchor, fill=color,
-                               font=(family, -px_size, style), tags=('item', tag))
+                               font=(family, -size_px, style), tags=('item', tag))
 
     def _draw_selection(self):
         self.cv.delete('selbox')
@@ -6104,7 +7034,8 @@ class LayoutEditor(tk.Toplevel):
             return
         self._snap(None)
         manual_merge_item(self.layout, self.sel)
-        self.layout['items'][self.sel] = manual_default_layout()['items'][self.sel]
+        ref = self._mode_reference()['items'].get(self.sel) or manual_default_layout()['items'][self.sel]
+        self.layout['items'][self.sel] = copy.deepcopy(ref)
         self._set_dirty()
         self._fill_tree()
         self._load_props()
@@ -6147,20 +7078,66 @@ class LayoutEditor(tk.Toplevel):
         self._load_props()
         self._draw_items()
 
-    def _reset_all(self):
-        if not messagebox.askyesno(T("Επαναφορά όλων", "Reset all"),
-                                   T("Όλες οι θέσεις και οι μορφοποιήσεις θα γυρίσουν στις προεπιλεγμένες και τα δικά σας "
-                                     "κείμενα θα διαγραφούν.\n\nΣυνέχεια;",
-                                     "Every position and format goes back to the default and your own texts are "
-                                     "deleted.\n\nContinue?"), default='no', parent=self):
-            return
+    def _current_mode(self):
+        return 'detect' if self.context == 'detect' else self.app.prefs.get('pdf_mode', 'overlay')
+
+    def _mode_reference(self):
+        """What the selected way of filling the form would place where (computed once; used by 'Reset this item')."""
+        if self._mode_ref is None:
+            mode = self._current_mode()
+            try:
+                self._mode_ref = manual_default_layout() if mode == 'manual' else build_mode_layout(mode, self.template)[0]
+            except Exception:
+                self._mode_ref = manual_default_layout()
+        return self._mode_ref
+
+    def _replace_layout(self, layout, status):
         self._snap(None)
-        self.layout = manual_default_layout()
+        self.layout = layout
         self.sel = None
         self._fill_tree()
         self._set_dirty()
         self._load_props()
         self._draw_items()
+        self.status_var.set(status)
+
+    def _wipe_all(self):
+        if not messagebox.askyesno(T("Εκκαθάριση όλων", "Clear all"),
+                                   T("Όλα τα στοιχεία θα αφαιρεθούν και ο καμβάς θα μείνει εντελώς κενός. Μπορείτε να προσθέσετε "
+                                     "ό,τι θέλετε με το «+ Προσθήκη στοιχείου…».\n\nΣυνέχεια;",
+                                     "Every item will be removed and the canvas will be completely blank. You can add whatever "
+                                     "you want with “+ Add item…”.\n\nContinue?"), default='no', parent=self):
+            return
+        self._replace_layout(blank_layout(), T("Ο καμβάς είναι κενός.", "The canvas is blank."))
+
+    def _auto_place(self):
+        mode = self._current_mode()
+        names = {'overlay': T("Παλιά μέθοδος (σταθερές συντεταγμένες)", "Legacy (fixed coordinates)"),
+                 'smart': T("Έξυπνη μετατόπιση", "Smart Shift"),
+                 'detect': T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection"),
+                 'manual': T("τελευταία αποθηκευμένη διάταξη", "last saved layout")}
+        if not messagebox.askyesno(T("Αυτόματη τοποθέτηση", "Auto-place items"),
+                                   T(f"Όλα τα στοιχεία θα τοποθετηθούν ξανά όπως θα τα έβαζε η επιλεγμένη μέθοδος ({names.get(mode, mode)}). "
+                                     "Οι αλλαγές σας και τα δικά σας κείμενα θα χαθούν.\n\nΣυνέχεια;",
+                                     f"Every item will be placed again the way the selected method ({names.get(mode, mode)}) would "
+                                     "place it. Your changes and your own texts will be lost.\n\nContinue?"),
+                                   default='no', parent=self):
+            return
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            layout, note = build_mode_layout(mode, self.template)
+        except Exception as e:
+            messagebox.showerror(T("Αυτόματη τοποθέτηση", "Auto-place items"),
+                                 T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"), parent=self)
+            return
+        finally:
+            self.config(cursor='')
+        self._mode_ref = copy.deepcopy(layout)
+        self._replace_layout(layout, T("✓ Τα στοιχεία τοποθετήθηκαν αυτόματα.", "✓ The items were placed automatically.")
+                             + ((" " + note.splitlines()[0]) if note else ""))
+        if note:
+            messagebox.showwarning(T("Αυτόματη τοποθέτηση", "Auto-place items"), note, parent=self)
 
     def _context_tip(self):
         """A short tip that fits what is selected right now."""
@@ -6308,6 +7285,16 @@ class LayoutEditor(tk.Toplevel):
 
     def _add_source_item(self, key):
         self._snap(None)
+        if key in MANUAL_FIELD_INDEX and key not in self.layout['items']:      # a field of the program that is not on the canvas
+            ref = self._mode_reference()['items'].get(key) or manual_default_layout()['items'][key]
+            it = copy.deepcopy(ref)
+            it['visible'] = True
+            self.layout['items'][key] = it
+            self._set_dirty()
+            self._fill_tree()
+            self._draw_items()
+            self._select(key)
+            return
         fid = self._free_id('extra_')
         cx, cy = self._view_center()
         it = manual_new_item(self.page, round(cx, 1), round(cy, 1), size=10.0)
@@ -6368,7 +7355,8 @@ class LayoutEditor(tk.Toplevel):
         kinds = dict(MANUAL_GROUPS)
         kinds['country'] = ("Αριθμοί χωρών", "Country numbers")
         kinds['cfield'] = ("Μεταβλητές", "Variables")
-        catalog = manual_source_catalog()
+        catalog = manual_source_catalog() + [(f[0], f[2], 'rows') for f in MANUAL_FIELDS
+                                             if f[1] == 'rows' and f[0] not in self.layout['items']]
 
         def fill(*_):
             tv.delete(*tv.get_children())
@@ -6418,7 +7406,15 @@ class LayoutEditor(tk.Toplevel):
     def _base_title(self):
         if self.temporary:
             return T("Επεξεργαστής διάταξης (προσωρινά)", "Layout editor (temporary)")
+        if self.context == 'detect':
+            return T("Επεξεργαστής διάταξης (Έξυπνη ανίχνευση)", "Layout editor (Smart Field Detection)")
         return T("Επεξεργαστής διάταξης", "Layout editor")
+
+    def _context_note(self):
+        if self.context == 'detect':
+            return T("Οι αλλαγές θυμούνται όσο μένετε στην Έξυπνη ανίχνευση πεδίων · ",
+                     "Your changes are remembered while Smart Field Detection stays selected · ")
+        return ""
 
     def _update_title(self):
         self.title(self._base_title() + (" *" if self.dirty else ""))
@@ -6436,7 +7432,10 @@ class LayoutEditor(tk.Toplevel):
                 callback(layout)
             return True
         try:
-            save_manual_layout(self.layout)
+            if self.context == 'detect':
+                save_detect_cache(self.layout, self.template)
+            else:
+                save_manual_layout(self.layout)
         except OSError as e:
             messagebox.showerror(T("Αποθήκευση", "Save"),
                                  T(f"Δεν ήταν δυνατή η αποθήκευση:\n{e}", f"Could not save:\n{e}"), parent=self)
@@ -7361,35 +8360,36 @@ class ElstatApp(TkBase):
         polish_settings_card(cp)
         fp = cp.body
         fp.columnconfigure(0, weight=1)
-        ttk.Radiobutton(fp, text=T("Πάνω στο template (προεπιλογή)", "On top of the template (default)"),
+        ttk.Radiobutton(fp, text=T("Παλιά μέθοδος (σταθερές συντεταγμένες)  ·  LEGACY",
+                                   "Legacy (Fixed Coordinates)  ·  LEGACY"),
                         value='overlay', variable=pv['pdf_mode'], style='Card.TRadiobutton',
                         command=self._pdf_mode_clicked).grid(row=0, column=0, sticky="w")
         hint(fp, T("Οι τιμές γράφονται σε σταθερές θέσεις πάνω στο άδειο PDF. Έτσι δούλευε πάντα το πρόγραμμα.",
                    "Values are written at fixed positions on top of the blank PDF. This is how the program has always worked."),
              1, padx=(24, 0), pady=(2, 0), margin=130)
-        ttk.Radiobutton(fp, text=T("Έξυπνη διάταξη (αναδημιουργία από το template)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
-                                   "Smart layout (rebuilt from the template)  ·  EXPERIMENTAL"),
+
+        # ---- Smart Shift
+        ttk.Radiobutton(fp, text=T("Έξυπνη μετατόπιση (Smart Shift)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
+                                   "Smart Shift  ·  EXPERIMENTAL"),
                         value='smart', variable=pv['pdf_mode'], style='Card.TRadiobutton',
                         command=self._pdf_mode_clicked).grid(row=2, column=0, sticky="w", pady=(10, 0))
-        hint(fp, T("Πριν συμπληρωθεί το δελτίο, το πρόγραμμα διαβάζει το template, βρίσκει πού βρίσκεται τώρα κάθε τμήμα του "
-                   "και τοποθετεί κάθε τιμή ακριβώς εκεί που ανήκει. Χρήσιμο αν η ΕΛΣΤΑΤ αλλάξει λίγο το έντυπο "
-                   "(μετατοπισμένες γραμμές, περιθώρια, αποστάσεις). Αν το template δεν αναγνωριστεί με ασφάλεια, "
-                   "χρησιμοποιείται αυτόματα η προεπιλεγμένη μέθοδος και εμφανίζεται προειδοποίηση.",
-                   "Before the form is filled in, the program reads the template, finds where each part of it now sits "
-                   "and places every value exactly where it belongs. Useful if ELSTAT changes the form slightly "
-                   "(shifted lines, margins, spacing). If the template is not recognised safely, the default method "
-                   "is used automatically and a warning is shown."),
+        hint(fp, T("Διαβάζει σημεία-άγκυρες του template, μετρά πόσο μετακινήθηκαν σε σχέση με το σημείο σύγκρισης (διανύσματα "
+                   "μετατόπισης και χωρική παρεμβολή IDW) και μετατοπίζει ανάλογα τις σταθερές συντεταγμένες. Χρήσιμο αν η ΕΛΣΤΑΤ "
+                   "αλλάξει λίγο το έντυπο. Αν το template δεν αναγνωριστεί με ασφάλεια, χρησιμοποιείται αυτόματα η παλιά μέθοδος "
+                   "και εμφανίζεται προειδοποίηση.",
+                   "Reads anchor texts of the template, measures how far they moved against the point of comparison (delta "
+                   "vectors and IDW spatial interpolation) and shifts the fixed coordinates accordingly. Useful if ELSTAT changes "
+                   "the form slightly. If the template is not recognised safely, the Legacy method is used automatically "
+                   "and a warning is shown."),
              3, padx=(24, 0), pady=(2, 0), margin=130)
-
-        # everything below is shown only while "Smart layout" is selected
         self.smart_frame = sm = ttk.Frame(fp, style='Card.TFrame')
         sm.grid(row=4, column=0, sticky="ew")
         sm.columnconfigure(0, weight=1)
         ttk.Separator(sm, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
         warn = ttk.Label(sm, text=T("⚠ Πειραματική λειτουργία: ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Αν κάτι δεν "
-                                    "πάει καλά, γυρίστε στο «Πάνω στο template».",
+                                    "πάει καλά, γυρίστε στην παλιά μέθοδο.",
                                     "⚠ Experimental feature: always check the form before submitting it. If anything "
-                                    "looks wrong, switch back to “On top of the template”."),
+                                    "looks wrong, switch back to the Legacy method."),
                          style='CardWarn.TLabel', justify="left")
         warn.grid(row=1, column=0, sticky="w")
         autowrap(warn, body, margin=110)
@@ -7407,20 +8407,51 @@ class ElstatApp(TkBase):
                    "“Test form” creates a PDF with made-up data (do not submit it) so you can see whether everything "
                    "lands in place with the method you chose."), 4, pady=(8, 0))
 
+        # ---- Smart Field Detection (AI / Auto-Detect)
+        ttk.Radiobutton(fp, text=T("Έξυπνη ανίχνευση πεδίων (AI / αυτόματη ανίχνευση)  ·  ΠΕΙΡΑΜΑΤΙΚΟ",
+                                   "Smart Field Detection (AI / Auto-Detect)  ·  EXPERIMENTAL"),
+                        value='detect', variable=pv['pdf_mode'], style='Card.TRadiobutton',
+                        command=self._pdf_mode_clicked).grid(row=5, column=0, sticky="w", pady=(10, 0))
+        hint(fp, T("Πλήρως αυτόνομη: σαρώνει το άδειο PDF εκείνη τη στιγμή, διαβάζει τις ετικέτες, ευθυγραμμίζει τον πίνακα "
+                   "και υπολογίζει τις συντεταγμένες χωρίς καμία σταθερή τιμή για τα πεδία του προγράμματος. Δικά σας πεδία "
+                   "και κείμενα τοποθετούνται χειροκίνητα από τον επεξεργαστή διάταξης.",
+                   "Fully autonomous: scans the blank PDF on the fly, reads the labels, aligns the table grid and computes the "
+                   "coordinates with nothing hardcoded for the program's own fields. Your own fields and texts are placed by "
+                   "hand in the layout editor."),
+             6, padx=(24, 0), pady=(2, 0), margin=130)
+        self.detect_frame = df = ttk.Frame(fp, style='Card.TFrame')
+        df.grid(row=7, column=0, sticky="ew")
+        df.columnconfigure(0, weight=1)
+        drow = ttk.Frame(df, style='Card.TFrame')
+        drow.grid(row=0, column=0, sticky="w", padx=(24, 0), pady=(8, 0))
+        ttk.Button(drow, text=T("👉 Ρύθμιση & έλεγχος ανίχνευσης…", "👉 Configure & Inspect Auto-Detection…"),
+                   style='PrintSm.TButton', command=self.open_detect_inspector).pack(side="left")
+        dwarn = ttk.Label(df, text=T("⚠ Πειραματική λειτουργία: ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Αν η ανίχνευση δεν "
+                                     "αναγνωρίσει το template, χρησιμοποιείται αυτόματα η παλιά μέθοδος με προειδοποίηση.",
+                                     "⚠ Experimental feature: always check the form before submitting it. If the detection "
+                                     "does not recognise the template, the Legacy method is used automatically with a warning."),
+                          style='CardWarn.TLabel', justify="left")
+        dwarn.grid(row=1, column=0, sticky="w", padx=(24, 0), pady=(8, 0))
+        autowrap(dwarn, body, margin=130)
+        self.detect_note_var = tk.StringVar()
+        self.detect_note = ttk.Label(df, textvariable=self.detect_note_var, style='CardHint.TLabel', justify="left")
+        self.detect_note.grid(row=2, column=0, sticky="w", padx=(24, 0), pady=(6, 0))
+        autowrap(self.detect_note, body, margin=130)
+
         # ---- set manually (layout editor)
         ttk.Radiobutton(fp, text=T("Χειροκίνητη τοποθέτηση (επεξεργαστής διάταξης)", "Set manually (layout editor)"),
                         value='manual', variable=pv['pdf_mode'], style='Card.TRadiobutton',
-                        command=self._pdf_mode_clicked).grid(row=5, column=0, sticky="w", pady=(10, 0))
+                        command=self._pdf_mode_clicked).grid(row=8, column=0, sticky="w", pady=(10, 0))
         hint(fp, T("Ανοίγει ένας επεξεργαστής όπου βλέπετε το έντυπο και σέρνετε κάθε στοιχείο εκεί που ανήκει. "
                    "Για κάθε τιμή ορίζετε επίσης γραμματοσειρά, μέγεθος, χρώμα και στοίχιση. "
                    "Χρήσιμο όταν θέλετε πλήρη έλεγχο ή το έντυπο της ΕΛΣΤΑΤ αλλάξει.",
                    "Opens an editor where you see the form and drag each item to where it belongs. "
                    "For every value you also choose the font, size, colour and alignment. "
                    "Useful when you want full control or the ELSTAT form changes."),
-             6, padx=(24, 0), pady=(2, 0), margin=130)
+             9, padx=(24, 0), pady=(2, 0), margin=130)
         self.manual_note_var = tk.StringVar()
         self.manual_frame = mf = ttk.Frame(fp, style='Card.TFrame')
-        mf.grid(row=7, column=0, sticky="ew")
+        mf.grid(row=10, column=0, sticky="ew")
         mf.columnconfigure(0, weight=1)
         ttk.Separator(mf, orient="horizontal").grid(row=0, column=0, sticky="ew", pady=14)
         self.manual_note = ttk.Label(mf, textvariable=self.manual_note_var, style='CardHint.TLabel', justify="left")
@@ -7432,6 +8463,21 @@ class ElstatApp(TkBase):
                    command=self.open_layout_editor).pack(side="left")
         ttk.Button(mrow, text=T("Δοκιμαστικό δελτίο", "Test form"), command=self.layout_test_form).pack(side="left", padx=8)
         ttk.Button(mrow, text=T("Επαναφορά θέσεων", "Reset positions"), command=self.manual_reset).pack(side="left")
+
+        # ---- the layout editor's starting point (applies to every method)
+        ttk.Separator(fp, orient="horizontal").grid(row=11, column=0, sticky="ew", pady=(16, 8))
+        ttk.Checkbutton(fp, text=T("Αυτόματη προσυμπλήρωση του προτύπου χειροκίνητης διάταξης",
+                                   "Auto-populate manual layout template"),
+                        variable=pv['auto_populate_layout'], style='Card.TCheckbutton',
+                        command=self._pref_changed).grid(row=12, column=0, sticky="w")
+        hint(fp, T("Ενεργό: ο επεξεργαστής διάταξης ανοίγει με τα στοιχεία τοποθετημένα όπως θα τα έβαζε η επιλεγμένη μέθοδος "
+                   "(παλιά, Έξυπνη μετατόπιση ή Έξυπνη ανίχνευση). Ανενεργό: ανοίγει εντελώς κενός καμβάς για να χτίσετε τη "
+                   "διάταξη από το μηδέν. Μέσα στον επεξεργαστή μπορείτε πάντα να πατήσετε «Εκκαθάριση όλων» ή «Αυτόματη "
+                   "τοποθέτηση».",
+                   "On: the layout editor opens with the items placed the way the selected method (Legacy, Smart Shift or Smart "
+                   "Field Detection) would place them. Off: it opens a completely blank canvas to build the layout from scratch. "
+                   "Inside the editor you can always press “Clear all” or “Auto-place items”."),
+             13, padx=(24, 0), pady=(2, 0), margin=130)
         self._update_smart_panel()
 
         # ---- 4. behaviour
@@ -7518,8 +8564,29 @@ class ElstatApp(TkBase):
         except tk.TclError:
             pass
 
+    def _editor_start_layout(self, mode, template, result=None):
+        """Where the layout editor starts: with "Auto-populate manual layout template" on, from what the selected
+        method would place (Legacy / Smart Shift / Smart Field Detection); off, from a blank canvas.
+        A manual layout you saved yourself is always what the manual method starts from. -> (layout, note or None)"""
+        if mode == 'manual' and manual_layout_saved():
+            return load_manual_layout(), None
+        if not self.prefs.get('auto_populate_layout', True):
+            return blank_layout(), None
+        if mode == 'detect' and result is not None and result.get('layout_used') is not None:
+            return copy.deepcopy(result['layout_used']), None      # exactly what this report was made with
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            return build_mode_layout(mode, template)
+        finally:
+            self.config(cursor='')
+
     def open_layout_editor(self):
         title = T("Επεξεργαστής διάταξης", "Layout editor")
+        mode = self.prefs.get('pdf_mode', 'overlay')
+        if mode == 'detect':            # its editor is reached through the inspection dialog (it saves the fine-tuning)
+            self.open_detect_inspector()
+            return
         existing = getattr(self, '_layout_editor', None)
         try:
             if existing is not None and existing.winfo_exists():
@@ -7536,7 +8603,36 @@ class ElstatApp(TkBase):
         except Exception as e:
             messagebox.showerror(title, T(f"Δεν μπορώ να διαβάσω το template:\n{e}", f"I could not read the template:\n{e}"))
             return
-        self._layout_editor = LayoutEditor(self, template, on_save=self._update_manual_panel)
+        layout, note = self._editor_start_layout(mode, template)
+        self._layout_editor = LayoutEditor(self, template, on_save=self._update_manual_panel, layout=layout)
+        if note:
+            messagebox.showwarning(title, note)
+
+    def open_detect_inspector(self):
+        """Context A: Configure & Inspect Auto-Detection (never opened while a report is being made)."""
+        title = T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection")
+        existing = getattr(self, '_detect_dialog', None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                return
+        except tk.TclError:
+            pass
+        template = self._template_or_error(title)
+        if not template:
+            return
+        self.config(cursor='watch')
+        self.update_idletasks()
+        try:
+            self._detect_dialog = DetectInspectDialog(self, template)
+        except DetectError as e:
+            messagebox.showwarning(title, str(e))
+        except PermissionError:
+            messagebox.showerror(title, T("Δεν μπορώ να γράψω στον προσωρινό φάκελο.", "I can't write to the temporary folder."))
+        except Exception as e:
+            messagebox.showerror(title, T(f"Κάτι πήγε στραβά:\n{e}", f"Something went wrong:\n{e}"))
+        finally:
+            self.config(cursor='')
 
     def manual_reset(self):
         title = T("Επαναφορά θέσεων", "Reset positions")
@@ -7555,7 +8651,7 @@ class ElstatApp(TkBase):
             self._update_manual_panel()
             self._status(T("✓ Οι προεπιλεγμένες θέσεις επανήλθαν.", "✓ The default positions are back."))
 
-    # ---- smart layout (settings)
+    # ---- Smart Shift (settings)
     def _template_path_now(self):
         return self.pdf_var.get().strip() or DEFAULT_TEMPLATE
 
@@ -7569,6 +8665,18 @@ class ElstatApp(TkBase):
             frame.grid()
         else:
             frame.grid_remove()
+        dframe = getattr(self, 'detect_frame', None)
+        if dframe is not None:
+            if self.prefs.get('pdf_mode') == 'detect':
+                dframe.grid()
+            else:
+                dframe.grid_remove()
+            self.detect_note_var.set(
+                T("✎ Έχετε αποθηκευμένες προσαρμογές στον επεξεργαστή - θα χρησιμοποιηθούν στα επόμενα δελτία.",
+                  "✎ You have fine-tuning saved in the editor - it will be used for the following forms.")
+                if detect_cache_saved() else
+                T("Η ανίχνευση τρέχει από την αρχή σε κάθε δελτίο πάνω στο τρέχον template.",
+                  "The detection runs from scratch on the current template for every form."))
         self._update_layout_note()
 
     def _update_layout_note(self):
@@ -7605,29 +8713,46 @@ class ElstatApp(TkBase):
 
     def _pdf_mode_clicked(self):
         """A radio button of the PDF method was clicked."""
-        if self.pv['pdf_mode'].get() == 'manual':
-            # Selecting manual mode only reveals its controls; the editor opens
-            # only when the user presses the dedicated button.
-            self._pref_changed()
-            return
-        if self.pv['pdf_mode'].get() == 'smart' and not self.prefs.get('smart_ack'):
+        previous, new = self.prefs.get('pdf_mode'), self.pv['pdf_mode'].get()
+        if new == 'smart' and not self.prefs.get('smart_ack'):
             if not messagebox.askyesno(
                     T("Πειραματική λειτουργία", "Experimental feature"),
-                    T("Η «Έξυπνη διάταξη» είναι πειραματική.\n\n"
-                      "Προσπαθεί να βρει μόνη της πού πρέπει να γραφτεί κάθε τιμή αν το έντυπο της ΕΛΣΤΑΤ αλλάξει λίγο. "
-                      "Μπορεί να κάνει λάθος, γι' αυτό ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η προεπιλεγμένη "
+                    T("Η «Έξυπνη μετατόπιση» είναι πειραματική.\n\n"
+                      "Προσπαθεί να μετατοπίσει μόνη της τις τιμές αν το έντυπο της ΕΛΣΤΑΤ αλλάξει λίγο. "
+                      "Μπορεί να κάνει λάθος, γι' αυτό ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η παλιά "
                       "μέθοδος παραμένει διαθέσιμη ανά πάσα στιγμή.\n\nΝα ενεργοποιηθεί;",
-                      "“Smart layout” is experimental.\n\n"
-                      "It tries to work out by itself where each value should be written if the ELSTAT form changes "
-                      "slightly. It can get things wrong, so always check the form before submitting it. The default "
+                      "“Smart Shift” is experimental.\n\n"
+                      "It tries to shift the values by itself if the ELSTAT form changes "
+                      "slightly. It can get things wrong, so always check the form before submitting it. The Legacy "
                       "method stays available at any time.\n\nTurn it on?"), default='no'):
-                self.pv['pdf_mode'].set('overlay')
+                self.pv['pdf_mode'].set(previous or 'overlay')
                 self._pref_changed()
                 return
             self.prefs['smart_ack'] = True
+        if new == 'detect' and not self.prefs.get('detect_ack'):
+            if not messagebox.askyesno(
+                    T("Πειραματική λειτουργία", "Experimental feature"),
+                    T("Η «Έξυπνη ανίχνευση πεδίων» είναι πειραματική.\n\n"
+                      "Σαρώνει το άδειο PDF και βρίσκει μόνη της πού πηγαίνει κάθε τιμή. Μπορεί να κάνει λάθος, γι' αυτό "
+                      "ελέγχετε πάντα το δελτίο πριν το υποβάλετε. Η παλιά μέθοδος παραμένει διαθέσιμη ανά πάσα στιγμή.\n\n"
+                      "Να ενεργοποιηθεί;",
+                      "“Smart Field Detection” is experimental.\n\n"
+                      "It scans the blank PDF and works out by itself where each value goes. It can get things wrong, so "
+                      "always check the form before submitting it. The Legacy method stays available at any time.\n\n"
+                      "Turn it on?"), default='no'):
+                self.pv['pdf_mode'].set(previous or 'overlay')
+                self._pref_changed()
+                return
+            self.prefs['detect_ack'] = True
+        if new != previous:
+            # fine-tuning of the detected layout only lives while Smart Field Detection stays selected
+            try:
+                delete_detect_cache()
+            except OSError:
+                pass
         self._pref_changed()
         if self.prefs['pdf_mode'] == 'smart' and load_layout_reference() is None:
-            self._offer_reference(T("Έξυπνη διάταξη", "Smart layout"))
+            self._offer_reference(T("Έξυπνη μετατόπιση", "Smart Shift"))
 
     def _save_reference(self, template, title):
         try:
@@ -7650,10 +8775,10 @@ class ElstatApp(TkBase):
             return False
         if messagebox.askyesno(
                 title,
-                T("Η έξυπνη διάταξη χρειάζεται ένα σημείο σύγκρισης: το template όπως είναι όταν το δελτίο "
+                T("Η έξυπνη μετατόπιση χρειάζεται ένα σημείο σύγκρισης: το template όπως είναι όταν το δελτίο "
                   "συμπληρώνεται σωστά.\n\nΝα αποθηκευτεί το τρέχον template ως σημείο σύγκρισης;\n"
                   "(Πατήστε «Ναι» μόνο αν με την προεπιλεγμένη μέθοδο το δελτίο βγαίνει σωστό.)",
-                  "Smart layout needs a point of comparison: the template as it is when the form fills in "
+                  "Smart Shift needs a point of comparison: the template as it is when the form fills in "
                   "correctly.\n\nSave the current template as the point of comparison?\n"
                   "(Press “Yes” only if the form comes out right with the default method.)"), default='no'):
             return self._save_reference(template, title)
@@ -7687,10 +8812,10 @@ class ElstatApp(TkBase):
                 title,
                 T("Να χρησιμοποιηθεί το τρέχον template ως διάταξη αναφοράς;\n\n"
                   "Κάντε το μόνο αν το δελτίο συμπληρώνεται σωστά με την προεπιλεγμένη μέθοδο πάνω σε αυτό το template. "
-                  "Η έξυπνη διάταξη θα μετράει τις αλλαγές των επόμενων templates σε σχέση με αυτό.",
+                  "Η έξυπνη μετατόπιση θα μετράει τις αλλαγές των επόμενων templates σε σχέση με αυτό.",
                   "Use the current template as the reference layout?\n\n"
                   "Only do this if the form is filled in correctly with the default method on this template. "
-                  "Smart layout will measure the changes of later templates against it."), default='no'):
+                  "Smart Shift will measure the changes of later templates against it."), default='no'):
             return
         self._save_reference(template, title)
 
@@ -7778,8 +8903,9 @@ class ElstatApp(TkBase):
         """Live values for the [[name]] placeholders of the guide."""
         hist = self._hist or {}
         last = max(((y, m) for y, ms in hist.items() for m in ms), default=None)
-        modes = {'overlay': T("Πάνω στο template", "On top of the template"),
-                 'smart': T("Έξυπνη διάταξη (πειραματική)", "Smart layout (experimental)"),
+        modes = {'overlay': T("Παλιά μέθοδος (σταθερές συντεταγμένες)", "Legacy (fixed coordinates)"),
+                 'smart': T("Έξυπνη μετατόπιση (πειραματική)", "Smart Shift (experimental)"),
+                 'detect': T("Έξυπνη ανίχνευση πεδίων (πειραματική)", "Smart Field Detection (experimental)"),
                  'manual': T("Χειροκίνητη τοποθέτηση", "Set manually")}
         themes = {'light': T("Φωτεινή", "Light"), 'dark': T("Σκούρα", "Dark"), 'auto': T("Όπως το σύστημα", "Match system")}
         return dict(
@@ -7840,9 +8966,14 @@ class ElstatApp(TkBase):
                         T("αποθηκευμένη", "saved") if saved
                         else T("δεν έχει αποθηκευτεί - ισχύουν οι προεπιλεγμένες θέσεις", "not saved - default positions apply"),
                         'sec:editor'))
+        elif mode == 'detect':
+            tuned = detect_cache_saved()
+            out.append(('ok', T("Έξυπνη ανίχνευση πεδίων", "Smart Field Detection"),
+                        T("υπάρχουν προσαρμογές από τον επεξεργαστή", "fine-tuning from the editor in use") if tuned
+                        else T("ανίχνευση από την αρχή σε κάθε δελτίο", "fresh detection for every form"), 'tab:settings'))
         elif mode == 'smart':
             ref = load_layout_reference() is not None
-            out.append(('ok' if ref else 'warn', T("Έξυπνη διάταξη", "Smart layout"),
+            out.append(('ok' if ref else 'warn', T("Έξυπνη μετατόπιση", "Smart Shift"),
                         T("υπάρχει διάταξη αναφοράς", "reference layout exists") if ref
                         else T("λείπει η διάταξη αναφοράς", "no reference layout yet"), 'tab:settings'))
         out.append(('ok' if DND_AVAILABLE else 'warn', 'Drag & drop',
@@ -8310,6 +9441,10 @@ class ElstatApp(TkBase):
                                      "(No data or history is deleted.)"), default='no'):
             return
         keep_template = self.prefs.get('template_pdf', '')
+        try:
+            delete_detect_cache()
+        except OSError:
+            pass
         self.prefs = dict(DEFAULT_PREFS, template_pdf=keep_template, language=self.prefs['language'], shortcuts={})
         load_shortcut_overrides({})
         ShortcutBinder.refresh_all()
@@ -9659,7 +10794,11 @@ class ElstatApp(TkBase):
             res = state['result']
             return {'values': res.get('live_values'), 'rows': res.get('pdf_data')}
 
-        PDFPreviewDialog(self, target, template, proceed, closed, regenerate, live_data)
+        def base_layout():
+            """What "Edit layout…" starts from: the layout this report was made with (or a blank canvas, see Settings)."""
+            return self._editor_start_layout(mode, template, state['result'])[0]
+
+        PDFPreviewDialog(self, target, template, proceed, closed, regenerate, live_data, base_layout)
 
     def _confirm_replace(self, out, parent=None):
         """The "file already exists" question (when it is turned on in Settings). True = go ahead."""
@@ -9697,7 +10836,7 @@ class ElstatApp(TkBase):
                 messagebox.showwarning(T("Προσοχή", "Warning"),
                                        T(f"Το PDF αποθηκεύτηκε, αλλά το ιστορικό δεν ενημερώθηκε:\n{e}",
                                          f"The PDF was saved, but the history could not be updated:\n{e}"))
-        extra = ("  ·  " + result['layout_info']) if result.get('layout_info') and commit_mode in (None, 'smart') else ""
+        extra = ("  ·  " + result['layout_info']) if result.get('layout_info') and commit_mode in (None, 'smart', 'detect') else ""
         try:
             gy, gm = int(m['year']), int(m['month'])
             if self.prefs['keep_archive']:
