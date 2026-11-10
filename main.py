@@ -1238,13 +1238,72 @@ def _read_csv_grid(path):
     return pd.DataFrame([r + [None] * (width - len(r)) for r in grid], dtype=object)
 
 
+def _sniff_kind(path):
+    """What the file really is, whatever its extension says: 'xls' (old binary Excel), 'xlsx' (zip), 'html' or 'text'."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(2048)
+    except OSError:
+        return 'text'
+    if head.startswith(b'\xd0\xcf\x11\xe0'):
+        return 'xls'
+    if head.startswith(b'PK'):
+        return 'xlsx'
+    if head.lstrip(b'\xef\xbb\xbf \t\r\n').lower().startswith((b'<html', b'<!doctype', b'<table', b'<?xml')):
+        return 'html'
+    return 'text'
+
+
+def _read_excel_any(path, nrows=None):
+    """Reads an Excel file (.xls / .xlsx) as a header-less table. Tries every reader that is available and,
+    as a last resort, converts the file with LibreOffice, so a missing 'xlrd' no longer makes a valid .xls unreadable."""
+    kind = _sniff_kind(path)
+    errors = []
+    engines = [None, 'calamine'] if kind == 'xls' else [None, 'openpyxl']
+    for eng in engines:
+        try:
+            kw = {'engine': eng} if eng else {}
+            return pd.read_excel(path, header=None, nrows=nrows, **kw)
+        except Exception as e:
+            errors.append(str(e).splitlines()[0] if str(e) else repr(e))
+    soffice = shutil.which('soffice') or shutil.which('libreoffice')
+    if soffice:
+        tmpdir = tempfile.mkdtemp(prefix='xls2xlsx_')
+        try:
+            src = os.path.join(tmpdir, 'in' + ('.xls' if kind == 'xls' else '.xlsx'))
+            shutil.copyfile(path, src)
+            subprocess.run([soffice, '--headless', '--convert-to', 'xlsx', '--outdir', tmpdir, src],
+                           capture_output=True, timeout=90)
+            out = os.path.join(tmpdir, 'in.xlsx')
+            if os.path.exists(out) and out != src:
+                return pd.read_excel(out, header=None, nrows=nrows, engine='openpyxl')
+        except Exception as e:
+            errors.append(repr(e))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    hint = T("Εγκαταστήστε το πακέτο xlrd:  pip install xlrd", "Install the xlrd package:  pip install xlrd")
+    raise ValueError(' | '.join(errors[:2]) + '\n' + hint)
+
+
 def read_sheet(path, nrows=None):
     """The Protel sheet as a header-less table - the same shape pd.read_excel(header=None) gives.
-    A .csv file is turned into that same table, so the preview, the PDF, the history and the revenue treat CSV and Excel alike."""
-    if is_csv_path(path):
+    .xls, .xlsx and .csv are all accepted (the real content decides, not the extension), and each one is turned into
+    that same table, so the preview, the PDF, the history and the revenue treat them alike."""
+    kind = _sniff_kind(path)
+    if kind in ('xls', 'xlsx'):
+        return _read_excel_any(path, nrows)
+    if kind == 'html':
+        try:
+            with open(path, 'rb') as f:
+                tables = pd.read_html(io.StringIO(_decode_csv_bytes(f.read())), header=None)
+            df = tables[0].astype(object)
+            return df.iloc[:nrows] if nrows else df
+        except Exception:
+            pass
+    if is_csv_path(path) or kind in ('text', 'html'):
         df = _read_csv_grid(path)
         return df.iloc[:nrows] if nrows else df
-    return pd.read_excel(path, header=None, nrows=nrows)
+    return _read_excel_any(path, nrows)
 
 
 def _csv_is_protel(path):
@@ -1544,13 +1603,13 @@ def verify_protel_file(path):
     try:
         df = read_sheet(path)
         df = df.map(fix_greek) if hasattr(df, 'map') else df.applymap(fix_greek)
-    except Exception:
-        return [T("Το αρχείο δεν μπορεί να διαβαστεί ως Excel/CSV.", "The file cannot be read as Excel/CSV.")]
+    except Exception as e:
+        return [T("Το αρχείο δεν μπορεί να διαβαστεί ως Excel/CSV: ", "The file cannot be read as Excel/CSV: ") + str(e)]
     if df.empty:
         return [T("Το αρχείο είναι κενό.", "The file is empty.")]
 
     head = []                                     # text cells of the Protel header block (top of the file)
-    if is_csv_path(path):                         # a CSV's real header is read raw (read_sheet rebuilds the header rows)
+    if is_csv_path(path) and _sniff_kind(path) == 'text':   # a CSV's real header is read raw (read_sheet rebuilds the header rows)
         try:
             with open(path, 'rb') as f:
                 text = _decode_csv_bytes(f.read(400000))
