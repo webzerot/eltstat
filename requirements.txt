@@ -1,7 +1,10 @@
-pandas>=2.0.0
-pypdf>=3.0.0
-openpyxl>=3.0.0
-reportlab>=3.6.0
-tkinterdnd2>=0.3.0
-pypdfium2>=4.0.0
-PyMuPDF>=1.22.0
+pandas
+numpy
+xlrd>=2.0.1
+openpyxl
+Pillow
+reportlab
+PyMuPDF
+pypdf
+pypdfium2
+tkinterdnd2
