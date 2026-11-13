@@ -376,7 +376,7 @@ def save_app_config(cfg):
 # ------------------------------------------------------- online update (GitHub)
 # The program updates itself from a GitHub repository: it reads APP_VERSION from main.py on the chosen
 # branch, and if that is newer it can replace this file (the old one is kept as main.py.bak).
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_FILE = "main.py"
 UPDATE_DEFAULT_REPO = "webzerot/eltstat"            # "owner/repository", e.g. "myname/elstat" (can also be typed in Settings)
 UPDATE_DEFAULT_BRANCH = "main"
@@ -397,6 +397,27 @@ def version_tuple(v):
     return tuple(int(x) for x in re.findall(r'\d+', str(v or '')))
 
 
+def changelog_section(text, version):
+    """From a CHANGELOG.md returns the part under the heading that mentions `version` (e.g. "## 1.0.2").
+    If no heading matches (or the section is empty), an empty string is returned and nothing is shown."""
+    lines = text.replace('\r\n', '\n').split('\n')
+    want = version_tuple(version)
+    start = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('#') and version_tuple(line) == want and want:
+            start = i
+            break
+    if start is None:
+        return ''
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].lstrip().startswith('#') and version_tuple(lines[j]):      # the next version's heading
+            end = j
+            break
+    body = [l for l in lines[start + 1:end] if l.strip()]
+    return '\n'.join(lines[start:end]).strip()[:1500] if body else ''
+
+
 def fetch_remote_update(repo, branch):
     """Downloads main.py from the repository. Returns {'version', 'newer', 'code' (bytes)}."""
     base = f"https://raw.githubusercontent.com/{repo}/{branch}/"
@@ -408,14 +429,15 @@ def fetch_remote_update(repo, branch):
     try:                                              # optional: a CHANGELOG.md in the repo is shown before installing
         with urllib.request.urlopen(urllib.request.Request(base + "CHANGELOG.md" + stamp, headers=headers),
                                     timeout=8) as resp:
-            notes = resp.read(40 * 1024).decode('utf-8', errors='replace').strip()[:1500]
+            notes = resp.read(100 * 1024).decode('utf-8', errors='replace')
     except Exception:
         pass
     m = _VERSION_RE.search(code.decode('utf-8', errors='replace'))
     if not m:
         raise ValueError("APP_VERSION not found in the repository's " + UPDATE_FILE)
     remote = m.group(1)
-    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch, 'notes': notes,
+    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
+            'notes': changelog_section(notes, remote) if notes.strip() else '',
             'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
 
 
