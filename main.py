@@ -1,4 +1,91 @@
-APP_VERSION = "1.0.1"      # raise this number every time you push a new main.py to GitHub
+APP_VERSION = "1.0.2"      # raise this number every time you push a new main.py to GitHub
+
+# ------------------------------------------------- first-run setup (requirements.txt from GitHub)
+# The very first time the program runs it downloads requirements.txt from the GitHub repository into the
+# SAME folder as this program and installs what is listed there. This block must stay above the other
+# imports, because those are exactly the packages that may still be missing.
+def _first_run_setup():
+    import os, sys, subprocess, importlib, importlib.util, urllib.request
+    if getattr(sys, 'frozen', False):                       # a packaged .exe already contains everything
+        return
+    here = os.path.dirname(os.path.abspath(__file__))        # the program's own folder (nothing to configure)
+    marker = os.path.join(here, ".elstat_setup_done")
+    req_path = os.path.join(here, "requirements.txt")
+    required = ("pandas", "pypdf", "reportlab", "openpyxl")
+    fallback = "pandas\npypdf\nreportlab\nopenpyxl\npillow\ntkinterdnd2\n"   # used if GitHub has no requirements.txt
+
+    def missing():
+        importlib.invalidate_caches()
+        return [m for m in required if importlib.util.find_spec(m) is None]
+
+    if os.path.exists(marker) and not missing():
+        return                                               # already set up: start normally and instantly
+
+    # ---- a small "please wait" window (skipped silently if there is no display)
+    win = None
+    try:
+        import tkinter as _tk
+        win = _tk.Tk()
+        win.title("ELSTAT")
+        _tk.Label(win, padx=30, pady=20, text="Πρώτη εκκίνηση: εγκατάσταση απαιτούμενων πακέτων…\n"
+                  "First run: installing the required packages…\n\nΠαρακαλώ περιμένετε / Please wait").pack()
+        win.update()
+    except Exception:
+        win = None
+
+    ok, error = True, ""
+    try:
+        # 1) download requirements.txt from GitHub into the program folder
+        url = "https://raw.githubusercontent.com/webzerot/eltstat/main/requirements.txt"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-setup'})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read(1024 * 1024)
+            with open(req_path, 'wb') as f:
+                f.write(data)
+        except Exception:
+            if not os.path.exists(req_path):                 # offline / not in the repo yet: use the built-in list
+                with open(req_path, 'w', encoding='utf-8') as f:
+                    f.write(fallback)
+        # 2) install it
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        cmd = [sys.executable, "-m", "pip", "install", "-r", req_path]
+        run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+        if run.returncode != 0 and "No module named pip" in (run.stderr or ""):
+            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], capture_output=True, creationflags=flags)
+            run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+        if run.returncode != 0:
+            ok, error = False, (run.stderr or run.stdout or "")[-800:]
+    except Exception as e:
+        ok, error = False, str(e)
+
+    still = missing()
+    if still:
+        ok = False
+    if ok:
+        try:
+            with open(marker, 'w', encoding='utf-8') as f:
+                f.write("setup done\n")
+        except OSError:
+            pass
+    if win is not None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+    if still:                                                # the program cannot start without these
+        msg = ("Δεν ήταν δυνατή η εγκατάσταση: " + ", ".join(still) + "\nCould not install: " + ", ".join(still)
+               + "\n\nRun / Εκτελέστε:  pip install -r requirements.txt\n\n" + error)
+        try:
+            from tkinter import messagebox
+            r = _tk.Tk(); r.withdraw()
+            messagebox.showerror("ELSTAT", msg)
+        except Exception:
+            print(msg)
+        sys.exit(1)
+
+
+_first_run_setup()
 import pandas as pd
 import pypdf
 import io
