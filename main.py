@@ -140,6 +140,7 @@ import time
 import threading
 import queue
 import weakref
+import urllib.parse
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -567,6 +568,48 @@ def changelog_section(text, version):
     return '\n'.join(lines[start:end]).strip()[:1500] if body else ''
 
 
+UPDATE_MANIFEST = "update_files.json"
+_EXTRA_EXT = ('.py', '.json', '.txt', '.md', '.png', '.ico', '.gif')
+
+
+def _safe_relpath(p):
+    """A path from the manifest must stay inside the program folder. Returns it normalised, or raises."""
+    p = str(p).replace('\\', '/').strip()
+    parts = [x for x in p.split('/') if x not in ('', '.')]
+    if (not parts or p.startswith('/') or re.match(r'^[A-Za-z]:', p) or '..' in parts
+            or parts[-1] == UPDATE_FILE or not parts[-1].lower().endswith(_EXTRA_EXT)):
+        raise ValueError("Not an allowed update path: " + p)
+    return '/'.join(parts)
+
+
+def _fetch_extra_files(base, stamp, headers):
+    """Optional multi-file support. If the repository has an update_files.json such as
+    {"files": ["app/ui.py", "app/data.py"], "delete": ["old_module.py"]}, those files are downloaded too and
+    installed together with main.py. Without that file (404) the update is main.py only, as before.
+    Returns ({relpath: bytes}, [relpath to delete])."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + UPDATE_MANIFEST + stamp, headers=headers),
+                                    timeout=8) as resp:
+            raw = resp.read(1024 * 1024).decode('utf-8-sig').strip()
+            manifest = json.loads(raw) if raw else {}              # an empty file means "no extra files"
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}, []
+        raise
+    except json.JSONDecodeError:
+        raise ValueError(UPDATE_MANIFEST + " is not valid JSON")
+    if not isinstance(manifest, dict):
+        manifest = {}
+    files = {}
+    for rel in manifest.get('files') or []:
+        rel = _safe_relpath(rel)
+        url = base + urllib.parse.quote(rel) + stamp          # a listed file that cannot be fetched fails the whole update
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as resp:
+            files[rel] = resp.read(30 * 1024 * 1024)
+    delete = [_safe_relpath(r) for r in (manifest.get('delete') or [])]
+    return files, [d for d in delete if d not in files]
+
+
 def _safe_changelog(notes, version):
     """The changelog is optional: anything wrong with it just means no 'What's new' text."""
     try:
@@ -589,37 +632,97 @@ def fetch_remote_update(repo, branch):
             notes = resp.read(100 * 1024).decode('utf-8', errors='replace')
     except Exception:
         pass
+    files, delete = _fetch_extra_files(base, stamp, headers)
     remote_text = code.decode('utf-8', errors='replace')
     m = _VERSION_RE.search(remote_text)
     if not m:
         raise ValueError("APP_VERSION not found in the repository's " + UPDATE_FILE)
     remote = m.group(1)
-    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
+    return {'version': remote, 'code': code, 'files': files, 'delete': delete, 'repo': repo, 'branch': branch,
             'force': bool(_FORCE_RE.search(remote_text)),
             'notes': _safe_changelog(notes, remote),
             'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
 
 
-def apply_update(code):
-    """Checks the downloaded program and replaces this file with it. Returns the path of the backup."""
+def _extra_backup_dir():
+    return os.path.abspath(__file__) + '.bak.d'
+
+
+def _write_atomic(path, data):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + '.new'
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def apply_update(code, files=None, delete=None):
+    """Checks the downloaded program and replaces this file (and, if the repository lists them, extra files)
+    with it. Nothing is written until everything has been checked; if writing fails midway, everything
+    already replaced is put back. Returns the path of the main.py backup."""
     if getattr(sys, 'frozen', False):
         raise RuntimeError("frozen")
+    files = files or {}
+    delete = delete or []
     text = code.decode('utf-8')
     compile(text, UPDATE_FILE, 'exec')                         # must at least be valid Python
     if 'class ElstatApp' not in text or not _VERSION_RE.search(text):
         raise ValueError("The downloaded file does not look like this program.")
+    for rel, data in files.items():
+        if rel.lower().endswith('.py'):
+            compile(data.decode('utf-8'), rel, 'exec')
     target = os.path.abspath(__file__)
+    base = os.path.dirname(target)
     backup = target + '.bak'
-    shutil.copy2(target, backup)
-    tmp = target + '.new'
-    with open(tmp, 'wb') as f:
-        f.write(code)
-    os.replace(tmp, target)
+    bdir = _extra_backup_dir()
+    if os.path.isdir(bdir):
+        shutil.rmtree(bdir, ignore_errors=True)
+    touched = [(r, True) for r in files] + [(r, False) for r in delete]
+    saved, created = [], []
+    try:
+        shutil.copy2(target, backup)
+        for rel, _writing in touched:
+            full = os.path.join(base, *rel.split('/'))
+            if os.path.isfile(full):
+                dst = os.path.join(bdir, *rel.split('/'))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(full, dst)
+                saved.append(rel)
+            elif rel in files:
+                created.append(rel)
+        for rel, data in files.items():
+            _write_atomic(os.path.join(base, *rel.split('/')), data)
+        for rel in delete:
+            full = os.path.join(base, *rel.split('/'))
+            if os.path.isfile(full):
+                os.remove(full)
+        _write_atomic(target, code)                            # main.py last: the program only switches over once the rest is in place
+    except BaseException:
+        _put_back_extras(base, bdir, saved, created)
+        raise
+    if saved or created:
+        os.makedirs(bdir, exist_ok=True)
+        with open(os.path.join(bdir, '_manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump({'restore': saved, 'remove': created}, f)
     return backup
 
 
+def _put_back_extras(base, bdir, saved, created):
+    for rel in saved:
+        try:
+            _write_atomic(os.path.join(base, *rel.split('/')),
+                          open(os.path.join(bdir, *rel.split('/')), 'rb').read())
+        except Exception:
+            pass
+    for rel in created:
+        try:
+            os.remove(os.path.join(base, *rel.split('/')))
+        except Exception:
+            pass
+
+
 def restore_backup():
-    """Puts back the program that was saved as main.py.bak before the last update."""
+    """Puts back the program (and any extra files) saved before the last update."""
     target = os.path.abspath(__file__)
     backup = target + '.bak'
     if not os.path.isfile(backup):
@@ -627,10 +730,15 @@ def restore_backup():
     with open(backup, 'rb') as f:
         code = f.read()
     compile(code.decode('utf-8'), UPDATE_FILE, 'exec')
-    tmp = target + '.new'
-    with open(tmp, 'wb') as f:
-        f.write(code)
-    os.replace(tmp, target)
+    bdir = _extra_backup_dir()
+    mpath = os.path.join(bdir, '_manifest.json')
+    if os.path.isfile(mpath):
+        with open(mpath, encoding='utf-8') as f:
+            m = json.load(f)
+        _put_back_extras(os.path.dirname(target), bdir,
+                         [_safe_relpath(r) for r in m.get('restore', [])],
+                         [_safe_relpath(r) for r in m.get('remove', [])])
+    _write_atomic(target, code)
 
 
 def init_storage():
@@ -12143,7 +12251,7 @@ class ElstatApp(TkBase):
                                  T(f"Η ενημέρωση δεν ολοκληρώθηκε (το πρόγραμμα δεν άλλαξε):\n{e}",
                                    f"The update did not complete (the program was not changed):\n{e}"), parent=self)
 
-        self.run_async(lambda: apply_update(info['code']), done, fail,
+        self.run_async(lambda: apply_update(info['code'], info.get('files'), info.get('delete')), done, fail,
                        text=T("Εγκατάσταση ενημέρωσης…", "Installing the update…"))
 
     def restore_previous(self):
@@ -12191,7 +12299,7 @@ class ElstatApp(TkBase):
             try:
                 info = fetch_remote_update(repo, branch)
                 if info['force'] and info['newer']:
-                    apply_update(info['code'])
+                    apply_update(info['code'], info.get('files'), info.get('delete'))
                     results.put(info['version'])
                 else:
                     results.put(None)
