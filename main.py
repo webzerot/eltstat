@@ -759,20 +759,43 @@ def load_prefs():
     return prefs
 
 
+_CONSOLE_ATTACHED = [True]
+
+
 def set_console_visible(show):
-    """Show or hide the console window (Windows only; leaves a shared terminal alone)."""
+    """Show or hide the console (Windows only). Hiding detaches the console entirely, which also
+    works when it is hosted by Windows Terminal (where ShowWindow only minimises it).
+    A terminal shared with other programs (launched by the user) is left alone."""
     if not sys.platform.startswith('win'):
         return
     try:
         import ctypes
         k32 = ctypes.windll.kernel32
-        hwnd = k32.GetConsoleWindow()
-        if not hwnd:
-            return
-        buf = (ctypes.c_uint * 2)()
-        if k32.GetConsoleProcessList(buf, 2) > 1:
-            return
-        ctypes.windll.user32.ShowWindow(hwnd, 5 if show else 0)
+        if show:
+            if _CONSOLE_ATTACHED[0] and k32.GetConsoleWindow():
+                return
+            if k32.AllocConsole():
+                try:
+                    sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
+                    sys.stderr = sys.stdout
+                    sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+                except Exception:
+                    pass
+            _CONSOLE_ATTACHED[0] = True
+        else:
+            if not k32.GetConsoleWindow():
+                _CONSOLE_ATTACHED[0] = False
+                return
+            buf = (ctypes.c_uint * 2)()
+            if k32.GetConsoleProcessList(buf, 2) > 1:
+                return
+            sink = open(os.devnull, 'w')
+            sys.stdout = sink
+            sys.stderr = sink
+            sys.__stdout__ = sink
+            sys.__stderr__ = sink
+            k32.FreeConsole()
+            _CONSOLE_ATTACHED[0] = False
     except Exception:
         pass
 
