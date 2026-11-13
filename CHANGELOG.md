@@ -3,8 +3,8 @@
 ## 1.0.3
 Released: 13 November 2026
 
--Fixed: the first-run setup window showed "Not responding" while packages were installing. The installation now runs in the background, and the window shows a running timer.
--The installer no longer waits forever on a bad connection (network timeout and retry limits added).
+- Fixed: the first-run setup window showed "Not responding" while packages were installing. The installation now runs in the background, and the window shows a running timer.
+- The installer no longer waits forever on a bad connection (network timeout and retry limits added).
 
 ## 1.0.2
 Released: 13 November 2026
