@@ -1,3 +1,4 @@
+APP_VERSION = "1.0.0"      # raise this number every time you push a new main.py to GitHub
 import pandas as pd
 import pypdf
 import io
@@ -376,7 +377,6 @@ def save_app_config(cfg):
 # ------------------------------------------------------- online update (GitHub)
 # The program updates itself from a GitHub repository: it reads APP_VERSION from main.py on the chosen
 # branch, and if that is newer it can replace this file (the old one is kept as main.py.bak).
-APP_VERSION = "1.0.1"
 UPDATE_FILE = "main.py"
 UPDATE_DEFAULT_REPO = "webzerot/eltstat"            # "owner/repository", e.g. "myname/elstat" (can also be typed in Settings)
 UPDATE_DEFAULT_BRANCH = "main"
