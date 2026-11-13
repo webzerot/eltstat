@@ -1821,6 +1821,25 @@ def fix_greek(text):
     return text
 
 
+def _whole_count(v):
+    """A pax / nights cell as a whole number. Accepts 12, 12.0, '12', '12.0', '1.200', '1,200', '1.200,00';
+    raises ValueError for blanks, text and anything with real decimals (12.5), so a misread cell is skipped
+    instead of being cut down to a wrong number."""
+    if v is None or isinstance(v, bool):
+        raise ValueError(v)
+    if isinstance(v, str):
+        s = v.strip().replace('\xa0', '').replace(' ', '')
+        m = re.fullmatch(r'([-+]?)(\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]0+)?', s)
+        if not m:
+            raise ValueError(v)
+        n = int(re.sub(r'[.,]', '', m.group(2)))
+        return -n if m.group(1) == '-' else n
+    x = float(v)
+    if x != x or x != int(x):
+        raise ValueError(v)
+    return int(x)
+
+
 def read_nationality_rows(excel_path):
     """Reads the Protel 'Nationalities Statistics' sheet.
     Returns ([(country_as_in_excel, clients, nights), ...], excel_grand_total_or_None).
@@ -1837,9 +1856,9 @@ def read_nationality_rows(excel_path):
         if not key:
             continue
         try:
-            pax = int(row[7])
-            nights = int(row[9])
-        except (ValueError, TypeError):
+            pax = _whole_count(row[7])
+            nights = _whole_count(row[9])
+        except (ValueError, TypeError, OverflowError):
             continue
         if key.startswith('ΣΥΝΟΛ') or key.startswith('ΤΟΤΑΛ'):   # Protel writes "Σύνολα :"
             excel_total = (pax, nights)      # Protel's own grand total, used as a check
