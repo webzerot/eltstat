@@ -1,4 +1,7 @@
 APP_VERSION = "1.0.4"      # raise this number every time you push a new main.py to GitHub
+FORCE_UPDATE = False       # set to True in the file you push to GitHub (together with a higher APP_VERSION): every
+                           # program that starts online then installs this version by itself, without asking anyone.
+                           # With False the update stays optional (the user presses "Install update" as before).
 
 # ------------------------------------------------- first-run setup (requirements.txt from GitHub)
 # The very first time the program runs it downloads requirements.txt from the GitHub repository into the
@@ -490,6 +493,7 @@ UPDATE_FILE = "main.py"
 UPDATE_DEFAULT_REPO = "webzerot/eltstat"            # "owner/repository", e.g. "myname/elstat" (can also be typed in Settings)
 UPDATE_DEFAULT_BRANCH = "main"
 _VERSION_RE = re.compile(r'^APP_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', re.M)
+_FORCE_RE = re.compile(r'^FORCE_UPDATE\s*=\s*(True|1)\b', re.M)      # read from the file on GitHub
 
 
 def parse_github_repo(text):
@@ -541,11 +545,13 @@ def fetch_remote_update(repo, branch):
             notes = resp.read(100 * 1024).decode('utf-8', errors='replace')
     except Exception:
         pass
-    m = _VERSION_RE.search(code.decode('utf-8', errors='replace'))
+    remote_text = code.decode('utf-8', errors='replace')
+    m = _VERSION_RE.search(remote_text)
     if not m:
         raise ValueError("APP_VERSION not found in the repository's " + UPDATE_FILE)
     remote = m.group(1)
     return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
+            'force': bool(_FORCE_RE.search(remote_text)),
             'notes': changelog_section(notes, remote) if notes.strip() else '',
             'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
 
@@ -10099,6 +10105,8 @@ class ElstatApp(TkBase):
                            f"For drag-and-drop support run: \"{sys.executable}\" -m pip install tkinterdnd2"))
         self.after(100, self._apply_titlebar)
         self.after(150, self.excel_btn.focus_set)
+        self._boot_time = time.time()
+        self.after(2500, self._startup_forced_check)          # silent: only acts if GitHub says FORCE_UPDATE = True
         if load_app_config().get('update_check_on_start'):
             self.after(3000, lambda: self.check_for_updates(silent=True))
         if self._storage_notices:
@@ -12012,6 +12020,57 @@ class ElstatApp(TkBase):
                                    f"Please close and reopen the program yourself.\n{e}"), parent=self)
             return
         self.destroy()
+
+    def _startup_forced_check(self):
+        """Runs at every start, invisibly. If the main.py on GitHub has a higher APP_VERSION AND FORCE_UPDATE = True,
+        it is installed right away and the program restarts. Otherwise (or without internet) nothing happens and
+        updates stay optional."""
+        if getattr(sys, 'frozen', False):
+            return
+        cfg = load_app_config()
+        repo = parse_github_repo(cfg.get('update_repo') or UPDATE_DEFAULT_REPO)
+        branch = (cfg.get('update_branch') or UPDATE_DEFAULT_BRANCH).strip() or UPDATE_DEFAULT_BRANCH
+        if not repo:
+            return
+        results = queue.Queue()
+
+        def worker():
+            try:
+                info = fetch_remote_update(repo, branch)
+                if info['force'] and info['newer']:
+                    apply_update(info['code'])
+                    results.put(info['version'])
+                else:
+                    results.put(None)
+            except BaseException:
+                results.put(None)                      # offline, 404, bad file ...: stay silent, nothing was changed
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                version = results.get_nowait()
+            except queue.Empty:
+                try:
+                    self.after(200, poll)
+                except tk.TclError:
+                    pass
+                return
+            if not version:
+                return
+            try:
+                self._update_pending = None
+                self._update_refresh_button()
+                if time.time() - getattr(self, '_boot_time', 0) < 40:     # still just starting: restart quietly
+                    self._restart()
+                elif messagebox.askyesno(T("Ενημέρωση", "Update"),
+                                         T(f"Εγκαταστάθηκε μια απαραίτητη ενημέρωση (έκδοση {version}). "
+                                           "Επανεκκίνηση τώρα;",
+                                           f"A required update (version {version}) was installed. Restart now?"),
+                                         parent=self):
+                    self._restart()
+            except tk.TclError:
+                pass
+        poll()
 
     # ---- keyboard shortcuts (settings)
     def _build_shortcuts_card(self, body, row, polish, hint):
