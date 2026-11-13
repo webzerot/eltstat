@@ -22,6 +22,8 @@ import time
 import threading
 import queue
 import weakref
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 from reportlab.pdfgen import canvas
@@ -369,6 +371,62 @@ def save_app_config(cfg):
         return True
     except OSError:
         return False
+
+
+# ------------------------------------------------------- online update (GitHub)
+# The program updates itself from a GitHub repository: it reads APP_VERSION from main.py on the chosen
+# branch, and if that is newer it can replace this file (the old one is kept as main.py.bak).
+APP_VERSION = "1.0.0"
+UPDATE_FILE = "main.py"
+UPDATE_DEFAULT_REPO = "webzerot/eltstat"            # "owner/repository", e.g. "myname/elstat" (can also be typed in Settings)
+UPDATE_DEFAULT_BRANCH = "main"
+_VERSION_RE = re.compile(r'^APP_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', re.M)
+
+
+def parse_github_repo(text):
+    """Accepts 'owner/repo' or a github.com link and returns 'owner/repo' ('' if it is not valid)."""
+    text = (text or '').strip()
+    m = re.match(r'^(?:https?://)?(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', text)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.match(r'^([\w.-]+)/([\w.-]+?)(?:\.git)?$', text)
+    return f"{m.group(1)}/{m.group(2)}" if m else ''
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r'\d+', str(v or '')))
+
+
+def fetch_remote_update(repo, branch):
+    """Downloads main.py from the repository. Returns {'version', 'newer', 'code' (bytes)}."""
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{UPDATE_FILE}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-updater', 'Cache-Control': 'no-cache'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        code = resp.read(30 * 1024 * 1024)
+    m = _VERSION_RE.search(code.decode('utf-8', errors='replace'))
+    if not m:
+        raise ValueError("APP_VERSION not found in the repository's " + UPDATE_FILE)
+    remote = m.group(1)
+    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
+            'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
+
+
+def apply_update(code):
+    """Checks the downloaded program and replaces this file with it. Returns the path of the backup."""
+    if getattr(sys, 'frozen', False):
+        raise RuntimeError("frozen")
+    text = code.decode('utf-8')
+    compile(text, UPDATE_FILE, 'exec')                         # must at least be valid Python
+    if 'class ElstatApp' not in text or not _VERSION_RE.search(text):
+        raise ValueError("The downloaded file does not look like this program.")
+    target = os.path.abspath(__file__)
+    backup = target + '.bak'
+    shutil.copy2(target, backup)
+    tmp = target + '.new'
+    with open(tmp, 'wb') as f:
+        f.write(code)
+    os.replace(tmp, target)
+    return backup
 
 
 def init_storage():
@@ -9859,6 +9917,8 @@ class ElstatApp(TkBase):
                            f"For drag-and-drop support run: \"{sys.executable}\" -m pip install tkinterdnd2"))
         self.after(100, self._apply_titlebar)
         self.after(150, self.excel_btn.focus_set)
+        if load_app_config().get('update_check_on_start'):
+            self.after(3000, lambda: self.check_for_updates(silent=True))
         if self._storage_notices:
             self.after(400, lambda: messagebox.showinfo(T("Ρυθμίσεις", "Settings"),
                                                         "\n\n".join(T(*n) for n in self._storage_notices),
@@ -10763,9 +10823,12 @@ class ElstatApp(TkBase):
         # ---- 5. keyboard shortcuts
         self._build_shortcuts_card(body, 6, polish_settings_card, hint)
 
+        # ---- 6. online update
+        self._build_update_card(body, 7, polish_settings_card, hint)
+
         # ---- reset
         bottom = ttk.Frame(body)
-        bottom.grid(row=7, column=0, sticky="ew", padx=4, pady=(6, 16))
+        bottom.grid(row=8, column=0, sticky="ew", padx=4, pady=(6, 16))
         ttk.Button(bottom, text=T("Επαναφορά ρυθμίσεων", "Reset settings"), style='Danger.TButton',
                    command=self.reset_prefs).pack(side="left")
         ttk.Label(bottom, text=T("Δεν διαγράφει ιστορικό ή στοιχεία ξενοδοχείου.",
@@ -11585,6 +11648,162 @@ class ElstatApp(TkBase):
                                              f"Could not create the backup:\n{e}"))
         self.run_async(work, lambda _r: self._status(T(f"✓ Αντίγραφο ασφαλείας: {fp}", f"✓ Backup: {fp}")),
                        fail, text=T("Δημιουργία αντιγράφου…", "Creating backup…"))
+
+    # ---- online update (GitHub)
+    def _ensure_update_vars(self):
+        if hasattr(self, 'update_repo_var'):
+            return
+        cfg = load_app_config()
+        self.update_repo_var = tk.StringVar(value=cfg.get('update_repo') or UPDATE_DEFAULT_REPO)
+        self.update_branch_var = tk.StringVar(value=cfg.get('update_branch') or UPDATE_DEFAULT_BRANCH)
+        self.update_auto_var = tk.BooleanVar(value=bool(cfg.get('update_check_on_start', False)))
+        self.update_status_var = tk.StringVar(value='')
+        self._update_pending = None
+
+    def _update_save_cfg(self, *_):
+        cfg = load_app_config()
+        cfg['update_repo'] = self.update_repo_var.get().strip()
+        cfg['update_branch'] = self.update_branch_var.get().strip() or UPDATE_DEFAULT_BRANCH
+        cfg['update_check_on_start'] = bool(self.update_auto_var.get())
+        save_app_config(cfg)
+
+    def _build_update_card(self, body, row, polish, hint):
+        self._ensure_update_vars()
+        card = Card(body, None, T("Ενημέρωση προγράμματος", "Program update"))
+        card.grid(row=row, column=0, sticky="ew", padx=4, pady=6)
+        polish(card)
+        f = card.body
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text=T(f"Τρέχουσα έκδοση: {APP_VERSION}", f"Current version: {APP_VERSION}"),
+                  style='CardBold.TLabel').grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, text=T("Αποθετήριο GitHub:", "GitHub repository:"), style='Card.TLabel').grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
+        repo_entry = ttk.Entry(f, textvariable=self.update_repo_var)
+        repo_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(10, 0))
+        ttk.Label(f, text=T("Κλάδος:", "Branch:"), style='Card.TLabel').grid(row=2, column=0, sticky="w", pady=(6, 0))
+        branch_entry = ttk.Entry(f, textvariable=self.update_branch_var, width=18)
+        branch_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        for e in (repo_entry, branch_entry):
+            e.bind('<FocusOut>', self._update_save_cfg)
+            e.bind('<Return>', self._update_save_cfg)
+        btns = ttk.Frame(f, style='Card.TFrame')
+        btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ttk.Button(btns, text=T("Έλεγχος για ενημερώσεις", "Check for updates"),
+                   command=self.check_for_updates).pack(side="left")
+        self.update_install_btn = ttk.Button(btns, text=T("Εγκατάσταση ενημέρωσης", "Install update"),
+                                             command=self.install_update,
+                                             state='normal' if self._update_pending else 'disabled')
+        self.update_install_btn.pack(side="left", padx=8)
+        lbl = hint(f, "", 4, columnspan=3, pady=(8, 0))
+        lbl.configure(textvariable=self.update_status_var)
+        ttk.Checkbutton(f, text=T("Έλεγχος για ενημέρωση όταν ανοίγει το πρόγραμμα", "Check for updates when the program starts"),
+                        variable=self.update_auto_var, style='Card.TCheckbutton',
+                        command=self._update_save_cfg).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        hint(f, T("Η ενημέρωση κατεβάζει το main.py από το αποθετήριο (ο κλάδος πρέπει να έχει μεγαλύτερο APP_VERSION). "
+                  "Το παλιό αρχείο αποθηκεύεται ως main.py.bak και τα δεδομένα σας δεν αγγίζονται. "
+                  "Λειτουργεί μόνο όταν το πρόγραμμα τρέχει ως αρχείο .py.",
+                  "The update downloads main.py from the repository (the branch must have a higher APP_VERSION). "
+                  "The old file is kept as main.py.bak and your data is not touched. "
+                  "It only works when the program runs as a .py file."), 6, columnspan=3)
+
+    def _update_refresh_button(self):
+        try:
+            self.update_install_btn.configure(state='normal' if self._update_pending else 'disabled')
+        except (tk.TclError, AttributeError):
+            pass
+
+    def check_for_updates(self, silent=False):
+        self._ensure_update_vars()
+        repo = parse_github_repo(self.update_repo_var.get())
+        branch = self.update_branch_var.get().strip() or UPDATE_DEFAULT_BRANCH
+        if not repo:
+            self.update_status_var.set(T("Γράψτε το αποθετήριο GitHub στη μορφή όνομα/αποθετήριο.",
+                                         "Enter the GitHub repository as owner/repository."))
+            if silent is not True:
+                messagebox.showinfo(T("Ενημέρωση", "Update"), self.update_status_var.get(), parent=self)
+            return
+        self._update_save_cfg()
+        self.update_status_var.set(T("Έλεγχος…", "Checking…"))
+
+        def done(info):
+            self._update_pending = info if info['newer'] else None
+            if info['newer']:
+                msg = T(f"Υπάρχει νέα έκδοση: {info['version']} (τρέχουσα {APP_VERSION}).",
+                        f"A new version is available: {info['version']} (current {APP_VERSION}).")
+            else:
+                msg = T(f"Το πρόγραμμα είναι ενημερωμένο (έκδοση {APP_VERSION}).",
+                        f"The program is up to date (version {APP_VERSION}).")
+            self.update_status_var.set(msg)
+            self._update_refresh_button()
+            if silent is True:
+                if info['newer']:
+                    self._status(msg + T(" Δείτε τις Ρυθμίσεις.", " See Settings."))
+            else:
+                messagebox.showinfo(T("Ενημέρωση", "Update"), msg, parent=self)
+
+        def fail(e):
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                msg = T(f"Δεν βρέθηκε το {UPDATE_FILE} στο {repo} (κλάδος {branch}). Αν το αποθετήριο είναι ιδιωτικό, "
+                        "δεν υποστηρίζεται.", f"{UPDATE_FILE} was not found in {repo} (branch {branch}). "
+                        "Private repositories are not supported.")
+            elif isinstance(e, (urllib.error.URLError, OSError)):
+                msg = T("Δεν υπάρχει σύνδεση με το GitHub. Ελέγξτε το internet και δοκιμάστε ξανά.",
+                        "Could not reach GitHub. Check your internet connection and try again.")
+            else:
+                msg = T(f"Ο έλεγχος απέτυχε:\n{e}", f"The check failed:\n{e}")
+            self.update_status_var.set(msg)
+            if silent is not True:
+                messagebox.showerror(T("Σφάλμα", "Error"), msg, parent=self)
+
+        self.run_async(lambda: fetch_remote_update(repo, branch), done, fail,
+                       text=T("Έλεγχος για ενημερώσεις…", "Checking for updates…"))
+
+    def install_update(self):
+        info = getattr(self, '_update_pending', None)
+        if not info:
+            return
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(T("Ενημέρωση", "Update"),
+                                T("Αυτή η έκδοση είναι πακεταρισμένη (.exe) και δεν μπορεί να ενημερωθεί από εδώ. "
+                                  "Κατεβάστε τη νέα έκδοση από το GitHub.",
+                                  "This is a packaged (.exe) build and cannot update itself. "
+                                  "Download the new version from GitHub."), parent=self)
+            return
+        if not messagebox.askyesno(T("Ενημέρωση", "Update"),
+                                   T(f"Να εγκατασταθεί η έκδοση {info['version']};\n\nΤο τρέχον αρχείο θα αποθηκευτεί ως "
+                                     "main.py.bak και το πρόγραμμα θα επανεκκινήσει.",
+                                     f"Install version {info['version']}?\n\nThe current file will be saved as "
+                                     "main.py.bak and the program will restart."),
+                                   default='no', parent=self):
+            return
+
+        def done(_backup):
+            self._update_pending = None
+            self._update_refresh_button()
+            self.update_status_var.set(T(f"✓ Εγκαταστάθηκε η έκδοση {info['version']}.",
+                                         f"✓ Version {info['version']} installed."))
+            if messagebox.askyesno(T("Ενημέρωση", "Update"),
+                                   T("Η ενημέρωση ολοκληρώθηκε. Επανεκκίνηση τώρα;", "The update is complete. Restart now?"),
+                                   parent=self):
+                self._restart()
+
+        def fail(e):
+            messagebox.showerror(T("Σφάλμα", "Error"),
+                                 T(f"Η ενημέρωση δεν ολοκληρώθηκε (το πρόγραμμα δεν άλλαξε):\n{e}",
+                                   f"The update did not complete (the program was not changed):\n{e}"), parent=self)
+
+        self.run_async(lambda: apply_update(info['code']), done, fail,
+                       text=T("Εγκατάσταση ενημέρωσης…", "Installing the update…"))
+
+    def _restart(self):
+        try:
+            subprocess.Popen([sys.executable] + sys.argv)
+        except Exception as e:
+            messagebox.showerror(T("Σφάλμα", "Error"),
+                                 T(f"Κλείστε και ανοίξτε ξανά το πρόγραμμα χειροκίνητα.\n{e}",
+                                   f"Please close and reopen the program yourself.\n{e}"), parent=self)
+            return
+        self.destroy()
 
     # ---- keyboard shortcuts (settings)
     def _build_shortcuts_card(self, body, row, polish, hint):
