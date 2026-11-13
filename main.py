@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.2"      # raise this number every time you push a new main.py to GitHub
+APP_VERSION = "1.0.3"      # raise this number every time you push a new main.py to GitHub
 
 # ------------------------------------------------- first-run setup (requirements.txt from GitHub)
 # The very first time the program runs it downloads requirements.txt from the GitHub repository into the
@@ -22,42 +22,64 @@ def _first_run_setup():
         return                                               # already set up: start normally and instantly
 
     # ---- a small "please wait" window (skipped silently if there is no display)
-    win = None
+    win = label = None
+    base_text = ''
     try:
         import tkinter as _tk
         win = _tk.Tk()
         win.title("ELSTAT")
-        _tk.Label(win, padx=30, pady=20, text="Πρώτη εκκίνηση: εγκατάσταση απαιτούμενων πακέτων…\n"
-                  "First run: installing the required packages…\n\nΠαρακαλώ περιμένετε / Please wait").pack()
+        base_text = ("Πρώτη εκκίνηση: εγκατάσταση απαιτούμενων πακέτων…\n"
+                     "First run: installing the required packages…\n\nΠαρακαλώ περιμένετε / Please wait")
+        label = _tk.Label(win, padx=30, pady=20, text=base_text)
+        label.pack()
         win.update()
     except Exception:
         win = None
 
-    ok, error = True, ""
-    try:
-        # 1) download requirements.txt from GitHub into the program folder
-        url = "https://raw.githubusercontent.com/webzerot/eltstat/main/requirements.txt"
+    result = {'ok': True, 'error': ''}
+
+    def work():                                              # runs in the background so the window stays responsive
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-setup'})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = resp.read(1024 * 1024)
-            with open(req_path, 'wb') as f:
-                f.write(data)
-        except Exception:
-            if not os.path.exists(req_path):                 # offline / not in the repo yet: use the built-in list
-                with open(req_path, 'w', encoding='utf-8') as f:
-                    f.write(fallback)
-        # 2) install it
-        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        cmd = [sys.executable, "-m", "pip", "install", "-r", req_path]
-        run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
-        if run.returncode != 0 and "No module named pip" in (run.stderr or ""):
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], capture_output=True, creationflags=flags)
-            run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
-        if run.returncode != 0:
-            ok, error = False, (run.stderr or run.stdout or "")[-800:]
-    except Exception as e:
-        ok, error = False, str(e)
+            # 1) download requirements.txt from GitHub into the program folder
+            url = "https://raw.githubusercontent.com/webzerot/eltstat/main/requirements.txt"
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-setup'})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = resp.read(1024 * 1024)
+                with open(req_path, 'wb') as f:
+                    f.write(data)
+            except Exception:
+                if not os.path.exists(req_path):             # offline / not in the repo yet: use the built-in list
+                    with open(req_path, 'w', encoding='utf-8') as f:
+                        f.write(fallback)
+            # 2) install it
+            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "20",
+                   "--retries", "2", "-r", req_path]
+            run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags, stdin=subprocess.DEVNULL)
+            if run.returncode != 0 and "No module named pip" in (run.stderr or ""):
+                subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], capture_output=True,
+                               creationflags=flags, stdin=subprocess.DEVNULL)
+                run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags,
+                                     stdin=subprocess.DEVNULL)
+            if run.returncode != 0:
+                result['ok'], result['error'] = False, (run.stderr or run.stdout or "")[-800:]
+        except Exception as e:
+            result['ok'], result['error'] = False, str(e)
+
+    import threading, time
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    started = time.time()
+    while worker.is_alive():
+        if win is not None:
+            try:
+                label.config(text=base_text + "  (%d s)" % int(time.time() - started))
+                win.update()
+            except Exception:
+                win = None
+        worker.join(0.1)
+    ok, error = result['ok'], result['error']
 
     still = missing()
     if still:
