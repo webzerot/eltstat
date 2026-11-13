@@ -428,6 +428,25 @@ def _handle_error(exc, val, tb, parent=None):
         pass
 
 
+def _log_swallowed(where, exc=None):
+    """For errors the program deliberately carries on after: one short entry in elstat_error.log, no pop-up."""
+    import traceback
+    try:
+        if exc is None:
+            exc = sys.exc_info()[1]
+        text = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else ''
+        for folder in (globals().get('DATA_DIR'), tempfile.gettempdir()):
+            try:
+                if folder:
+                    with open(os.path.join(folder, 'elstat_error.log'), 'a', encoding='utf-8') as f:
+                        f.write(f"\n--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (handled: {where}) ---\n{text}")
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def set_data_dir(path):
     """Points every data path of the program at `path`."""
     global DATA_DIR, SETTINGS_CSV, HISTORY_CSV, MONTHS_CSV, PREFS_JSON, ARCHIVE_DIR, COUNTRY_MAPPINGS_FILE
@@ -707,8 +726,10 @@ def load_prefs():
                         prefs[k] = bool(data[k]) if isinstance(default, bool) else str(data[k] or '')
             if 'manual_base' not in data and data.get('auto_populate_layout') is False:
                 prefs['manual_base'] = 'blank'        # older settings: "auto-populate" off meant a blank canvas
-    except Exception:
-        pass
+    except FileNotFoundError:
+        pass                                          # first run: no settings file yet is normal
+    except Exception as e:
+        _log_swallowed('load_prefs: settings file unreadable, defaults used', e)
     if prefs['output_mode'] not in ('program', 'excel', 'custom'):
         prefs['output_mode'] = 'program'
     if prefs['language'] not in LANGUAGES:
@@ -1545,7 +1566,8 @@ def read_excel_period(excel_path):
     Returns (date_from, date_to) or None if it cannot be found."""
     try:
         df = read_sheet(excel_path, nrows=15)
-    except Exception:
+    except Exception as e:
+        _log_swallowed(f'read_excel_period: could not read {excel_path}', e)
         return None
     # the label cells are Greek text saved as cp1253 -> repair like in the main reader
     def fix(t):
