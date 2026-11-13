@@ -2,6 +2,8 @@ APP_VERSION = "1.0.4"      # raise this number every time you push a new main.py
 FORCE_UPDATE = False       # set to True in the file you push to GitHub (together with a higher APP_VERSION): every
                            # program that starts online then installs this version by itself, without asking anyone.
                            # With False the update stays optional (the user presses "Install update" as before).
+GITHUB_REPO = "webzerot/eltstat"     # "owner/repository" or the full link https://github.com/webzerot/eltstat.git - the ONE place to change.
+GITHUB_BRANCH = "main"               # Used by the first-run setup (requirements.txt) and as the updater's default.
 
 # ------------------------------------------------- first-run setup (requirements.txt from GitHub)
 # The very first time the program runs it downloads requirements.txt from the GitHub repository into the
@@ -44,7 +46,10 @@ def _first_run_setup():
     def work():                                              # runs in the background so the window stays responsive
         try:
             # 1) download requirements.txt from GitHub into the program folder
-            url = "https://raw.githubusercontent.com/webzerot/eltstat/main/requirements.txt"
+            import re as _re          # GITHUB_REPO may be "owner/repo" or the full https://github.com/owner/repo(.git) link
+            _m = _re.match(r'^(?:https?://)?(?:www\.)?(?:github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', GITHUB_REPO.strip())
+            repo_path = f"{_m.group(1)}/{_m.group(2)}" if _m else GITHUB_REPO.strip()
+            url = f"https://raw.githubusercontent.com/{repo_path}/{GITHUB_BRANCH}/requirements.txt"
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-setup'})
                 with urllib.request.urlopen(req, timeout=20) as resp:
@@ -490,8 +495,8 @@ def save_app_config(cfg):
 # The program updates itself from a GitHub repository: it reads APP_VERSION from main.py on the chosen
 # branch, and if that is newer it can replace this file (the old one is kept as main.py.bak).
 UPDATE_FILE = "main.py"
-UPDATE_DEFAULT_REPO = "webzerot/eltstat"            # "owner/repository", e.g. "myname/elstat" (can also be typed in Settings)
-UPDATE_DEFAULT_BRANCH = "main"
+UPDATE_DEFAULT_REPO = GITHUB_REPO                   # set at the top of the file (can also be typed in Settings)
+UPDATE_DEFAULT_BRANCH = GITHUB_BRANCH
 _VERSION_RE = re.compile(r'^APP_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', re.M)
 _FORCE_RE = re.compile(r'^FORCE_UPDATE\s*=\s*(True|1)\b', re.M)      # read from the file on GitHub
 
@@ -11852,8 +11857,12 @@ class ElstatApp(TkBase):
 
     def _update_save_cfg(self, *_):
         cfg = load_app_config()
-        cfg['update_repo'] = self.update_repo_var.get().strip()
-        cfg['update_branch'] = self.update_branch_var.get().strip() or UPDATE_DEFAULT_BRANCH
+        repo_txt = self.update_repo_var.get().strip()
+        branch_txt = self.update_branch_var.get().strip() or UPDATE_DEFAULT_BRANCH
+        # only a CHANGED value is stored: while the box still shows the default, a later change of GITHUB_REPO /
+        # GITHUB_BRANCH at the top of the file reaches the already installed programs too
+        cfg['update_repo'] = '' if parse_github_repo(repo_txt) == parse_github_repo(UPDATE_DEFAULT_REPO) else repo_txt
+        cfg['update_branch'] = '' if branch_txt == UPDATE_DEFAULT_BRANCH else branch_txt
         cfg['update_check_on_start'] = bool(self.update_auto_var.get())
         save_app_config(cfg)
 
