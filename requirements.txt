@@ -8,3 +8,4 @@ PyMuPDF
 pypdf
 pypdfium2
 tkinterdnd2
+python-calamine
