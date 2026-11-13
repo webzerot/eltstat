@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.0"      # raise this number every time you push a new main.py to GitHub
+APP_VERSION = "1.0.1"      # raise this number every time you push a new main.py to GitHub
 import pandas as pd
 import pypdf
 import io
