@@ -665,7 +665,7 @@ def init_storage():
 
 
 # ------------------------------------------------------------- preferences
-BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading', 'auto_populate_layout', 'center_window')
+BOOL_PREFS = ('open_after', 'confirm_overwrite', 'keep_archive', 'show_reminder', 'prefill_employees', 'preview_before_result', 'show_extra_fields', 'show_loading', 'auto_populate_layout', 'center_window', 'show_console')
 DEFAULT_PREFS = {
     'language': 'el',                          # 'el' | 'en'  (interface language)
     'theme': 'light',                          # 'light' | 'dark' | 'auto'  (follow the system)
@@ -687,6 +687,7 @@ DEFAULT_PREFS = {
     'preview_before_result': False,             # show an in-app PDF preview before the Result dialog
     'show_extra_fields': True,                  # the optional "extra details" drop-down of the Hotel details tab
     'center_window': True,                     # open the window in the centre of the screen
+    'show_console': False,                     # show the console window (Windows only)
     'show_loading': True,                       # animated loading indicator while something is working
     'shortcuts': {},                            # keyboard shortcuts the user changed: {id: "Ctrl+Shift+S"} ('' = none)
 }
@@ -756,6 +757,24 @@ def load_prefs():
     if pattern_error(prefs['filename_pattern']):
         prefs['filename_pattern'] = DEFAULT_PREFS['filename_pattern']
     return prefs
+
+
+def set_console_visible(show):
+    """Show or hide the console window (Windows only; leaves a shared terminal alone)."""
+    if not sys.platform.startswith('win'):
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd:
+            return
+        buf = (ctypes.c_uint * 2)()
+        if k32.GetConsoleProcessList(buf, 2) > 1:
+            return
+        ctypes.windll.user32.ShowWindow(hwnd, 5 if show else 0)
+    except Exception:
+        pass
 
 
 def save_prefs(prefs):
@@ -5912,6 +5931,9 @@ MANUAL = [
                 "χωρίς να «πηδάει». Αν το κλείσετε, τη θέση την επιλέγει το σύστημα. Δεν επηρεάζει τα υπόλοιπα παράθυρα.",
                 "**Centre the window when the program starts**: the main window opens in the middle of the screen and appears once, "
                 "without jumping. If you turn it off, the system chooses the position. It does not affect the other windows.")),
+        ('anchor', 'opt_show_console'),
+        ('li', ("**Εμφάνιση του παραθύρου κονσόλας**: μόνο στα Windows. Από προεπιλογή είναι κρυμμένο· ενεργοποιήστε το για να δείτε μηνύματα διάγνωσης. Η αλλαγή ισχύει αμέσως.",
+                "**Show the console window**: Windows only. Hidden by default; turn it on to see diagnostic messages. The change applies immediately.")),
         ('anchor', 'opt_open_after'),
         ('li', ("**Άνοιγμα του PDF αμέσως μετά τη δημιουργία**: όταν αποθηκευτεί το δελτίο, ανοίγει στο πρόγραμμα PDF του υπολογιστή σας. "
                 "Με την προεπισκόπηση ανοίγει αφού πατήσετε «Αποθήκευση & συνέχεια». Δεν ανοίγει όταν στέλνετε το δελτίο κατευθείαν στον εκτυπωτή.",
@@ -10143,6 +10165,7 @@ class ElstatApp(TkBase):
         self._storage_notices = init_storage()
         load_custom_country_mappings()
         self.prefs = load_prefs()
+        set_console_visible(self.prefs.get('show_console', False))
         load_shortcut_overrides(self.prefs.get('shortcuts'))
         set_language(self.prefs['language'])
         set_theme(self.prefs['theme'])
@@ -11049,6 +11072,9 @@ class ElstatApp(TkBase):
             ('center_window', T("Κεντράρισμα του παραθύρου κατά την εκκίνηση", "Centre the window when the program starts"),
              T("Το παράθυρο ανοίγει στο κέντρο της οθόνης. Αν το κλείσετε, το σύστημα επιλέγει τη θέση.",
                "The window opens in the middle of the screen. If you turn it off, the system chooses the position.")),
+            ('show_console', T("Εμφάνιση του παραθύρου κονσόλας (μόνο Windows)", "Show the console window (Windows only)"),
+             T("Από προεπιλογή το μαύρο παράθυρο κονσόλας είναι κρυμμένο. Ενεργοποιήστε το για διάγνωση προβλημάτων.",
+               "The black console window is hidden by default. Turn it on to diagnose problems.")),
             ('open_after', T("Άνοιγμα του PDF αμέσως μετά τη δημιουργία",
                              "Open the PDF right after it is created"),
              T("Μόλις φτιαχτεί το δελτίο, ανοίγει στο πρόγραμμα PDF του υπολογιστή σας.",
@@ -11750,6 +11776,7 @@ class ElstatApp(TkBase):
             var.set(self.prefs[k])
 
     def _after_prefs_change(self):
+        set_console_visible(self.prefs.get('show_console', False))
         custom = self.prefs['output_mode'] == 'custom'
         for w in (self.out_dir_entry, self.out_dir_btn):
             w.state(['!disabled' if custom else 'disabled'])
