@@ -5,6 +5,124 @@ FORCE_UPDATE = False       # set to True in the file you push to GitHub (togethe
 GITHUB_REPO = "webzerot/eltstat"     # "owner/repository" or the full link https://github.com/webzerot/eltstat.git - the ONE place to change.
 GITHUB_BRANCH = "main"               # Used by the first-run setup (requirements.txt) and as the updater's default.
 
+import sys
+import os as _os0
+_CONSOLE_ATTACHED = [True]
+# True when the user started the program with pythonw.exe / a .pyw file: there is no console to show or hide.
+NO_CONSOLE_MODE = sys.platform.startswith('win') and _os0.path.basename(sys.executable).lower() == 'pythonw.exe'
+
+
+def set_console_visible(show):
+    """Show or hide the console (Windows only). Hiding detaches the console entirely, which also
+    works when it is hosted by Windows Terminal (where ShowWindow only minimises it).
+    A terminal shared with other programs (launched by the user) is left alone."""
+    if not sys.platform.startswith('win') or NO_CONSOLE_MODE:
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        if show:
+            if _CONSOLE_ATTACHED[0] and k32.GetConsoleWindow():
+                return
+            if k32.AllocConsole():
+                try:
+                    sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
+                    sys.stderr = sys.stdout
+                    sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+                except Exception:
+                    pass
+            _CONSOLE_ATTACHED[0] = True
+        else:
+            if not k32.GetConsoleWindow():
+                _CONSOLE_ATTACHED[0] = False
+                return
+            buf = (ctypes.c_uint * 2)()
+            if k32.GetConsoleProcessList(buf, 2) > 1:
+                return
+            import os
+            sink = open(os.devnull, 'w')
+            sys.stdout = sink
+            sys.stderr = sink
+            sys.__stdout__ = sink
+            sys.__stderr__ = sink
+            k32.FreeConsole()
+            _CONSOLE_ATTACHED[0] = False
+    except Exception:
+        pass
+
+
+set_console_visible(False)    # hide the console at once (before the slow imports); Settings can show it again
+if sys.stdout is None or sys.stderr is None:      # pythonw.exe has no console streams: give print() somewhere to go
+    import os as _os
+    _sink = open(_os.devnull, 'w')
+    sys.stdout = sys.stdout or _sink
+    sys.stderr = sys.stderr or _sink
+
+def _startup_failure(exc, val, tb):
+    """The program crashed while starting (before its own error handling exists). With the console closed this
+    would be invisible, so: write elstat_crash.log next to the program and show ONE short message, offering to put
+    back the version saved before the last update (main.py.bak). Never raises."""
+    if exc is not None and issubclass(exc, (KeyboardInterrupt, SystemExit)):
+        return
+    try:
+        import traceback, datetime as _dt, shutil as _sh
+        here = _os0.path.dirname(_os0.path.abspath(__file__))
+        text = ''.join(traceback.format_exception(exc, val, tb))
+        log = _os0.path.join(here, 'elstat_crash.log')
+        try:
+            with open(log, 'a', encoding='utf-8') as f:
+                f.write(f"\n=== {_dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n{text}")
+        except Exception:
+            log = ''
+        bak = _os0.path.join(here, _os0.path.basename(__file__) + '.bak')
+        can_restore = _os0.path.isfile(bak) and not getattr(sys, 'frozen', False)
+        msg = ("Το πρόγραμμα δεν μπόρεσε να ξεκινήσει.\nThe program could not start.\n\n"
+               f"{getattr(exc, '__name__', 'Error')}: {val}\n"
+               + (f"\nDetails / Λεπτομέρειες: {log}\n" if log else ''))
+        if can_restore:
+            msg += ("\nΝα επανέλθει η προηγούμενη έκδοση (πριν την τελευταία ενημέρωση);\n"
+                    "Go back to the previous version (before the last update)?")
+        restore = False
+        try:
+            import tkinter as _tkm
+            from tkinter import messagebox as _mb
+            r = _tkm.Tk()
+            r.withdraw()
+            if can_restore:
+                restore = _mb.askyesno("ELSTAT", msg, default='no')
+            else:
+                _mb.showerror("ELSTAT", msg)
+            r.destroy()
+        except Exception:
+            if sys.platform.startswith('win'):
+                import ctypes
+                flag = 0x24 if can_restore else 0x10            # Yes/No + question, or OK + error
+                restore = ctypes.windll.user32.MessageBoxW(0, msg, "ELSTAT", flag) == 6 and can_restore
+        if restore:
+            target = _os0.path.abspath(__file__)
+            _sh.copy2(bak, target)
+            bdir = bak + '.d'
+            mp = _os0.path.join(bdir, '_manifest.json')
+            if _os0.path.isfile(mp):                            # extra files of a multi-file update
+                import json as _js
+                m = _js.load(open(mp, encoding='utf-8'))
+                for rel in m.get('restore', []):
+                    if '..' not in rel.split('/') and not rel.startswith('/'):
+                        dst = _os0.path.join(here, *rel.split('/'))
+                        _os0.makedirs(_os0.path.dirname(dst), exist_ok=True)
+                        _sh.copy2(_os0.path.join(bdir, *rel.split('/')), dst)
+                for rel in m.get('remove', []):
+                    if '..' not in rel.split('/') and not rel.startswith('/'):
+                        try:
+                            _os0.remove(_os0.path.join(here, *rel.split('/')))
+                        except OSError:
+                            pass
+    except Exception:
+        pass
+
+
+sys.excepthook = _startup_failure        # replaced by the program's own error handling once it is running
+
 # ------------------------------------------------- first-run setup (requirements.txt from GitHub)
 # The very first time the program runs it downloads requirements.txt from the GitHub repository into the
 # SAME folder as this program and installs what is listed there. This block must stay above the other
@@ -873,47 +991,6 @@ def load_prefs():
     if pattern_error(prefs['filename_pattern']):
         prefs['filename_pattern'] = DEFAULT_PREFS['filename_pattern']
     return prefs
-
-
-_CONSOLE_ATTACHED = [True]
-
-
-def set_console_visible(show):
-    """Show or hide the console (Windows only). Hiding detaches the console entirely, which also
-    works when it is hosted by Windows Terminal (where ShowWindow only minimises it).
-    A terminal shared with other programs (launched by the user) is left alone."""
-    if not sys.platform.startswith('win'):
-        return
-    try:
-        import ctypes
-        k32 = ctypes.windll.kernel32
-        if show:
-            if _CONSOLE_ATTACHED[0] and k32.GetConsoleWindow():
-                return
-            if k32.AllocConsole():
-                try:
-                    sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
-                    sys.stderr = sys.stdout
-                    sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
-                except Exception:
-                    pass
-            _CONSOLE_ATTACHED[0] = True
-        else:
-            if not k32.GetConsoleWindow():
-                _CONSOLE_ATTACHED[0] = False
-                return
-            buf = (ctypes.c_uint * 2)()
-            if k32.GetConsoleProcessList(buf, 2) > 1:
-                return
-            sink = open(os.devnull, 'w')
-            sys.stdout = sink
-            sys.stderr = sink
-            sys.__stdout__ = sink
-            sys.__stderr__ = sink
-            k32.FreeConsole()
-            _CONSOLE_ATTACHED[0] = False
-    except Exception:
-        pass
 
 
 def save_prefs(prefs):
@@ -11211,9 +11288,9 @@ class ElstatApp(TkBase):
             ('center_window', T("Κεντράρισμα του παραθύρου κατά την εκκίνηση", "Centre the window when the program starts"),
              T("Το παράθυρο ανοίγει στο κέντρο της οθόνης. Αν το κλείσετε, το σύστημα επιλέγει τη θέση.",
                "The window opens in the middle of the screen. If you turn it off, the system chooses the position.")),
-            ('show_console', T("Εμφάνιση του παραθύρου κονσόλας (μόνο Windows)", "Show the console window (Windows only)"),
+            *([] if (NO_CONSOLE_MODE or not sys.platform.startswith('win')) else [('show_console', T("Εμφάνιση του παραθύρου κονσόλας (μόνο Windows)", "Show the console window (Windows only)"),
              T("Από προεπιλογή το μαύρο παράθυρο κονσόλας είναι κρυμμένο. Ενεργοποιήστε το για διάγνωση προβλημάτων.",
-               "The black console window is hidden by default. Turn it on to diagnose problems.")),
+               "The black console window is hidden by default. Turn it on to diagnose problems."))]),
             ('open_after', T("Άνοιγμα του PDF αμέσως μετά τη δημιουργία",
                              "Open the PDF right after it is created"),
              T("Μόλις φτιαχτεί το δελτίο, ανοίγει στο πρόγραμμα PDF του υπολογιστή σας.",
@@ -14360,5 +14437,9 @@ if __name__ == "__main__":
     sys.excepthook = lambda e, v, t: _handle_error(e, v, t)
     if hasattr(threading, 'excepthook'):
         threading.excepthook = lambda a: _handle_error(a.exc_type, a.exc_value, a.exc_traceback)
-    app = ElstatApp()
+    try:
+        app = ElstatApp()
+    except BaseException as _e:
+        _startup_failure(type(_e), _e, _e.__traceback__)
+        sys.exit(1)
     app.mainloop()
