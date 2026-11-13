@@ -399,15 +399,23 @@ def version_tuple(v):
 
 def fetch_remote_update(repo, branch):
     """Downloads main.py from the repository. Returns {'version', 'newer', 'code' (bytes)}."""
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{UPDATE_FILE}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-updater', 'Cache-Control': 'no-cache'})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    base = f"https://raw.githubusercontent.com/{repo}/{branch}/"
+    stamp = f"?t={int(time.time())}"                  # a new address each time, so GitHub's cache is skipped
+    headers = {'User-Agent': 'ELSTAT-updater', 'Cache-Control': 'no-cache'}
+    with urllib.request.urlopen(urllib.request.Request(base + UPDATE_FILE + stamp, headers=headers), timeout=20) as resp:
         code = resp.read(30 * 1024 * 1024)
+    notes = ''
+    try:                                              # optional: a CHANGELOG.md in the repo is shown before installing
+        with urllib.request.urlopen(urllib.request.Request(base + "CHANGELOG.md" + stamp, headers=headers),
+                                    timeout=8) as resp:
+            notes = resp.read(40 * 1024).decode('utf-8', errors='replace').strip()[:1500]
+    except Exception:
+        pass
     m = _VERSION_RE.search(code.decode('utf-8', errors='replace'))
     if not m:
         raise ValueError("APP_VERSION not found in the repository's " + UPDATE_FILE)
     remote = m.group(1)
-    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
+    return {'version': remote, 'code': code, 'repo': repo, 'branch': branch, 'notes': notes,
             'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
 
 
@@ -427,6 +435,21 @@ def apply_update(code):
         f.write(code)
     os.replace(tmp, target)
     return backup
+
+
+def restore_backup():
+    """Puts back the program that was saved as main.py.bak before the last update."""
+    target = os.path.abspath(__file__)
+    backup = target + '.bak'
+    if not os.path.isfile(backup):
+        raise FileNotFoundError(backup)
+    with open(backup, 'rb') as f:
+        code = f.read()
+    compile(code.decode('utf-8'), UPDATE_FILE, 'exec')
+    tmp = target + '.new'
+    with open(tmp, 'wb') as f:
+        f.write(code)
+    os.replace(tmp, target)
 
 
 def init_storage():
@@ -11694,6 +11717,10 @@ class ElstatApp(TkBase):
                                              command=self.install_update,
                                              state='normal' if self._update_pending else 'disabled')
         self.update_install_btn.pack(side="left", padx=8)
+        self.update_restore_btn = ttk.Button(btns, text=T("Επαναφορά προηγούμενης έκδοσης", "Restore previous version"),
+                                             command=self.restore_previous)
+        self.update_restore_btn.pack(side="left")
+        self._update_refresh_button()
         lbl = hint(f, "", 4, columnspan=3, pady=(8, 0))
         lbl.configure(textvariable=self.update_status_var)
         ttk.Checkbutton(f, text=T("Έλεγχος για ενημέρωση όταν ανοίγει το πρόγραμμα", "Check for updates when the program starts"),
@@ -11709,6 +11736,8 @@ class ElstatApp(TkBase):
     def _update_refresh_button(self):
         try:
             self.update_install_btn.configure(state='normal' if self._update_pending else 'disabled')
+            has_bak = os.path.isfile(os.path.abspath(__file__) + '.bak') and not getattr(sys, 'frozen', False)
+            self.update_restore_btn.configure(state='normal' if has_bak else 'disabled')
         except (tk.TclError, AttributeError):
             pass
 
@@ -11733,7 +11762,8 @@ class ElstatApp(TkBase):
             else:
                 msg = T(f"Το πρόγραμμα είναι ενημερωμένο (έκδοση {APP_VERSION}).",
                         f"The program is up to date (version {APP_VERSION}).")
-            self.update_status_var.set(msg)
+            self.update_status_var.set(msg + T(f"  (ελέγχθηκε {time.strftime('%H:%M')})",
+                                               f"  (checked at {time.strftime('%H:%M')})"))
             self._update_refresh_button()
             if silent is True:
                 if info['newer']:
@@ -11773,7 +11803,8 @@ class ElstatApp(TkBase):
                                    T(f"Να εγκατασταθεί η έκδοση {info['version']};\n\nΤο τρέχον αρχείο θα αποθηκευτεί ως "
                                      "main.py.bak και το πρόγραμμα θα επανεκκινήσει.",
                                      f"Install version {info['version']}?\n\nThe current file will be saved as "
-                                     "main.py.bak and the program will restart."),
+                                     "main.py.bak and the program will restart.")
+                                   + (T("\n\nΤι αλλάζει:\n", "\n\nWhat's new:\n") + info['notes'] if info.get('notes') else ''),
                                    default='no', parent=self):
             return
 
@@ -11794,6 +11825,24 @@ class ElstatApp(TkBase):
 
         self.run_async(lambda: apply_update(info['code']), done, fail,
                        text=T("Εγκατάσταση ενημέρωσης…", "Installing the update…"))
+
+    def restore_previous(self):
+        if not messagebox.askyesno(T("Επαναφορά", "Restore"),
+                                   T("Να επανέλθει η προηγούμενη έκδοση του προγράμματος (main.py.bak);",
+                                     "Go back to the previous version of the program (main.py.bak)?"),
+                                   default='no', parent=self):
+            return
+
+        def done(_r):
+            self._update_refresh_button()
+            self.update_status_var.set(T("✓ Επαναφέρθηκε η προηγούμενη έκδοση.", "✓ The previous version was restored."))
+            if messagebox.askyesno(T("Επαναφορά", "Restore"), T("Επανεκκίνηση τώρα;", "Restart now?"), parent=self):
+                self._restart()
+
+        def fail(e):
+            messagebox.showerror(T("Σφάλμα", "Error"), T(f"Η επαναφορά απέτυχε:\n{e}", f"The restore failed:\n{e}"),
+                                 parent=self)
+        self.run_async(restore_backup, done, fail, text=T("Επαναφορά…", "Restoring…"))
 
     def _restart(self):
         try:
