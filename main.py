@@ -567,6 +567,14 @@ def changelog_section(text, version):
     return '\n'.join(lines[start:end]).strip()[:1500] if body else ''
 
 
+def _safe_changelog(notes, version):
+    """The changelog is optional: anything wrong with it just means no 'What's new' text."""
+    try:
+        return changelog_section(notes, version) if notes and notes.strip() else ''
+    except Exception:
+        return ''
+
+
 def fetch_remote_update(repo, branch):
     """Downloads main.py from the repository. Returns {'version', 'newer', 'code' (bytes)}."""
     base = f"https://raw.githubusercontent.com/{repo}/{branch}/"
@@ -588,7 +596,7 @@ def fetch_remote_update(repo, branch):
     remote = m.group(1)
     return {'version': remote, 'code': code, 'repo': repo, 'branch': branch,
             'force': bool(_FORCE_RE.search(remote_text)),
-            'notes': changelog_section(notes, remote) if notes.strip() else '',
+            'notes': _safe_changelog(notes, remote),
             'newer': version_tuple(remote) > version_tuple(APP_VERSION)}
 
 
