@@ -1510,6 +1510,17 @@ def _sniff_kind(path):
     return 'text'
 
 
+_QUIET_LOG = None
+
+
+def _quiet_log():
+    """A file object that swallows text (what xlrd is told to write its warnings to)."""
+    global _QUIET_LOG
+    if _QUIET_LOG is None:
+        _QUIET_LOG = open(os.devnull, 'w')
+    return _QUIET_LOG
+
+
 def _read_excel_any(path, nrows=None):
     """Reads an Excel file (.xls / .xlsx) as a header-less table. Tries every reader that is available and,
     as a last resort, converts the file with LibreOffice, so a missing 'xlrd' no longer makes a valid .xls unreadable."""
@@ -1519,7 +1530,17 @@ def _read_excel_any(path, nrows=None):
     for eng in engines:
         try:
             kw = {'engine': eng} if eng else {}
-            return pd.read_excel(path, header=None, nrows=nrows, **kw)
+            if kind == 'xls' and not eng:
+                kw['engine_kwargs'] = {'logfile': _quiet_log()}     # xlrd's own chatter about Protel's .xls goes nowhere
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*xlrd engine is deprecated.*')
+                try:
+                    return pd.read_excel(path, header=None, nrows=nrows, **kw)
+                except TypeError:                                    # an older pandas without engine_kwargs
+                    if 'engine_kwargs' not in kw:
+                        raise
+                    kw.pop('engine_kwargs')
+                    return pd.read_excel(path, header=None, nrows=nrows, **kw)
         except Exception as e:
             errors.append(str(e).splitlines()[0] if str(e) else repr(e))
     soffice = shutil.which('soffice') or shutil.which('libreoffice')
