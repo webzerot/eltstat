@@ -51,12 +51,54 @@ def set_console_visible(show):
         pass
 
 
-set_console_visible(False)    # hide the console at once (before the slow imports); Settings can show it again
+def _console_wanted():
+    """Cheap look at the saved settings (before any heavy import): did the user turn 'show console' on?"""
+    try:
+        import json as _j
+        here = _os0.path.dirname(_os0.path.abspath(__file__))
+        folders = []
+        try:
+            with open(_os0.path.join(here, 'elstat_config.json'), encoding='utf-8') as f:
+                d = (_j.load(f) or {}).get('data_dir')
+            if d:
+                folders.append(str(d))
+        except Exception:
+            pass
+        folders += [_os0.path.join(here, 'ELSTAT_Data'), here]
+        for folder in folders:
+            p = _os0.path.join(folder, 'elstat_preferences.json')
+            if _os0.path.isfile(p):
+                with open(p, encoding='utf-8') as f:
+                    return bool((_j.load(f) or {}).get('show_console', False))
+    except Exception:
+        pass
+    return False
+
+
+if not _console_wanted():
+    set_console_visible(False)    # hide the console at once (before the slow imports); Settings can show it again
 if sys.stdout is None or sys.stderr is None:      # pythonw.exe has no console streams: give print() somewhere to go
     import os as _os
     _sink = open(_os.devnull, 'w')
     sys.stdout = sys.stdout or _sink
     sys.stderr = sys.stderr or _sink
+
+_console_lock = None
+
+
+def set_console_visible_async(show):
+    """Same as set_console_visible, but off the interface thread: opening a console can take a moment
+    (especially with Windows Terminal) and must not freeze the window."""
+    global _console_lock
+    import threading
+    if _console_lock is None:
+        _console_lock = threading.Lock()
+
+    def work():
+        with _console_lock:
+            set_console_visible(show)
+    threading.Thread(target=work, daemon=True).start()
+
 
 def _startup_failure(exc, val, tb):
     """The program crashed while starting (before its own error handling exists). With the console closed this
@@ -11992,7 +12034,7 @@ class ElstatApp(TkBase):
             var.set(self.prefs[k])
 
     def _after_prefs_change(self):
-        set_console_visible(self.prefs.get('show_console', False))
+        set_console_visible_async(self.prefs.get('show_console', False))
         custom = self.prefs['output_mode'] == 'custom'
         for w in (self.out_dir_entry, self.out_dir_btn):
             w.state(['!disabled' if custom else 'disabled'])
