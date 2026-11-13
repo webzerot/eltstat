@@ -1,0 +1,16 @@
+# Changelog
+
+## 1.0.2
+Released: 13 November 2026
+
+- First-run setup: on the very first start the program downloads requirements.txt from the GitHub repository and installs the required packages automatically.
+- The setup runs once. A hidden file, .elstat_setup_done, remembers that it is finished, so later starts are instant.
+- If a required package goes missing later, the setup runs again by itself.
+- If GitHub has no requirements.txt or there is no internet, a built-in list of packages is used instead.
+- Everything stays in the program's own folder by default, so no folders need to be changed.
+
+## 1.0.1
+- Update check test release.
+
+## 1.0.0
+- First release.
