@@ -428,6 +428,18 @@ def _handle_error(exc, val, tb, parent=None):
         pass
 
 
+def _backup_unreadable(path):
+    """Before a file that could not be read gets overwritten: keeps a copy next to it (name.bad-DATE-TIME)."""
+    try:
+        if os.path.exists(path):
+            dst = f"{path}.bad-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+            shutil.copy2(path, dst)
+            return dst
+    except Exception as e:
+        _log_swallowed(f'could not back up {path}', e)
+    return None
+
+
 def _log_swallowed(where, exc=None):
     """For errors the program deliberately carries on after: one short entry in elstat_error.log, no pop-up."""
     import traceback
@@ -1226,8 +1238,8 @@ def load_hotel_settings():
                 saved = df.iloc[0].to_dict()
                 for k in settings:
                     settings[k] = str(saved.get(k, '') or '').strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _log_swallowed('load_hotel_settings: hotel_settings.csv unreadable, empty settings used', e)
     return settings
 
 def save_hotel_settings(settings_data):
@@ -2140,7 +2152,8 @@ def load_history():
         return {}
     try:
         df = pd.read_csv(HISTORY_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
-    except Exception:
+    except Exception as e:
+        _log_swallowed('load_history: history CSV unreadable, treated as empty', e)
         return {}
     out = {}
     for _, r in df.iterrows():
@@ -2208,7 +2221,8 @@ def load_month_records():
         df = pd.read_csv(MONTHS_CSV, encoding='utf-8-sig', dtype=str, keep_default_na=False)
         return {(int(r['Etos']), int(r['Minas'])): {'employees': r['Ypalliloi'], 'days': r['Meres'],
                                                     'date_to': r['DateTo']} for _, r in df.iterrows()}
-    except Exception:
+    except Exception as e:
+        _log_swallowed('load_month_records: months CSV unreadable, treated as empty', e)
         return {}
 
 
@@ -2222,8 +2236,10 @@ def save_month_record(year, month, employees, days, date_to):
             keep = ~((pd.to_numeric(old['Etos'], errors='coerce') == year) &
                      (pd.to_numeric(old['Minas'], errors='coerce') == month))
             df = pd.concat([old[keep], df], ignore_index=True)
-        except Exception:
-            pass
+        except Exception as e:
+            # the old file cannot be merged: keep a copy of it so the earlier months are not lost for good
+            saved = _backup_unreadable(MONTHS_CSV)
+            _log_swallowed(f'save_month_record: old months CSV unreadable, copy kept as {saved}', e)
     ensure_data_dir()
     df.to_csv(MONTHS_CSV, index=False, encoding='utf-8-sig')
 
@@ -2512,8 +2528,10 @@ def load_layout_reference():
         pages = data['pages']
         if len(pages) == 2 and all(isinstance(p.get('items'), list) for p in pages):
             return data
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        _log_swallowed('load_layout_reference: saved layout reference unreadable', e)
     return None
 
 
@@ -2962,7 +2980,10 @@ def load_manual_layout():
     try:
         with open(manual_layout_file(), encoding='utf-8') as f:
             data = json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        data = {}
+    except Exception as e:
+        _log_swallowed('load_manual_layout: saved layout unreadable, default positions used', e)
         data = {}
     return _layout_from_saved(data) or manual_default_layout()
 
@@ -3926,7 +3947,10 @@ def load_detect_cache():
     try:
         with open(detect_layout_file(), encoding='utf-8') as f:
             data = json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        _log_swallowed('load_detect_cache: saved detection layout unreadable', e)
         return None
     layout = _layout_from_saved(data)
     if layout is not None:
@@ -4557,8 +4581,8 @@ def commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode='overla
     if pdf_mode == 'overlay' and load_layout_reference() is None:
         try:        # the first real form made the default way shows the template the fixed positions fit
             save_layout_reference(template_pdf)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_swallowed('commit_report_history: could not save the layout reference', e)
     csv_filename = HISTORY_CSV
     csv_data = []
     for country, vals in pdf_data.items():
