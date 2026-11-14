@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.5"      # raise this number every time you push a new main.py to GitHub
+APP_VERSION = "1.0.6"      # raise this number every time you push a new main.py to GitHub
 FORCE_UPDATE = False       # set to True in the file you push to GitHub (together with a higher APP_VERSION): every
                            # program that starts online then installs this version by itself, without asking anyone.
                            # With False the update stays optional (the user presses "Install update" as before).
@@ -2197,6 +2197,36 @@ def save_custom_country_mapping(country, destination):
         if norm(old) == norm(key):
             del updated[old]
     updated[key] = value
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = COUNTRY_MAPPINGS_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(updated, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, COUNTRY_MAPPINGS_FILE)
+    load_custom_country_mappings()
+
+
+def pretty_row(target_norm):
+    """Readable name of a form row given its normalised name."""
+    return next((v for v in country_mapping_destinations() if norm(v) == target_norm),
+                PRETTY_COUNTRY.get(target_norm, target_norm))
+
+
+def default_country_row(name):
+    """Readable form row a country goes to WITHOUT the user's own mappings (None = the program does not know it)."""
+    k = norm(name)
+    target = COUNTRY_MAPPING_NORM.get(k) or (k if k in MAPPED_TARGETS else None)
+    return pretty_row(target) if target else None
+
+
+def delete_custom_country_mapping(country):
+    """Remove the user's own mapping of one country (it goes back to the program's default)."""
+    delete_custom_country_mappings([country])
+
+
+def delete_custom_country_mappings(countries):
+    """Remove the user's own mappings of several countries at once (they go back to the program's default)."""
+    gone = {norm(c) for c in countries}
+    updated = {k: v for k, v in CUSTOM_COUNTRY_MAPPING.items() if norm(k) not in gone}
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = COUNTRY_MAPPINGS_FILE + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
@@ -6490,7 +6520,7 @@ MANUAL = [
                "Protel writes countries with English names. The program maps them to the lines of the ELSTAT form with a built-in list.")),
         ('h', ("Όταν μια χώρα είναι άγνωστη", "When a country is unknown")),
         ('step', ("Στο Βήμα 1 η άγνωστη χώρα εμφανίζεται με κόκκινο και η στήλη «Στο δελτίο» γράφει ότι λείπει.", "In Step 1 the unknown country shows in red and the “On the form” column says it is missing.")),
-        ('step', ("Επιλέξτε την και πατήστε **Προσθήκη / αντιστοίχιση επιλεγμένης χώρας…** (ή κάντε διπλό κλικ πάνω της).", "Select it and press **Add / map selected country…** (or double-click it).")),
+        ('step', ("Επιλέξτε την και πατήστε **Αλλαγή γραμμής επιλεγμένης χώρας…** (ή κάντε κλικ στη στήλη **Στο δελτίο**, ή διπλό κλικ πάνω της).", "Select it and press **Change form row of selected country…** (or click its **On the form** cell, or double-click it).")),
         ('step', ("Διαλέξτε σε ποια γραμμή ή κατηγορία του δελτίου ανήκει και πατήστε **Αποθήκευση**.", "Choose which row or category of the form it belongs to and press **Save mapping**.")),
         ('step', ("Πατήστε ξανά **Δημιουργία PDF**. Η αντιστοίχιση θυμάται και για τους επόμενους μήνες.", "Press **Create PDF** again. The mapping is remembered for future months.")),
         ('li', ("Έχετε ήδη **[[custom_count]]** δικές σας αντιστοιχίσεις. Αποθηκεύονται στο `elstat_country_mappings.json` του φακέλου δεδομένων και μπαίνουν στο αντίγραφο ασφαλείας.",
@@ -6624,9 +6654,9 @@ MANUAL = [
                "Read the check message right above it: it says what to fix (e.g. no Excel chosen, or the Tax ID is missing).")),
         ('h', ("Μια χώρα δεν μπήκε στο PDF", "A country was left out of the PDF")),
         ('p', ("Η χώρα δεν είναι γνωστή στο πρόγραμμα. Εμφανίζεται με κόκκινο στον πίνακα του Βήματος 1 και στο παράθυρο αποτελέσματος, "
-               "μαζί με τους πελάτες και τις διανυκτερεύσεις της. Επιλέξτε την κόκκινη χώρα στον πίνακα και πατήστε «Προσθήκη / αντιστοίχιση χώρας» για να τη συνδέσετε με τη σωστή γραμμή της ΕΛΣΤΑΤ. Η επιλογή αποθηκεύεται για τους επόμενους μήνες. Ελέγξτε τα σύνολα πριν υποβάλετε το δελτίο.",
+               "μαζί με τους πελάτες και τις διανυκτερεύσεις της. Επιλέξτε τη χώρα στον πίνακα και πατήστε «Αλλαγή γραμμής επιλεγμένης χώρας» (ή κλικ στη στήλη «Στο δελτίο») για να τη συνδέσετε με τη σωστή γραμμή της ΕΛΣΤΑΤ. Το ίδιο ισχύει και για χώρες που το πρόγραμμα ήδη γνωρίζει. Η επιλογή αποθηκεύεται για τους επόμενους μήνες. Ελέγξτε τα σύνολα πριν υποβάλετε το δελτίο.",
                "The country is unknown to the program. It shows in red in the Step 1 table and in the result window, with its guests and nights. "
-               "Select the red country in the table and click “Add / map country” to assign it to the correct ELSTAT row. The choice is saved for future months. Check the totals before submitting.")),
+               "Select the country in the table and click “Change form row of selected country” (or click its “On the form” cell) to assign it to the correct ELSTAT row. This also works for countries the program already knows. The choice is saved for future months. Check the totals before submitting.")),
         ('h', ("Τα σύνολα διαφέρουν", "The totals differ")),
         ('p', ("Το γενικό σύνολο του PDF δεν ταιριάζει με το Excel - συνήθως επειδή κάτι δεν μπήκε (δείτε το προηγούμενο). Μην υποβάλετε το δελτίο πριν το ελέγξετε.",
                "The PDF's grand total does not match the Excel - usually because something was left out (see the previous point). Don't submit the form before checking it.")),
@@ -10829,13 +10859,16 @@ class ElstatApp(TkBase):
         self.preview_tree.bind('<Double-1>', self._map_selected_country)
         self.map_country_btn = ttk.Button(
             self.preview_frame,
-            text=T("Προσθήκη / αντιστοίχιση επιλεγμένης χώρας…", "Add / map selected country…"),
+            text=T("Αλλαγή γραμμής επιλεγμένης χώρας…", "Change form row of selected country…"),
             command=self._map_selected_country)
         self.map_country_btn.grid(row=2, column=0, sticky="w", pady=(8, 2))
+        self.reset_map_btn = ttk.Button(self.preview_frame, text="", command=self._reset_country_rows)
+        self.reset_map_btn.grid(row=2, column=0, sticky="e", pady=(8, 2))
+        self.reset_map_btn.grid_remove()          # only shown while some country has a row changed by the user
         self.preview_hint = ttk.Label(
             self.preview_frame,
-            text=T("Επιλέξτε την κόκκινη χώρα και πατήστε εδώ για να τη βάλετε στη σωστή γραμμή του δελτίου.",
-                   "Select a red country and click here to assign it to the correct form row."),
+            text=T("Κάντε κλικ στη στήλη «Στο δελτίο» (ή διπλό κλικ σε μια χώρα) για να αλλάξετε τη γραμμή του δελτίου στην οποία πηγαίνει.",
+                   "Click the “On the form” column (or double-click a country) to change the form row it goes to."),
             style='CardHint.TLabel', wraplength=620, justify='left')
         self.preview_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.preview_frame.grid_remove()
@@ -13255,7 +13288,7 @@ class ElstatApp(TkBase):
         self.load_period(fp)
 
     def _map_selected_country(self, _event=None):
-        """Let the user map an unknown Excel country to the correct ELSTAT form row."""
+        """Let the user choose the ELSTAT form row of any Excel country (unknown ones, or to override a known one)."""
         if _event is not None and hasattr(_event, 'y'):
             if self.preview_tree.identify_column(_event.x) == '#1':
                 return 'break'
@@ -13265,40 +13298,51 @@ class ElstatApp(TkBase):
         selection = self.preview_tree.selection()
         if not selection:
             messagebox.showinfo(T("Επιλέξτε χώρα", "Select a country"),
-                                T("Επιλέξτε πρώτα μια κόκκινη χώρα από τον πίνακα.",
-                                  "First select a red country in the table."), parent=self)
+                                T("Επιλέξτε πρώτα μια χώρα από τον πίνακα.",
+                                  "First select a country in the table."), parent=self)
             return 'break'
+        old_win = getattr(self, '_map_win', None)
+        try:
+            if old_win is not None and old_win.winfo_exists():       # a double-click must not open two dialogs
+                old_win.lift()
+                return 'break'
+        except tk.TclError:
+            pass
         country = self.preview_tree.item(selection[0], 'text')
         existing_custom = CUSTOM_COUNTRY_MAPPING_NORM.get(norm(country))
-        if resolve_country(country) is not None and existing_custom is None:
-            messagebox.showinfo(T("Η χώρα είναι ήδη γνωστή", "Country already recognised"),
-                                T(f"Η χώρα «{country}» αναγνωρίζεται ήδη από το πρόγραμμα.",
-                                  f"“{country}” is already recognised by the program."), parent=self)
-            return 'break'
+        current = resolve_country(country)             # where it goes now (None = not recognised)
+        choices = country_mapping_destinations()
+        current_pretty = next((o for o in choices if norm(o) == current), None)
 
-        win = tk.Toplevel(self)
+        win = self._map_win = tk.Toplevel(self)
         win.title(T("Αντιστοίχιση χώρας", "Map country"))
         win.configure(bg=BG)
         win.transient(self)
         win.resizable(False, False)
         box = ttk.Frame(win, padding=18)
         box.pack(fill='both', expand=True)
-        ttk.Label(box, text=T(f"Η χώρα «{country}» δεν είναι γνωστή.",
-                              f"The country “{country}” is not recognised."),
-                  style='CardBold.TLabel', wraplength=440).pack(anchor='w')
+        if current_pretty:
+            head = T(f"Η χώρα «{country}» μπαίνει τώρα στη γραμμή «{current_pretty}».",
+                     f"“{country}” currently goes to “{current_pretty}”.")
+            if existing_custom:
+                default_row = default_country_row(country)
+                if default_row and default_row != current_pretty:
+                    head += T(f"\nΠροεπιλογή του προγράμματος: «{default_row}».",
+                              f"\nProgram default: “{default_row}”.")
+        else:
+            head = T(f"Η χώρα «{country}» δεν είναι γνωστή.", f"The country “{country}” is not recognised.")
+        ttk.Label(box, text=head, style='CardBold.TLabel', wraplength=440).pack(anchor='w')
         ttk.Label(box, text=T("Σε ποια γραμμή / κατηγορία του δελτίου της ΕΛΣΤΑΤ ανήκει;",
                               "Which ELSTAT form row / category should it be assigned to?"),
                   style='CardHint.TLabel', wraplength=440).pack(anchor='w', pady=(8, 10))
-        choices = country_mapping_destinations()
         choice_var = tk.StringVar(value='')
         combo = ttk.Combobox(box, textvariable=choice_var, values=choices,
                              state='readonly', width=48)
         combo.pack(fill='x', pady=(0, 12))
-        if existing_custom:
-            for i, option in enumerate(choices):
-                if norm(option) == existing_custom:
-                    combo.current(i)
-                    break
+        for i, option in enumerate(choices):             # start on where the country goes now
+            if norm(option) == (existing_custom or current):
+                combo.current(i)
+                break
         ttk.Label(box, text=T("Η επιλογή αποθηκεύεται και θα χρησιμοποιείται και στους επόμενους μήνες. "
                               "Αν δεν είστε βέβαιοι, ελέγξτε πρώτα τη σωστή κατηγορία.",
                               "Your choice is saved and will also be used in future months. "
@@ -13312,6 +13356,9 @@ class ElstatApp(TkBase):
                 messagebox.showwarning(T("Επιλέξτε κατηγορία", "Choose a category"),
                                         T("Επιλέξτε πού ανήκει η χώρα.",
                                           "Choose where the country belongs."), parent=win)
+                return
+            if existing_custom is None and norm(destination) == current:      # nothing changed
+                win.destroy()
                 return
             try:
                 save_custom_country_mapping(country, destination)
@@ -13329,6 +13376,20 @@ class ElstatApp(TkBase):
                                   "Click “Create PDF” again to generate the corrected form."), parent=self)
         ttk.Button(buttons, text=T("Αποθήκευση", "Save mapping"), command=save_mapping).pack(side='left')
         ttk.Button(buttons, text=T("Ακύρωση", "Cancel"), command=win.destroy).pack(side='right')
+
+        def reset_mapping():
+            try:
+                delete_custom_country_mapping(country)
+            except Exception as exc:
+                messagebox.showerror(T("Δεν αποθηκεύτηκε", "Could not save"), str(exc), parent=win)
+                return
+            win.destroy()
+            fp = self.excel_var.get().strip()
+            if fp and os.path.isfile(fp):
+                self.load_preview(fp)
+        if existing_custom:
+            ttk.Button(buttons, text=T("Επαναφορά προεπιλογής", "Reset to default"),
+                       command=reset_mapping).pack(side='right', padx=(0, 8))
         win.bind('<Return>', lambda _e: save_mapping())
         win.bind('<Escape>', lambda _e: win.destroy())
         win.update_idletasks()
@@ -13373,7 +13434,53 @@ class ElstatApp(TkBase):
                                      tags=(self._preview_tag(country),))
         self.preview_tree.configure(height=max(3, min(len(rows), 7)))
         self._update_preview_summary()
+        self._update_reset_button()
         self.preview_frame.grid()
+
+    def _changed_rows(self):
+        """Countries of the table whose form row was set by the user."""
+        return [r[0] for r in (getattr(self, '_preview_rows', None) or [])
+                if norm(r[0]) in CUSTOM_COUNTRY_MAPPING_NORM]
+
+    def _update_reset_button(self):
+        n = len(self._changed_rows())
+        if n:
+            self.reset_map_btn.configure(text=T(f"Επαναφορά αλλαγών στις γραμμές ({n})",
+                                                f"Reset changed rows ({n})"))
+            self.reset_map_btn.grid()
+        else:
+            self.reset_map_btn.grid_remove()
+
+    def _reset_country_rows(self):
+        """Puts every country of the table that the user moved back on the program's default row."""
+        names = self._changed_rows()
+        if not names:
+            self._update_reset_button()
+            return
+        unknown = T("(άγνωστη χώρα - θα γίνει κόκκινη)", "(not recognised - will turn red)")
+        lines = []
+        for n in names[:10]:
+            now = resolve_country(n)
+            back = default_country_row(n)
+            lines.append(f"• {n}\n     {pretty_row(now) if now else '?'}  →  {back if back else unknown}")
+        shown = "\n".join(lines) + ("\n…" if len(names) > 10 else "")
+        if not messagebox.askyesno(T("Επαναφορά γραμμών", "Reset rows"),
+                                   T(f"Να επανέλθουν στην προεπιλεγμένη γραμμή οι παρακάτω χώρες;\n"
+                                     f"(τώρα  →  μετά την επαναφορά)\n\n{shown}",
+                                     f"Put these countries back on their default form row?\n"
+                                     f"(now  →  after the reset)\n\n{shown}"),
+                                   default='no', parent=self):
+            return
+        try:
+            delete_custom_country_mappings(names)
+        except Exception as exc:
+            messagebox.showerror(T("Δεν αποθηκεύτηκε", "Could not save"), str(exc), parent=self)
+            return
+        fp = self.excel_var.get().strip()
+        if fp and os.path.isfile(fp):
+            self.load_preview(fp)
+        else:
+            self._update_reset_button()
 
     @staticmethod
     def _preview_tag(country):
@@ -13388,6 +13495,8 @@ class ElstatApp(TkBase):
         destination = resolve_country(country)
         shown = (next((v for v in country_mapping_destinations() if norm(v) == destination), destination)
                  if destination else T("⚠ λείπει από το πρόγραμμα", "⚠ missing from the program"))
+        if norm(country) in CUSTOM_COUNTRY_MAPPING_NORM:
+            shown += "  ✎"                          # the row was set by the user
         return ('☑', pax, nights, shown)
 
     def _update_preview_summary(self):
@@ -13409,9 +13518,17 @@ class ElstatApp(TkBase):
     def _toggle_country_click(self, event):
         """Click on the ☑ column ticks / un-ticks one country; click on its header ticks / un-ticks all."""
         tree = self.preview_tree
-        if tree.identify_column(event.x) != '#1':
-            return None
+        column = tree.identify_column(event.x)
         region = tree.identify_region(event.x, event.y)
+        if column == '#4' and region == 'cell':               # "On the form" column: change the row
+            iid = tree.identify_row(event.y)
+            if iid:
+                tree.selection_set(iid)
+                self.after(10, self._map_selected_country)
+                return 'break'
+            return None
+        if column != '#1':
+            return None
         rows = getattr(self, '_preview_rows', None) or []
         if region == 'heading':
             keys = {norm(r[0]) for r in rows}
