@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.6
+Released: 14 November 2026
+
+- New: you can now change the form row of any country, not only the red ones. Click the "On the form" column of a country (or double-click it, or use the "Change form row of selected country…" button). The window shows where the country goes now and starts on that row.
+- Countries whose row you changed are marked with ✎ in the table. When you open one of them, the window also shows the program's default row.
+- New: a "Reset changed rows" button appears under the table as soon as you have changed a row. Before anything happens, a confirmation shows each country with its current row and the default row it goes back to. Countries the program does not know turn red again.
+- A country can also be reset on its own with "Reset to default" in its change window.
+- The message shown when no country is selected, and the built-in guide, were updated to match.
+
 ## 1.0.5
 Released: 14 November 2026
 
