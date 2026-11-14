@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.4"      # raise this number every time you push a new main.py to GitHub
+APP_VERSION = "1.0.5"      # raise this number every time you push a new main.py to GitHub
 FORCE_UPDATE = False       # set to True in the file you push to GitHub (together with a higher APP_VERSION): every
                            # program that starts online then installs this version by itself, without asking anyone.
                            # With False the update stays optional (the user presses "Install update" as before).
@@ -169,21 +169,43 @@ sys.excepthook = _startup_failure        # replaced by the program's own error h
 # The very first time the program runs it downloads requirements.txt from the GitHub repository into the
 # SAME folder as this program and installs what is listed there. This block must stay above the other
 # imports, because those are exactly the packages that may still be missing.
+PIN_CONSTRAINTS = ("pypdf<7",)      # pypdf 7 breaks "create PDF": the setup keeps pypdf below version 7
+
+
 def _first_run_setup():
-    import os, sys, subprocess, importlib, importlib.util, urllib.request
+    import os, sys, re, subprocess, importlib, importlib.util, urllib.request
     if getattr(sys, 'frozen', False):                       # a packaged .exe already contains everything
         return
     here = os.path.dirname(os.path.abspath(__file__))        # the program's own folder (nothing to configure)
     marker = os.path.join(here, ".elstat_setup_done")
     req_path = os.path.join(here, "requirements.txt")
+    cons_path = os.path.join(here, "constraints.txt")        # version limits that apply on top of requirements.txt
+    log_path = os.path.join(here, "elstat_setup.log")
     required = ("pandas", "pypdf", "reportlab", "openpyxl")
-    fallback = "pandas\npypdf\nreportlab\nopenpyxl\npillow\ntkinterdnd2\n"   # used if GitHub has no requirements.txt
+    fallback = "pandas\npypdf<7\nreportlab\nopenpyxl\npillow\ntkinterdnd2\n"   # used if GitHub has no requirements.txt
+
+    def add_user_site():                  # packages installed with --user must be importable in this very run
+        try:
+            import site
+            p = site.getusersitepackages()
+            if p and os.path.isdir(p) and p not in sys.path:
+                sys.path.append(p)
+        except Exception:
+            pass
 
     def missing():
         importlib.invalidate_caches()
+        add_user_site()
         return [m for m in required if importlib.util.find_spec(m) is None]
 
-    if os.path.exists(marker) and not missing():
+    def pypdf_too_new():                  # an installed pypdf of version 7 or newer
+        try:
+            from importlib import metadata
+            return int(re.match(r'\d+', metadata.version('pypdf')).group()) >= 7
+        except Exception:
+            return False
+
+    if os.path.exists(marker) and not missing() and not pypdf_too_new():
         return                                               # already set up: start normally and instantly
 
     # ---- a small "please wait" window (skipped silently if there is no display)
@@ -202,38 +224,86 @@ def _first_run_setup():
         win = None
 
     result = {'ok': True, 'error': ''}
+    log = []
 
     def work():                                              # runs in the background so the window stays responsive
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+        def pip(*args):
+            """One pip call. Returns (returncode, output). Never raises, never waits forever."""
+            py = sys.executable or "python"
+            cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "30", "--retries", "3",
+                   "--prefer-binary", "-c", cons_path] + list(args)
+            try:
+                run = subprocess.run(cmd, capture_output=True, text=True, errors='replace', creationflags=flags,
+                                     stdin=subprocess.DEVNULL, timeout=900)
+                out = (run.stdout or "") + (run.stderr or "")
+                log.append("$ " + " ".join(cmd[2:]) + "\n" + out[-3000:])
+                return run.returncode, out
+            except Exception as e:
+                log.append("$ " + " ".join(cmd[2:]) + "\n" + str(e))
+                return 1, str(e)
+
+        def pip_smart(*args):
+            """pip, and: no pip -> install it; no write permission -> install for this user only."""
+            rc, out = pip(*args)
+            if rc != 0 and "No module named pip" in out:
+                try:
+                    subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], capture_output=True,
+                                   creationflags=flags, stdin=subprocess.DEVNULL, timeout=300)
+                except Exception:
+                    pass
+                rc, out = pip(*args)
+            if rc != 0 and re.search(r'permission|access is denied|not writeable|not writable|WinError 5', out, re.I):
+                rc, out = pip("--user", *args)
+            return rc, out
+
         try:
-            # 1) download requirements.txt from GitHub into the program folder
-            import re as _re          # GITHUB_REPO may be "owner/repo" or the full https://github.com/owner/repo(.git) link
-            _m = _re.match(r'^(?:https?://)?(?:www\.)?(?:github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', GITHUB_REPO.strip())
+            # 1) download requirements.txt from GitHub into the program folder (kept only if it really is a list)
+            _m = re.match(r'^(?:https?://)?(?:www\.)?(?:github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', GITHUB_REPO.strip())
             repo_path = f"{_m.group(1)}/{_m.group(2)}" if _m else GITHUB_REPO.strip()
             url = f"https://raw.githubusercontent.com/{repo_path}/{GITHUB_BRANCH}/requirements.txt"
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'ELSTAT-setup'})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     data = resp.read(1024 * 1024)
+                text = data.decode('utf-8-sig')
+                if '<html' in text.lower() or not re.search(r'^\s*[A-Za-z0-9_.-]+', text, re.M):
+                    raise ValueError("not a requirements file")
                 with open(req_path, 'wb') as f:
                     f.write(data)
+            except Exception as e:
+                log.append("requirements.txt download skipped: %s" % e)
+            try:
+                have = open(req_path, encoding='utf-8-sig').read().lower() if os.path.exists(req_path) else ""
             except Exception:
-                if not os.path.exists(req_path):             # offline / not in the repo yet: use the built-in list
-                    with open(req_path, 'w', encoding='utf-8') as f:
-                        f.write(fallback)
-            # 2) install it
-            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-            cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "20",
-                   "--retries", "2", "-r", req_path]
-            run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags, stdin=subprocess.DEVNULL)
-            if run.returncode != 0 and "No module named pip" in (run.stderr or ""):
-                subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], capture_output=True,
-                               creationflags=flags, stdin=subprocess.DEVNULL)
-                run = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags,
-                                     stdin=subprocess.DEVNULL)
-            if run.returncode != 0:
-                result['ok'], result['error'] = False, (run.stderr or run.stdout or "")[-800:]
+                have = ""
+            if not all(re.search(r'^\s*' + re.escape(p) + r'\b', have, re.M) for p in required):
+                with open(req_path, 'w', encoding='utf-8') as f:          # offline / incomplete: use the built-in list
+                    f.write(fallback)
+            with open(cons_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(PIN_CONSTRAINTS) + "\n")
+
+            # 2) install everything in one go
+            rc, out = pip_smart("-r", req_path)
+            # 3) one bad line must not block the rest: install what is still missing one package at a time
+            todo = missing()
+            if pypdf_too_new() and 'pypdf' not in todo:
+                todo.append('pypdf')
+            for name in todo:
+                rc2, out2 = pip_smart(name)
+                if rc2 != 0:
+                    out = out2
+            if missing() or pypdf_too_new():
+                result['ok'] = False
+                result['error'] = out[-800:]
         except Exception as e:
             result['ok'], result['error'] = False, str(e)
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write("\n\n".join(log))
+        except OSError:
+            pass
 
     import threading, time
     worker = threading.Thread(target=work, daemon=True)
@@ -247,11 +317,9 @@ def _first_run_setup():
             except Exception:
                 win = None
         worker.join(0.1)
-    ok, error = result['ok'], result['error']
 
     still = missing()
-    if still:
-        ok = False
+    ok = result['ok'] and not still and not pypdf_too_new()
     if ok:
         try:
             with open(marker, 'w', encoding='utf-8') as f:
@@ -265,9 +333,12 @@ def _first_run_setup():
             pass
     if still:                                                # the program cannot start without these
         msg = ("Δεν ήταν δυνατή η εγκατάσταση: " + ", ".join(still) + "\nCould not install: " + ", ".join(still)
-               + "\n\nRun / Εκτελέστε:  pip install -r requirements.txt\n\n" + error)
+               + "\n\nΈλεγξτε το internet / Check the internet connection."
+               + "\nRun / Εκτελέστε:  \"" + str(sys.executable) + "\" -m pip install -r requirements.txt"
+               + "\n\nLog: " + log_path + "\n\n" + result['error'])
         try:
             from tkinter import messagebox
+            import tkinter as _tk
             r = _tk.Tk(); r.withdraw()
             messagebox.showerror("ELSTAT", msg)
         except Exception:
@@ -2055,11 +2126,36 @@ COUNTRY_MAPPING.update({
     'EGYPT': 'ΑΙΓΥΠΤΟΣ', 'ETHIOPIA': 'ΑΙΘΙΟΠΙΑ', 'ALGERIA': 'ΑΛΓΕΡΙΑ', 'NIGERIA': 'ΝΙΓΗΡΙΑ',
     'SOUTH AFRICA': 'ΝΟΤΙΑ ΑΦΡΙΚΗ',
 })
+
+# countries found in the Protel exports that had no row of their own on the form
+_OTHER_EUROPE = 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΕΥΡΩΠΗΣ'
+_OTHER_AMERICA = 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΜΕΡΙΚΗΣ'
+_OTHER_ASIA = 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΣΙΑΣ'
+_OTHER_AFRICA = 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΦΡΙΚΗΣ'
+_OCEANIA_ROW = 'ΝΕΑ ΖΗΛΑΝΔΙΑ ΚΑΙ ΛΟΙΠΕΣ ΠΕΡΙΟΧΕΣ'
+COUNTRY_MAPPING.update({'MOLDAVIA': 'ΜΟΛΔΑΒΙΑΣ ΔΗΜΟΚΡΑΤΙΑ', 'ΜΟΛΔΑΒΙΑ': 'ΜΟΛΔΑΒΙΑΣ ΔΗΜΟΚΡΑΤΙΑ'})
+COUNTRY_MAPPING.update({k: _OTHER_EUROPE for k in (
+    'ΛΟΙΠΩΝ ΕΥΡΩΠΗΣ', 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΕΥΡΩΠΗΣ', 'OTHER EUROPE',
+    'MONACO', 'BELARUS', 'BOSNIA & ERZEGOVINE', 'BOSNIA AND HERZEGOVINA', 'BOSNIA & HERZEGOVINA',
+    'KOSOVO', 'ANDORRA', 'SAN MARINO', 'VATICAN')})
+COUNTRY_MAPPING.update({k: _OTHER_AMERICA for k in (
+    'ΛΟΙΠΩΝ ΑΜΕΡΙΚΗΣ', 'OTHER AMERICA', 'URUGUAY', 'CHILE', 'COLOMBIA', 'PERU', 'VENEZUELA', 'ECUADOR',
+    'BOLIVIA', 'PARAGUAY', 'COSTA RICA', 'CUBA', 'PANAMA', 'DOMINICAN REPUBLIC', 'GUATEMALA')})
+COUNTRY_MAPPING.update({k: _OTHER_ASIA for k in (
+    'ΛΟΙΠΩΝ ΑΣΙΑΣ', 'OTHER ASIA', 'JORDAN', 'SRI LANKA', 'KAZAKSTAN', 'KAZAKHSTAN', 'ARMENIA',
+    'AZERBAITZAN', 'AZERBAIJAN', 'KYRGYSTAN', 'KYRGYZSTAN', 'HONG KONG', 'AFGHANISTAN', 'UZBEKISTAN',
+    'TAJIKISTAN', 'TURKMENISTAN', 'INDONESIA', 'MALAYSIA', 'VIETNAM', 'KUWAIT', 'OMAN', 'BAHRAIN',
+    'TAIWAN', 'NEPAL', 'BANGLADESH', 'MYANMAR', 'CAMBODIA', 'YEMEN', 'PALESTINE')})
+COUNTRY_MAPPING.update({k: _OTHER_AFRICA for k in (
+    'ΛΟΙΠΩΝ ΑΦΡΙΚΗΣ', 'OTHER AFRICA', 'TUNISIA', 'MOROCCO', 'KENYA', 'GHANA', 'LIBYA', 'SUDAN',
+    'TANZANIA', 'SENEGAL', 'CAMEROON', 'ANGOLA')})
+COUNTRY_MAPPING.update({k: _OCEANIA_ROW for k in ('FIJI', 'PAPUA NEW GUINEA')})
 COUNTRY_MAPPING_NORM = {norm(k): norm(v) for k, v in COUNTRY_MAPPING.items()}
 
 # User-added mappings are stored in the data folder and survive program updates.
 CUSTOM_COUNTRY_MAPPING = {}
 CUSTOM_COUNTRY_MAPPING_NORM = {}
+EXCLUDED_COUNTRIES = set()      # norm(country as in the file) of rows the user un-ticked: they stay out of the PDF
 COUNTRY_EXTRA_DESTINATIONS = (
     'ΛΟΙΠΕΣ ΧΩΡΕΣ ΕΥΡΩΠΗΣ', 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΜΕΡΙΚΗΣ',
     'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΣΙΑΣ', 'ΛΟΙΠΕΣ ΧΩΡΕΣ ΑΦΡΙΚΗΣ',
@@ -2809,6 +2905,25 @@ def _fit_line(pairs):
     return a, _median([v - a * u for u, v in pairs])
 
 
+def text_xy(cm, tm):
+    """Where a piece of text really sits on the page: the text matrix (tm) combined with the transformation
+    matrix (cm). pypdf versions differ in what they put into each of the two, so only the combination is
+    reliable. Never raises; if a matrix is missing or malformed it falls back to whatever is usable."""
+    try:
+        t = [float(v) for v in tm]
+        if len(t) < 6:
+            raise ValueError
+    except Exception:
+        t = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    try:
+        c = [float(v) for v in cm]
+        if len(c) < 6:
+            raise ValueError
+    except Exception:
+        c = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    return (t[4] * c[0] + t[5] * c[2] + c[4], t[4] * c[1] + t[5] * c[3] + c[5])
+
+
 def read_template_snapshot(template_pdf):
     """What the program needs to know about a template: for its first 2 pages the page size and every
     piece of text with its position (x, y in PDF points, in the page's own coordinates)."""
@@ -2822,12 +2937,11 @@ def read_template_snapshot(template_pdf):
         page = reader.pages[i]
         items = []
 
-        def visit(text, cm, tm, font_dict, font_size, _items=items):
+        def visit(text, cm, tm, *_rest, _items=items):
             n = norm(text)
             if not n:
                 return
-            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
-            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+            x, y = text_xy(cm, tm)
             if not any(t == n and abs(x - ox) < 0.5 and abs(y - oy) < 0.5 for t, ox, oy in _items):
                 _items.append([n, round(float(x), 2), round(float(y), 2)])
 
@@ -4736,13 +4850,13 @@ def detect_template_rows(template_pdf):
     targets = sorted(MAPPED_TARGETS | {norm('ΕΛΛΑΔΑ')}, key=len, reverse=True)
     found = [{}, {}]
     for i in range(min(2, len(reader.pages))):
-        def visitor_text(text, cm, tm, fontDict, fontSize, _i=i):
+        def visitor_text(text, cm, tm, *_rest, _i=i):
             n = norm(text)
             if not n:
                 return
             for target in targets:
                 if n.startswith(target):
-                    found[_i].setdefault(target, tm[5])
+                    found[_i].setdefault(target, text_xy(cm, tm)[1])
                     break
         reader.pages[i].extract_text(visitor_text=visitor_text)
     if norm('ΤΟΥΡΚΙΑ') not in found[1]:
@@ -4755,11 +4869,15 @@ def template_text_items(template_pdf):
     reader = pypdf.PdfReader(template_pdf)
     pages = [[], []]
     for i in range(min(2, len(reader.pages))):
-        def visitor_text(text, cm, tm, fontDict, fontSize, _i=i):
+        def visitor_text(text, cm, tm, *_rest, _i=i):
             if text.strip():
-                x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
-                y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
-                pages[_i].append((text.strip(), x, y, max(5.0, float(fontSize or 8) * abs(cm[0] or 1))))
+                x, y = text_xy(cm, tm)
+                try:
+                    size = float(_rest[1] or 8) if len(_rest) > 1 else 8.0
+                    scale = abs(float(cm[0]) or 1.0)
+                except Exception:
+                    size, scale = 8.0, 1.0
+                pages[_i].append((text.strip(), x, y, max(5.0, size * scale)))
         reader.pages[i].extract_text(visitor_text=visitor_text)
     return pages
 
@@ -4924,6 +5042,57 @@ def commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode='overla
     df_csv.to_csv(csv_filename, index=False, encoding='utf-8-sig')
 
 
+def write_merged_pdf(template_pdf, overlays, output_pdf):
+    """Puts overlays[i] on page i of the template and saves the result as output_pdf.
+    pypdf changes how pages are merged and written from version to version (pypdf 7 broke the old way), so
+    several equivalent ways are tried in turn on a fresh reader/writer each time; the first that works is
+    used. The file is written to a temporary name first, so a failure never leaves a half-written PDF."""
+    def build(style):
+        reader_ = pypdf.PdfReader(template_pdf)
+        writer_ = pypdf.PdfWriter()
+        if style == 'append':
+            writer_.append(reader_, pages=(0, len(overlays)))
+            for i, ov in enumerate(overlays):
+                writer_.pages[i].merge_page(ov.pages[0])
+        else:
+            for i, ov in enumerate(overlays):
+                if style == 'writer_first':          # add the page to the writer, then merge onto the writer's copy
+                    writer_.add_page(reader_.pages[i])
+                    writer_.pages[len(writer_.pages) - 1].merge_page(ov.pages[0])
+                else:                                # 'classic': merge on the reader's page, then add it
+                    page_ = reader_.pages[i]
+                    page_.merge_page(ov.pages[0])
+                    writer_.add_page(page_)
+        buf = io.BytesIO()
+        writer_.write(buf)
+        data = buf.getvalue()
+        if not data.startswith(b'%PDF'):
+            raise ValueError("pypdf wrote no PDF data")
+        return data
+
+    errors, data = [], None
+    for style in ('writer_first', 'classic', 'append'):
+        try:
+            data = build(style)
+            break
+        except Exception as e:
+            errors.append(f"{style}: {type(e).__name__}: {e}")
+    if data is None:
+        raise RuntimeError("pypdf (%s) could not build the PDF:\n%s" % (getattr(pypdf, '__version__', '?'),
+                                                                     "\n".join(errors)))
+    tmp = output_pdf + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, output_pdf)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, monthly_data,
                          rows_override=None, save_history=True, pdf_mode='overlay', manual_layout=None,
                          detect_layout=None):
@@ -4971,7 +5140,12 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     else:
         rows, excel_total = read_nationality_rows(excel_path)
     revenue_rows = read_revenue_rows(excel_path) if rows_override is None else {}
+    skipped_pax = skipped_nights = 0
     for country_excel, pax, nights in rows:
+        if rows_override is None and norm(country_excel) in EXCLUDED_COUNTRIES:
+            skipped_pax += pax          # un-ticked by the user: not in the PDF
+            skipped_nights += nights
+            continue
         pdf_target = resolve_country(country_excel)
         if pdf_target is None:
             unmapped.append((country_excel, pax, nights))
@@ -4986,6 +5160,9 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         if cat:
             totals[cat]['clients'] += pax
             totals[cat]['nights'] += nights
+
+    if excel_total and (skipped_pax or skipped_nights):      # the PDF is meant to be lower than Protel's total
+        excel_total = (excel_total[0] - skipped_pax, excel_total[1] - skipped_nights)
 
     totals['2'] = {
         'clients': totals['2.1']['clients'] + totals['2.2']['clients'] + totals['2.3']['clients'],
@@ -5071,14 +5248,13 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
     coord_map = {0: {}, 1: {}}
     for i in range(2):
         page = reader.pages[i]
-        def visitor_text(text, cm, tm, fontDict, fontSize, _i=i):
+        def visitor_text(text, cm, tm, *_rest, _i=i):
             n = norm(text)
             if not n:
                 return
             for target in sorted(pdf_data.keys(), key=len, reverse=True):
                 if n.startswith(target):
-                    y = tm[5] if layout is None else tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
-                    coord_map[_i].setdefault(target, y)
+                    coord_map[_i].setdefault(target, text_xy(cm, tm)[1])
                     break
         page.extract_text(visitor_text=visitor_text)
 
@@ -5223,15 +5399,9 @@ def process_elstat_report(excel_path, template_pdf, output_pdf, settings_data, m
         packet.seek(0)
         return pypdf.PdfReader(packet)
 
-    writer = pypdf.PdfWriter()
-    for i in range(2):
-        page = reader.pages[i]
-        overlay_pdf = create_manual_overlay(i) if manual is not None else create_overlay(i, pdf_data, coord_map[i], totals)
-        page.merge_page(overlay_pdf.pages[0])
-        writer.add_page(page)
-
-    with open(output_pdf, "wb") as f:
-        writer.write(f)
+    overlays = [create_manual_overlay(i) if manual is not None else create_overlay(i, pdf_data, coord_map[i], totals)
+                for i in range(2)]
+    write_merged_pdf(template_pdf, overlays, output_pdf)
 
     if save_history:
         commit_report_history(pdf_data, monthly_data, template_pdf, pdf_mode)
@@ -10637,21 +10807,25 @@ class ElstatApp(TkBase):
         self.preview_summary = ttk.Label(self.preview_frame, text="", style='CardBold.TLabel', justify="left")
         self.preview_summary.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         autowrap(self.preview_summary, body, margin=110)
-        self.preview_tree = ttk.Treeview(self.preview_frame, columns=('p', 'n', 's'), show='tree headings', height=6)
+        self.preview_tree = ttk.Treeview(self.preview_frame, columns=('u', 'p', 'n', 's'), show='tree headings', height=6)
         self.preview_tree.heading('#0', text=T('Χώρα (όπως στο Excel)', 'Country (as in the Excel)'), anchor='w')
+        self.preview_tree.heading('u', text='☑')
         self.preview_tree.heading('p', text=T('Πελάτες', 'Guests'))
         self.preview_tree.heading('n', text=T('Διανυκτ.', 'Nights'))
         self.preview_tree.heading('s', text=T('Στο δελτίο', 'On the form'), anchor='w')
         self.preview_tree.column('#0', width=220, minwidth=140, stretch=True)
+        self.preview_tree.column('u', width=44, minwidth=44, anchor='center', stretch=False)
         self.preview_tree.column('p', width=80, minwidth=60, anchor='e', stretch=False)
         self.preview_tree.column('n', width=80, minwidth=60, anchor='e', stretch=False)
         self.preview_tree.column('s', width=190, minwidth=120, stretch=False)
         self.preview_tree.tag_configure('bad', foreground=BAD, background=BAD_BG)
         self.preview_tree.tag_configure('ok', background=CARD)
+        self.preview_tree.tag_configure('off', foreground='#8a8a8a', background=CARD)
         psb = ttk.Scrollbar(self.preview_frame, orient="vertical", command=self.preview_tree.yview)
         self.preview_tree.configure(yscrollcommand=psb.set)
         self.preview_tree.grid(row=1, column=0, sticky="ew")
         psb.grid(row=1, column=1, sticky="ns")
+        self.preview_tree.bind('<Button-1>', self._toggle_country_click, add='+')
         self.preview_tree.bind('<Double-1>', self._map_selected_country)
         self.map_country_btn = ttk.Button(
             self.preview_frame,
@@ -13083,6 +13257,8 @@ class ElstatApp(TkBase):
     def _map_selected_country(self, _event=None):
         """Let the user map an unknown Excel country to the correct ELSTAT form row."""
         if _event is not None and hasattr(_event, 'y'):
+            if self.preview_tree.identify_column(_event.x) == '#1':
+                return 'break'
             clicked = self.preview_tree.identify_row(_event.y)
             if clicked:
                 self.preview_tree.selection_set(clicked)
@@ -13180,36 +13356,84 @@ class ElstatApp(TkBase):
         self.run_async(work, done, text=T("Ανάγνωση Excel…", "Reading Excel…"))
 
     def _apply_preview(self, rows):
-        """Shows the countries found in the Excel and flags the ones the program does not know."""
+        """Shows the countries found in the Excel, flags the ones the program does not know and lets the user
+        tick / un-tick the ones that go into the PDF."""
         self.preview_frame.grid_remove()
         if not rows:
             return
+        current = self.excel_var.get().strip()
+        if getattr(self, '_excl_file', None) != current:      # another file: start with everything ticked
+            EXCLUDED_COUNTRIES.clear()
+            self._excl_file = current
+        self._preview_rows = list(rows)
+        EXCLUDED_COUNTRIES.intersection_update({norm(r[0]) for r in rows})
         self.preview_tree.delete(*self.preview_tree.get_children())
-        bad = 0
-        for country, pax, nights in rows:
-            known = resolve_country(country) is not None
-            bad += not known
-            destination = resolve_country(country)
-            shown_destination = (next((v for v in country_mapping_destinations()
-                                        if norm(v) == destination), destination)
-                                  if destination else T("⚠ λείπει από το πρόγραμμα",
-                                                        "⚠ missing from the program"))
-            self.preview_tree.insert('', 'end', text=country, values=(pax, nights,
-                                     shown_destination),
-                                     tags=('ok' if known else 'bad',))
+        for i, (country, pax, nights) in enumerate(rows):
+            self.preview_tree.insert('', 'end', iid=f'c{i}', text=country, values=self._preview_values(country, pax, nights),
+                                     tags=(self._preview_tag(country),))
         self.preview_tree.configure(height=max(3, min(len(rows), 7)))
-        text = (T(f"Βρέθηκαν {len(rows)} χώρες · {sum(r[1] for r in rows)} πελάτες · "
-                  f"{sum(r[2] for r in rows)} διανυκτερεύσεις",
-                  f"Found {len(rows)} countries · {sum(r[1] for r in rows)} guests · "
-                  f"{sum(r[2] for r in rows)} overnight stays"))
+        self._update_preview_summary()
+        self.preview_frame.grid()
+
+    @staticmethod
+    def _preview_tag(country):
+        if norm(country) in EXCLUDED_COUNTRIES:
+            return 'off'
+        return 'ok' if resolve_country(country) is not None else 'bad'
+
+    @staticmethod
+    def _preview_values(country, pax, nights):
+        if norm(country) in EXCLUDED_COUNTRIES:
+            return ('☐', pax, nights, T("— εκτός PDF —", "— left out of the PDF —"))
+        destination = resolve_country(country)
+        shown = (next((v for v in country_mapping_destinations() if norm(v) == destination), destination)
+                 if destination else T("⚠ λείπει από το πρόγραμμα", "⚠ missing from the program"))
+        return ('☑', pax, nights, shown)
+
+    def _update_preview_summary(self):
+        rows = getattr(self, '_preview_rows', None) or []
+        used = [r for r in rows if norm(r[0]) not in EXCLUDED_COUNTRIES]
+        off = len(rows) - len(used)
+        bad = sum(resolve_country(r[0]) is None for r in used)
+        text = (T(f"Στο PDF: {len(used)} από {len(rows)} χώρες · {sum(r[1] for r in used)} πελάτες · "
+                  f"{sum(r[2] for r in used)} διανυκτερεύσεις",
+                  f"In the PDF: {len(used)} of {len(rows)} countries · {sum(r[1] for r in used)} guests · "
+                  f"{sum(r[2] for r in used)} overnight stays"))
+        if off:
+            text += T(f"   ({off} εκτός PDF)", f"   ({off} left out)")
         if bad:
             text += T(f"   ⚠ {bad} δεν αναγνωρίστηκαν και ΔΕΝ θα μπουν στο PDF",
                       f"   ⚠ {bad} not recognised and will NOT be included in the PDF")
-            self.preview_summary.configure(style='CardBad.TLabel')
+        self.preview_summary.configure(style='CardBad.TLabel' if bad else 'CardGood.TLabel', text=text)
+
+    def _toggle_country_click(self, event):
+        """Click on the ☑ column ticks / un-ticks one country; click on its header ticks / un-ticks all."""
+        tree = self.preview_tree
+        if tree.identify_column(event.x) != '#1':
+            return None
+        region = tree.identify_region(event.x, event.y)
+        rows = getattr(self, '_preview_rows', None) or []
+        if region == 'heading':
+            keys = {norm(r[0]) for r in rows}
+            if keys <= EXCLUDED_COUNTRIES:
+                EXCLUDED_COUNTRIES.difference_update(keys)
+            else:
+                EXCLUDED_COUNTRIES.update(keys)
+        elif region == 'cell':
+            iid = tree.identify_row(event.y)
+            if not iid:
+                return 'break'
+            key = norm(tree.item(iid, 'text'))
+            if key in EXCLUDED_COUNTRIES:
+                EXCLUDED_COUNTRIES.discard(key)
+            else:
+                EXCLUDED_COUNTRIES.add(key)
         else:
-            self.preview_summary.configure(style='CardGood.TLabel')
-        self.preview_summary.configure(text=text)
-        self.preview_frame.grid()
+            return None
+        for iid, (country, pax, nights) in zip(tree.get_children(), rows):
+            tree.item(iid, values=self._preview_values(country, pax, nights), tags=(self._preview_tag(country),))
+        self._update_preview_summary()
+        return 'break'
 
     def _build_history_tab(self):
         tab = self.tab_history
